@@ -1,0 +1,41 @@
+<!--
+    RemoteFsShell custom property descriptions.
+    Registered by DllRegisterServer via PSRegisterPropertySchema.
+    The file must sit in the same directory as RemoteFsShell.dll.
+-->
+<schema xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+        xmlns="http://schemas.microsoft.com/windows/2006/propertydescription"
+        schemaVersion="1.0" >
+    <propertyDescriptionList publisher="RemoteFS" product="RemoteFS Shell">
+        <propertyDescription name="Remote.Permissions" formatID="{FBF7453E-DC5F-4A6F-9302-526228C77955}" propID="2">
+            <description>Unix permission string, e.g. drwxr-xr-x</description>
+            <searchInfo inInvertedIndex="false" isColumn="false" />
+            <typeInfo canStackBy="true" type="String"/>
+            <labelInfo label="Permissions"/>
+        </propertyDescription>
+        <propertyDescription name="Remote.Owner" formatID="{EB18C18D-CF33-4AF1-8DCB-34880C260AC5}" propID="2">
+            <description>Owner of the remote item.</description>
+            <searchInfo inInvertedIndex="false" isColumn="false" />
+            <typeInfo canStackBy="true" type="String"/>
+            <labelInfo label="Owner"/>
+        </propertyDescription>
+        <propertyDescription name="Remote.Group" formatID="{D4149AAF-7D8D-49EE-B436-BC24A4B575C5}" propID="2">
+            <description>Group of the remote item.</description>
+            <searchInfo inInvertedIndex="false" isColumn="false" />
+            <typeInfo canStackBy="true" type="String"/>
+            <labelInfo label="Group"/>
+        </propertyDescription>
+        <propertyDescription name="Remote.Size" formatID="{1E83002B-7181-461E-AD20-9070048FCC58}" propID="2">
+            <description>Human readable size of the remote item.</description>
+            <searchInfo inInvertedIndex="false" isColumn="false" />
+            <typeInfo canStackBy="true" type="String"/>
+            <labelInfo label="Size"/>
+        </propertyDescription>
+        <propertyDescription name="Remote.Modified" formatID="{3D0E1BF8-FA3A-4F1F-BDBC-EB808CCF1FD6}" propID="2">
+            <description>Modified time of the remote item.</description>
+            <searchInfo inInvertedIndex="false" isColumn="false" />
+            <typeInfo canStackBy="false" type="String"/>
+            <labelInfo label="Modified"/>
+        </propertyDescription>
+    </propertyDescriptionList>
+</schema>

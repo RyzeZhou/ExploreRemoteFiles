@@ -1,0 +1,17 @@
+# Build outputs
+bin/
+obj/
+publish/
+*.user
+*.suo
+*.nupkg
+
+# Cloned reference repos (large upstream sources, keep out of git)
+reference/
+
+# Local test server runtime files
+research/ftpserver/test_host_key
+research/ftpserver/__pycache__/
+
+# Debug log
+C:\temp\

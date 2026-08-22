@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/ExplorerRemoteFs/ExplorerRemoteFs.csproj" />
+  <Project Path="src/ExplorerRemoteFs.Cli/ExplorerRemoteFs.Cli.csproj" />
+</Solution>
