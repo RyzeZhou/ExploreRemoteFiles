@@ -100,6 +100,35 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         return sb.ToString();
     }
 
+    public void Delete(string path)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        var item = _client.GetAttributes(path);
+        if (item is null) return;
+        if (item.IsDirectory)
+            _client.DeleteDirectory(path);
+        else
+            _client.DeleteFile(path);
+        Utils.ShellLog.Write($"SFTP deleted: {path}");
+    }
+
+    public void Rename(string from, string to)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        _client.RenameFile(from, to);
+        Utils.ShellLog.Write($"SFTP renamed: {from} -> {to}");
+    }
+
+    public void CreateDirectory(string path)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        _client.CreateDirectory(path);
+        Utils.ShellLog.Write($"SFTP mkdir: {path}");
+    }
+
     public void Dispose()
     {
         try

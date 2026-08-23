@@ -50,3 +50,6 @@
 // Permissions dialogs (modal box + property sheet page)
 #define IDD_PERMBOX                     4000
 #define IDD_PERMPAGE                    3000
+
+// Name input dialog (rename / new folder)
+#define IDD_NAMEBOX                     4001

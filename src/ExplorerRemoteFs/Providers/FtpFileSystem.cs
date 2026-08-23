@@ -39,6 +39,12 @@ public sealed class FtpFileSystem : IRemoteFileSystem
             _client.Config.EncryptionMode = FtpEncryptionMode.Explicit;
             _client.Config.ValidateAnyCertificate = false;
         }
+        else
+        {
+            // FluentFTP 默认 Auto 会先尝试 AUTH TLS；纯 FTP 服务器（如 pyftpdlib 无 TLS）
+            // 握手会失败。显式设为 None 走明文。
+            _client.Config.EncryptionMode = FtpEncryptionMode.None;
+        }
         _client.Connect();
         Utils.ShellLog.Write($"FTP connected: {DisplayName}");
     }
@@ -52,7 +58,9 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         FtpListItem[] items;
         try
         {
-            items = _client.GetListing(path);
+            // ForceList：MLSD 不携带 unix.mode/owner/group fact，必须用 LIST 才能拿到 Unix 权限。
+            // Unix 服务器（vsftpd/pyftpdlib/ProFTPD）LIST 输出为标准 -rw-r--r-- owner group 格式。
+            items = _client.GetListing(path, FtpListOption.ForceList);
         }
         catch (System.IO.IOException ex)
         {
@@ -99,6 +107,33 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         sb.Append(others.HasFlag(FtpPermission.Write) ? 'w' : '-');
         sb.Append(others.HasFlag(FtpPermission.Execute) ? 'x' : '-');
         return sb.ToString();
+    }
+
+    public void Delete(string path)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        if (_client.DirectoryExists(path))
+            _client.DeleteDirectory(path);
+        else
+            _client.DeleteFile(path);
+        Utils.ShellLog.Write($"FTP deleted: {path}");
+    }
+
+    public void Rename(string from, string to)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        _client.Rename(from, to);
+        Utils.ShellLog.Write($"FTP renamed: {from} -> {to}");
+    }
+
+    public void CreateDirectory(string path)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        _client.CreateDirectory(path);
+        Utils.ShellLog.Write($"FTP mkdir: {path}");
     }
 
     public void Dispose()

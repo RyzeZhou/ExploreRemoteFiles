@@ -44,9 +44,11 @@ private:
     PIDLIST_ABSOLUTE _pidlFolder;
     IContextMenu *_pDefault;    // default context menu (SHCreateDefaultContextMenu)
     UINT    _cVerbsDefault;     // verbs added by _pDefault in the last QueryContextMenu
+    UINT    _idCmdFirst;        // idCmdFirst from the last QueryContextMenu (probe/fix)
 
     HRESULT _GetSelectedItem(PCFVITEMID *ppItem);
     HRESULT _OpenSelected();
+    HRESULT _GetFolderPidlFromSite(PIDLIST_ABSOLUTE *ppidl);
 };
 
 HRESULT CFolderViewImplContextMenu_CreateInstance(REFIID riid, void **ppv);

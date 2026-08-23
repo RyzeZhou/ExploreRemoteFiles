@@ -5,9 +5,12 @@
 #pragma once
 
 #include <windows.h>
+#include <shlobj.h>
 #include <strsafe.h>
 #include <time.h>
 #include <stdio.h>
+#include <vector>
+#include <string>
 
 // Debug logging helper (append to C:\temp\remotefs-debug.log)
 inline void DebugLog(const wchar_t *fmt, ...)
@@ -37,8 +40,8 @@ typedef struct tagObject
     DWORD   dwMode;      // unix permission bits, e.g. 0755
     DWORD   dwSize;      // file size in bytes (0 for directories)
     DWORD   dwMtime;     // modified time (unix epoch)
-    BYTE    nOwner;      // index into c_rgOwners
-    BYTE    nGroup;      // index into c_rgGroups
+    BYTE    nOwner;      // index into the owner name table
+    BYTE    nGroup;      // index into the group name table
     BOOL    fIsFolder;
     BOOL    fIsSymlink;
     BYTE    cchName;
@@ -46,11 +49,59 @@ typedef struct tagObject
 } FVITEMID;
 #pragma pack()
 
+// Owner/group string tables referenced by BYTE index from the PIDL.
+// Kept dynamic (real FTP servers expose arbitrary owner/group names) and
+// thread-safe.  The PIDL stays small (~30 bytes) like the Microsoft sample,
+// which the Win10 19041 shell handles reliably.
+struct OwnerGroupTables
+{
+    std::vector<std::wstring> owners;
+    std::vector<std::wstring> groups;
+    SRWLOCK lock;
+};
+inline OwnerGroupTables &OwnerTables()
+{
+    static OwnerGroupTables t = { {}, {}, SRWLOCK_INIT };
+    return t;
+}
+inline BYTE TableAdd(std::vector<std::wstring> &v, const wchar_t *s)
+{
+    const wchar_t *psz = s ? s : L"";
+    for (size_t i = 0; i < v.size(); i++)
+    {
+        if (v[i] == psz)
+        {
+            return (BYTE)i;
+        }
+    }
+    v.push_back(psz);
+    return (BYTE)(v.size() - 1);
+}
+inline const wchar_t *TableGet(const std::vector<std::wstring> &v, BYTE idx)
+{
+    return idx < v.size() ? v[idx].c_str() : L"";
+}
+
 typedef UNALIGNED FVITEMID *PFVITEMID;
 typedef const UNALIGNED FVITEMID *PCFVITEMID;
 
 static const PCWSTR c_rgOwners[] = { L"root", L"deploy", L"www-data", L"ftpuser", L"alex" };
 static const PCWSTR c_rgGroups[] = { L"root", L"dev", L"www-data", L"ftp", L"staff" };
+
+// Directory-entry data model shared by the hardcoded source, the real FTP
+// source (FtpSource.cpp) and the enumerator.
+typedef struct
+{
+    int     nLevel;
+    DWORD   dwMode;
+    DWORD   dwSize;
+    DWORD   dwMtime;
+    BOOL    fIsFolder;
+    BOOL    fIsSymlink;
+    WCHAR   szOwner[33];
+    WCHAR   szGroup[33];
+    WCHAR   szName[MAX_PATH];
+} ITEMDATA;
 
 inline BOOL IsValidRemoteItem(PCUIDLIST_RELATIVE pidl, PCFVITEMID *ppItem)
 {
@@ -60,7 +111,7 @@ inline BOOL IsValidRemoteItem(PCUIDLIST_RELATIVE pidl, PCFVITEMID *ppItem)
         return FALSE;
     }
     PCFVITEMID pidmine = (PCFVITEMID)pidl;
-    if (pidmine->cb && MYOBJID == pidmine->MyObjID && pidmine->nLevel <= 3)
+    if (pidmine->cb && MYOBJID == pidmine->MyObjID && pidmine->nLevel <= 10)
     {
         *ppItem = pidmine;
         return TRUE;

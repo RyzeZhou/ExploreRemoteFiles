@@ -184,8 +184,10 @@ static INT_PTR CALLBACK PermPageDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPA
         FormatSize(pItem->dwSize, pItem->fIsFolder, szSize, ARRAYSIZE(szSize));
         FormatMtime(pItem->dwMtime, szMtime, ARRAYSIZE(szMtime));
 
-        PCWSTR pszOwner = (pItem->nOwner < ARRAYSIZE(c_rgOwners)) ? c_rgOwners[pItem->nOwner] : L"?";
-        PCWSTR pszGroup = (pItem->nGroup < ARRAYSIZE(c_rgGroups)) ? c_rgGroups[pItem->nGroup] : L"?";
+        const wchar_t *pszOwnerT = TableGet(OwnerTables().owners, pItem->nOwner);
+        const wchar_t *pszGroupT = TableGet(OwnerTables().groups, pItem->nGroup);
+        PCWSTR pszOwner = pszOwnerT[0] ? pszOwnerT : L"?";
+        PCWSTR pszGroup = pszGroupT[0] ? pszGroupT : L"?";
 
         SetDlgItemTextW(hDlg, IDC_PP_NAME, szName);
         SetDlgItemTextW(hDlg, IDC_PP_TYPE, pItem->fIsFolder ? L"Folder" : (pItem->fIsSymlink ? L"Symbolic Link" : L"File"));

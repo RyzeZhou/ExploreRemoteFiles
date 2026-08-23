@@ -8,7 +8,11 @@ $dllPath = "D:\tools\explorer-remote-fs\src-cpp\RemoteFsShell\RemoteFsShell.dll"
 $folderClsid = "{BB7CB9B5-4CD1-4C2E-B585-BF95B141CD15}"
 $ctxClsid = "{D3FD7C50-BF7E-4A0C-BA6F-E3694B91ABC8}"
 $title = "Remote"
-$attrs = 0xA0000020   # SFGAO_FOLDER | SFGAO_HASSUBFOLDER | SFGAO_CANDELETE
+# 0xA0000020 = SFGAO_FOLDER | SFGAO_HASSUBFOLDER | SFGAO_CANDELETE
+# NOTE: do NOT add SFGAO_BROWSABLE (RESEARCH_LOG): it makes explorer request
+# the private view interface 93F81976 instead of falling back to IShellView,
+# breaking deep-folder view creation.
+$attrs = 0xA0000020
 
 # --- remove old SDK sample registration ---
 $oldFolder = "{BA16CE0E-728C-4FC9-98E5-D0B35B384597}"
@@ -27,7 +31,10 @@ if (Test-Path $ft) { Remove-Item $ft -Recurse -Force }
 function WriteReg($path, $name, $value, $isDword = $false) {
     $null = New-Item -Path "Registry::$path" -Force
     if ($name -eq "(default)") {
-        Set-Item -Path "Registry::$path" -Value $value
+        # Set-Item on the Registry provider does not reliably write the
+        # (default) value of an existing key; use reg.exe instead.
+        & reg.exe add $path /ve /t REG_SZ /d $value /f | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "reg add failed for $path" }
     } else {
         if ($isDword) {
             Set-ItemProperty -Path "Registry::$path" -Name $name -Value $value -Type DWord
@@ -50,6 +57,8 @@ WriteReg "$hkcu\Software\Classes\CLSID\$folderClsid\ShellFolder" "Attributes" $a
 WriteReg "$hkcu\Software\Classes\CLSID\$ctxClsid" "(default)" $title
 WriteReg "$hkcu\Software\Classes\CLSID\$ctxClsid\InprocServer32" "(default)" $dllPath
 WriteReg "$hkcu\Software\Classes\CLSID\$ctxClsid\InprocServer32" "ThreadingModel" "Apartment"
+# MayChangeDefaultMenu: tells explorer this handler can alter the default verb
+# (aligned with the Microsoft sample; affects double-click handling).
 WriteReg "$hkcu\Software\Classes\CLSID\$ctxClsid\ShellEx\MayChangeDefaultMenu" "(default)" ""
 WriteReg "$hkcu\Software\Classes\RemoteFsShellType\shellex\ContextMenuHandlers\$ctxClsid" "(default)" $ctxClsid
 

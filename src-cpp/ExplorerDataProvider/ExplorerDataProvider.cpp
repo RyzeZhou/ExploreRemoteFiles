@@ -17,6 +17,7 @@
 
 #include "resource.h"
 #include "Utils.h"
+#include "ProbeLog.h"
 #include "Category.h"
 #include "Guid.h"
 #include "fvcommands.h"
@@ -283,6 +284,7 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
 //  interface can then be used to enumerate the folder's contents.
 HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnumIDList **ppenumIDList)
 {
+    ProbeLog(L"[SAMPLE] EnumObjects level=%d", m_nLevel);
     HRESULT hr;
     if (m_nLevel >= g_nMaxLevel)
     {
@@ -313,6 +315,7 @@ HRESULT CFolderViewImplFolder::BindToObject(PCUIDLIST_RELATIVE pidl,
                                             IBindCtx *pbc, REFIID riid, void **ppv)
 {
     *ppv = NULL;
+    ProbeLog(L"[SAMPLE] BindToObject level=%d m_pidl=%p", m_nLevel, m_pidl);
     HRESULT hr = _ValidatePidl(pidl);
     if (SUCCEEDED(hr))
     {
@@ -573,6 +576,7 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
 HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **ppv)
 {
     *ppv = NULL;
+    ProbeLog(L"[SAMPLE] CreateViewObject riid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X level=%d", riid.Data1, riid.Data2, riid.Data3, riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3], riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7], m_nLevel);
 
     HRESULT hr = E_NOINTERFACE;
     if (riid == IID_IShellView)
