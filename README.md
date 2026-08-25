@@ -54,8 +54,10 @@ current       lrwxrwxrwx    root       root                   ...
 explorer-remote-fs/
 ├── README.md                       # 项目章程（本文件）
 ├── docs/
-│   ├── EXPLORATION_PLAN.md         # 技术探索计划（架构/风险/原型/任务清单，核心文档）
-│   └── RESEARCH_LOG.md             # 探索日志与任务状态追踪（随进度更新）
+│   ├── EXPLORATION_PLAN.md         # 技术探索计划（架构/风险/原型/任务清单）
+│   ├── RESEARCH_LOG.md             # 探索日志与任务状态追踪
+│   ├── NAVIGATION_INVESTIGATION_2026-08-24.md # 深层导航排查与架构决策
+│   └── IMPLEMENTATION_GUIDE.md     # 当前实现方向与历史实现说明
 ├── src/
 │   ├── ExplorerRemoteFs/           # Shell Namespace 插件（.NET 8 + SharpShell + comhost）
 │   └── ExplorerRemoteFs.Cli/       # 冒烟测试 CLI（不依赖 Explorer 验证 Provider 层）
@@ -68,6 +70,19 @@ explorer-remote-fs/
 │   └── sharpshell-src/             # SharpShell 源码（API 参考）
 └── research/                       # 探索产出：验证笔记、测试服务器、API 探测工具
 ```
+
+
+## 当前开发方向（2026-08-24）
+
+深层导航控制实验已经完成。项目 Shell 主线从累计改造的 RemoteFsShell 切换为：
+
+> **Microsoft ExplorerDataProvider 导航内核 + 紧凑身份 PIDL + PIDL 外部的远程元数据/操作层。**
+
+四组实机对照显示：微软原始 Demo 正常；旧 RemoteFsShell 使用固定数据或真实 FTP 都异常；微软内核接真实 FTP 完全正常。新内核继续加入 Rename、Delete、Properties 后，面包屑、文本地址、Back、Up、F5 和操作后位置仍全部正常。
+
+当前新主线位于 src-cpp/ExplorerDataProviderFtp/。下一阶段是恢复字段式 Remote Permissions 属性界面和 POSIX Details 列，并切换正式 Remote 注册。详细排查与不再重复的失败方向见 [docs/NAVIGATION_INVESTIGATION_2026-08-24.md](docs/NAVIGATION_INVESTIGATION_2026-08-24.md)。
+
+---
 
 ## 快速开始（Prototype 1）
 

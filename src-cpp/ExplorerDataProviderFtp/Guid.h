@@ -1,0 +1,44 @@
+/**************************************************************************
+    THIS CODE AND INFORMATION IS PROVIDED "AS IS" WITHOUT WARRANTY OF
+   ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+   THE IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A
+   PARTICULAR PURPOSE.
+
+   (c) Microsoft Corporation. All Rights Reserved.
+**************************************************************************/
+
+// This file contains the CLSID and Property Keys used in this sample.
+#define INITGUID
+#include <guiddef.h>
+#include <propkeydef.h>
+
+
+// Command Line,
+// explorer ::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\::{BA16CE0E-728C-4FC9-98E5-D0B35B384597}
+
+DEFINE_GUID(CLSID_FolderViewImpl,0xc816ce0e, 0x728c, 0x4fc9, 0x98, 0xe5, 0xd0, 0xb3, 0x5b, 0x38, 0x45, 0x97);
+
+DEFINE_GUID(CLSID_FolderViewImplContextMenu, 0xcb8f539d, 0x3b97, 0x4473, 0x9e, 0x07, 0xc8, 0x24, 0x8c, 0x53, 0x24, 0x8e);
+
+// Col 2
+// name="Microsoft.SDKSample.AreaSize"
+// {CE8B09DD-B2D6-4751-A207-4FFDD1A0F65C}
+DEFINE_PROPERTYKEY(PKEY_Microsoft_SDKSample_AreaSize, 0xce8b09dd, 0xb2d6, 0x4751, 0xa2, 0x7, 0x4f, 0xfd, 0xd1, 0xa0, 0xf6, 0x5c, 3);
+
+// Col 3
+// name="Microsoft.SDKSample.NumberOfSides"
+// {DADD3288-0380-4dd3-A5C4-CD7AE2A099F0}
+DEFINE_PROPERTYKEY(PKEY_Microsoft_SDKSample_NumberOfSides, 0xdadd3288, 0x380, 0x4dd3, 0xa5, 0xc4, 0xcd, 0x7a, 0xe2, 0xa0, 0x99, 0xf0, 3);
+
+// Col 4
+// name="Microsoft.SDKSample.DirectoryLevel"
+// {581CF603-2925-4acf-BB5A-3D3EB39EACD3}
+DEFINE_PROPERTYKEY(PKEY_Microsoft_SDKSample_DirectoryLevel, 0x581cf603, 0x2925, 0x4acf, 0xbb, 0x5a, 0x3d, 0x3e, 0xb3, 0x9e, 0xac, 0xd3, 3);
+
+// Remote POSIX metadata property keys (PIDL-external; shown in Details columns).
+// Col 1 = Permissions, Col 2 = Owner, Col 3 = Group, Col 4 = Size, Col 5 = Modified.
+DEFINE_PROPERTYKEY(PKEY_Remote_Permissions, 0xfbf7453e, 0xdc5f, 0x4a6f, 0x93, 0x02, 0x52, 0x62, 0x28, 0xc7, 0x79, 0x55, 2);
+DEFINE_PROPERTYKEY(PKEY_Remote_Owner, 0xeb18c18d, 0xcf33, 0x4af1, 0x8d, 0xcb, 0x34, 0x88, 0x0c, 0x26, 0x0a, 0xc5, 2);
+DEFINE_PROPERTYKEY(PKEY_Remote_Group, 0xd4149aaf, 0x7d8d, 0x49ee, 0xb4, 0x36, 0xbc, 0x24, 0xa4, 0xb5, 0x75, 0xc5, 2);
+DEFINE_PROPERTYKEY(PKEY_Remote_Size, 0x1e83002b, 0x7181, 0x461e, 0xad, 0x20, 0x90, 0x70, 0x04, 0x8f, 0xcc, 0x58, 2);
+DEFINE_PROPERTYKEY(PKEY_Remote_Modified, 0x3d0e1bf8, 0xfa3a, 0x4f1f, 0xbd, 0xbc, 0xeb, 0x80, 0x8c, 0xcf, 0x1f, 0xd6, 2);

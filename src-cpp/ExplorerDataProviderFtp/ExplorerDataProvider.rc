@@ -1,0 +1,106 @@
+#include "resource.h"
+
+#include "Windows.h"
+#include <winres.h>
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+#pragma code_page(1252)
+
+STRINGTABLE 
+BEGIN
+    IDS_EXPLORE             "Explore"
+    IDS_OPEN                "Open"
+    IDS_GROUPBYSIDES        "Group By Sides"
+    IDS_EXPLORE_HELP        "Explore Item"
+    IDS_OPEN_HELP           "Open Item in New Window"
+    IDS_ONE                 "One"
+    IDS_TWO                 "Two"
+    IDS_THREE               "Three"
+    IDS_FOUR                "Four"
+END
+
+STRINGTABLE 
+BEGIN
+    IDS_FIVE                "Five"
+    IDS_SIX                 "Six"
+    IDS_SEVEN               "Seven"
+    IDS_EIGHT               "Eight"
+    IDS_NINE                "Nine"
+    IDS_ZERO                "Zero"
+    IDS_GROUPBYSIZE         "Group by Size"
+    IDS_GROUPBYALPHA        "Alphabetical"
+    IDS_VALUE               "Value"
+    IDS_SMALL               "Small"
+    IDS_MEDIUM              "Medium"
+    IDS_LARGE               "Large"
+    IDS_LESSTHAN5           "Less Than 5"
+    IDS_5ORGREATER          "Five or Greater"
+    IDS_GROUPBYVALUE        "Group by Value"
+    IDS_GROUPBYLEVEL        "Group by Level"
+END
+
+STRINGTABLE 
+BEGIN
+    IDS_RECTANGLE           "Rectangle"
+    IDS_TRIANGLE            "Triangle"
+    IDS_CIRCLE              "Circle"
+    IDS_POLYGON             "Polygon"
+    IDS_TITLE               "Explorer Data Provider"
+    IDS_DISPLAY             "Display"
+    IDS_UNSPECIFIED         "Unspecified"
+    IDS_SETTINGS            "Settings"
+    IDS_SETTING1            "Setting 1"
+    IDS_SETTING2            "Setting 2"
+    IDS_SETTING3            "Setting 3"
+    IDS_DISPLAY_TT          "Display the item."
+    IDS_SETTINGS_TT         "Modify settings."
+    IDS_SETTING1_TT         "Modify setting 1."
+    IDS_SETTING2_TT         "Modify setting 2."
+    IDS_SETTING3_TT         "Modify setting 3."
+END
+
+IDD_NAMEBOX DIALOGEX 0, 0, 224, 62
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Rename"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Name:", IDC_STATIC, 8, 10, 40, 10
+    EDITTEXT        3101, 52, 8, 164, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 62, 38, 48, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 118, 38, 48, 14
+END
+
+IDD_PERMBOX DIALOGEX 0, 0, 240, 224
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Remote Permissions"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Name:", IDC_STATIC, 12, 12, 44, 10
+    LTEXT           "", 3001, 60, 12, 170, 10
+    LTEXT           "Type:", IDC_STATIC, 12, 28, 44, 10
+    LTEXT           "", 3002, 60, 28, 170, 10
+    LTEXT           "Permissions:", IDC_STATIC, 12, 44, 60, 10
+    LTEXT           "", 3003, 80, 44, 150, 10
+    LTEXT           "Owner:", IDC_STATIC, 12, 60, 44, 10
+    LTEXT           "", 3004, 60, 60, 170, 10
+    LTEXT           "Group:", IDC_STATIC, 12, 76, 44, 10
+    LTEXT           "", 3005, 60, 76, 170, 10
+    LTEXT           "Size:", IDC_STATIC, 12, 92, 44, 10
+    LTEXT           "", 3006, 60, 92, 170, 10
+    LTEXT           "Modified:", IDC_STATIC, 12, 108, 48, 10
+    LTEXT           "", 3007, 64, 108, 166, 10
+    GROUPBOX        "Permissions", IDC_STATIC, 12, 126, 218, 56
+    LTEXT           "Owner", IDC_STATIC, 22, 140, 40, 10
+    AUTOCHECKBOX    "Read", 3011, 72, 140, 42, 10
+    AUTOCHECKBOX    "Write", 3012, 118, 140, 42, 10
+    AUTOCHECKBOX    "Exec", 3013, 164, 140, 42, 10
+    LTEXT           "Group", IDC_STATIC, 22, 156, 40, 10
+    AUTOCHECKBOX    "Read", 3014, 72, 156, 42, 10
+    AUTOCHECKBOX    "Write", 3015, 118, 156, 42, 10
+    AUTOCHECKBOX    "Exec", 3016, 164, 156, 42, 10
+    LTEXT           "Others", IDC_STATIC, 22, 172, 40, 10
+    AUTOCHECKBOX    "Read", 3017, 72, 172, 42, 10
+    AUTOCHECKBOX    "Write", 3018, 118, 172, 42, 10
+    AUTOCHECKBOX    "Exec", 3019, 164, 172, 42, 10
+    DEFPUSHBUTTON   "OK", IDOK, 92, 198, 56, 16
+END
