@@ -949,10 +949,17 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
                 {
                     dwAttribs |= SFGAO_HASSUBFOLDER;
                 }
-                // NOTE: no SFGAO_HIDDEN for dotfiles — Explorer would apply its
-                // own hidden filtering on top of ours, which fought the "Show
-                // hidden files" toggle. Hidden-state is handled entirely by our
-                // enumeration filter, driven by HKCU Advanced\Hidden.
+                // Dotfiles are mapped to SFGAO_HIDDEN so Explorer renders them
+                // with the familiar half-transparent icon AND filters them via
+                // its own "hidden items" toggle (verified live: toggling the
+                // Ribbon View checkbox instantly shows/hides them, no F5).
+                // Enumeration itself never filters dotfiles — hiding is fully
+                // delegated to Explorer's hidden-item filtering.
+                WCHAR szName[MAX_PATH] = {};
+                if (SUCCEEDED(_GetName(apidl[0], szName, ARRAYSIZE(szName))) && szName[0] == L'.')
+                {
+                    dwAttribs |= SFGAO_HIDDEN;
+                }
                 *rgfInOut &= dwAttribs;
             }
         }
