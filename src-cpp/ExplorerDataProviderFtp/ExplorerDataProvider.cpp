@@ -28,6 +28,9 @@
 #include "Guid.h"
 #include "fvcommands.h"
 
+// background context menu wrapper (defined in ContextMenu.cpp)
+HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, REFIID riid, void **ppv);
+
 const int g_nMaxLevel = 5;
 
 HRESULT CFolderViewCB_CreateInstance(REFIID riid, void **ppv);
@@ -896,9 +899,17 @@ HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **p
     }
     else if (riid == IID_IContextMenu)
     {
-        // This is the background context menu for the folder itself, not the context menu on items within it.
+        // Background context menu for the folder itself: wrap the system default
+        // menu (View/Sort/Refresh/Paste) and append our folder commands
+        // (show hidden files, copy current path, new folder, paste files, custom).
         DEFCONTEXTMENU dcm = { hwnd, NULL, m_pidl, static_cast<IShellFolder2 *>(this), 0, NULL, NULL, 0, NULL };
-        hr = SHCreateDefaultContextMenu(&dcm, riid, ppv);
+        IContextMenu *pDef = NULL;
+        hr = SHCreateDefaultContextMenu(&dcm, IID_PPV_ARGS(&pDef));
+        if (SUCCEEDED(hr))
+        {
+            hr = CFolderViewImplBgMenu_Create(pDef, m_pidl, riid, ppv);
+            pDef->Release();
+        }
     }
     else if (riid == IID_IExplorerCommandProvider)
     {

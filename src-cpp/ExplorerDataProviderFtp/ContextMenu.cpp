@@ -930,3 +930,130 @@ HRESULT CFolderViewImplPropSheet_CreateInstance(REFIID riid, void **ppv)
     m->Release();
     return hr;
 }
+
+// ---- background menu wrapper: system default menu + our folder commands -----
+static CUSTCMD g_cmds[MAX_CUSTOM];
+class CFolderViewImplBgMenu : public IContextMenu, public IObjectWithSite
+{
+public:
+    CFolderViewImplBgMenu(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder)
+        : ref(1), m_pDefault(pDef), m_site(NULL), m_lastFirst(0), m_defaultCount(0)
+    {
+        m_pidl = pidlFolder ? ILCloneFull(pidlFolder) : NULL;
+        DllAddRef();
+    }
+    ~CFolderViewImplBgMenu()
+    {
+        if (m_pDefault) m_pDefault->Release();
+        if (m_site) m_site->Release();
+        if (m_pidl) ILFree(m_pidl);
+        DllRelease();
+    }
+    HRESULT QueryInterface(REFIID r, void **p)
+    {
+        static const QITAB q[] = { QITABENT(CFolderViewImplBgMenu, IContextMenu),
+                                   QITABENT(CFolderViewImplBgMenu, IObjectWithSite), {0} };
+        return QISearch(this, q, r, p);
+    }
+    ULONG AddRef() { return InterlockedIncrement(&ref); }
+    ULONG Release() { long n = InterlockedDecrement(&ref); if (!n) delete this; return n; }
+
+    HRESULT QueryContextMenu(HMENU m, UINT i, UINT first, UINT maxid, UINT flags)
+    {
+        UINT n = 0;
+        if (m_pDefault)
+        {
+            HRESULT hr = m_pDefault->QueryContextMenu(m, i, first, maxid, flags);
+            if (SUCCEEDED(hr)) n = LOWORD(hr);
+        }
+        m_lastFirst = first;
+        m_defaultCount = n;
+
+        UINT pos = i + n;
+        UINT our = first + n;
+        BOOL showHidden = FtpHiddenSetting();
+        InsertMenuW(m, pos++, MF_BYPOSITION, our++, showHidden ? L"Don't show hidden files" : L"Show hidden files");
+        InsertMenuW(m, pos++, MF_BYPOSITION, our++, L"Copy current path");
+        InsertMenuW(m, pos++, MF_BYPOSITION, our++, L"New folder...");
+        InsertMenuW(m, pos++, MF_BYPOSITION, our++, L"Paste files here");
+        int custom = LoadCustomCommands(g_cmds, MAX_CUSTOM);
+        if (custom > 0)
+        {
+            InsertMenuW(m, pos++, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+            for (int k = 0; k < custom; k++)
+                InsertMenuW(m, pos++, MF_BYPOSITION, our++, g_cmds[k].name);
+        }
+        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, n + 4 + custom);
+    }
+
+    HRESULT InvokeCommand(LPCMINVOKECOMMANDINFO ci)
+    {
+        UINT id = IS_INTRESOURCE(ci->lpVerb) ? LOWORD((UINT_PTR)ci->lpVerb) : 99;
+        UINT ourStart = m_lastFirst + m_defaultCount;
+        if (id < ourStart && m_pDefault)
+            return m_pDefault->InvokeCommand(ci);           // system item
+
+        WCHAR site[64] = {}, folder[512] = {};
+        if (m_pidl) { PidlSite(m_pidl, site, ARRAYSIZE(site)); PidlPath(m_pidl, folder, ARRAYSIZE(folder)); }
+        switch (id - ourStart)
+        {
+        case 0: // show hidden
+            FtpSetHiddenSetting(!FtpHiddenSetting());
+            FtpCacheClear();
+            if (m_pidl) SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, m_pidl, NULL);
+            break;
+        case 1: { std::wstring t = site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
+        case 2: NewFolderRemote(ci->hwnd, site, folder); break;
+        case 3: PasteClipboardToFolder(ci->hwnd, site, folder); break;
+        default: BgCustomCommand(ci->hwnd, site, folder, id - ourStart - 4); break;
+        }
+        return S_OK;
+    }
+
+    HRESULT GetCommandString(UINT_PTR id, UINT type, UINT *r, LPSTR s, UINT c)
+    {
+        if (m_pDefault && id < m_lastFirst + m_defaultCount)
+            return m_pDefault->GetCommandString(id, type, r, s, c);
+        return E_NOTIMPL;
+    }
+
+    HRESULT SetSite(IUnknown *s)
+    {
+        if (m_site) m_site->Release();
+        m_site = s;
+        if (m_site) m_site->AddRef();
+        return S_OK;
+    }
+    HRESULT GetSite(REFIID r, void **p)
+    {
+        if (m_pDefault)
+        {
+            IObjectWithSite *ows = NULL;
+            if (SUCCEEDED(m_pDefault->QueryInterface(IID_PPV_ARGS(&ows))))
+            {
+                HRESULT hr = ows->GetSite(r, p);
+                ows->Release();
+                return hr;
+            }
+        }
+        return m_site ? m_site->QueryInterface(r, p) : E_FAIL;
+    }
+
+private:
+    long ref;
+    IContextMenu *m_pDefault;
+    IUnknown *m_site;
+    PIDLIST_ABSOLUTE m_pidl;
+    UINT m_lastFirst;
+    UINT m_defaultCount;
+};
+
+HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, REFIID riid, void **ppv)
+{
+    *ppv = NULL;
+    CFolderViewImplBgMenu *bg = new (std::nothrow) CFolderViewImplBgMenu(pDef, pidlFolder);
+    if (!bg) return E_OUTOFMEMORY;
+    HRESULT hr = bg->QueryInterface(riid, ppv);
+    bg->Release();
+    return hr;
+}
