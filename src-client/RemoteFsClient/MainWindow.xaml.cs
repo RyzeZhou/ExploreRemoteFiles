@@ -81,6 +81,33 @@ public partial class MainWindow : Window
         StatusText.Text = "已删除";
     }
 
+    /// <summary>WinSCP 设置：指定 WinSCP.com 路径（支持绿色版/便携版），存入注册表。</summary>
+    private void OnWinScpSettings(object sender, RoutedEventArgs e)
+    {
+        var current = ConnectionTester.FindWinScp();
+        var dlg = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "选择 WinSCP.com（绿色版请选解压目录里的 WinSCP.com）",
+            Filter = "WinSCP 命令行程序|WinSCP.com|所有文件|*.*",
+            FileName = current ?? "WinSCP.com",
+            CheckFileExists = true,
+        };
+        if (dlg.ShowDialog() == true)
+        {
+            try
+            {
+                Microsoft.Win32.Registry.CurrentUser
+                    .CreateSubKey(@"Software\ExplorerRemoteFs")?
+                    .SetValue("WinScpPath", dlg.FileName);
+                StatusText.Text = $"WinSCP.com 已设置: {dlg.FileName}";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"保存失败: {ex.Message}", "WinSCP 设置", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+    }
+
     private async void OnTest(object sender, RoutedEventArgs e)
     {
         if (_selected == null) { StatusText.Text = "请先选择站点"; return; }

@@ -56,3 +56,12 @@ ExplorerRemoteFs — FTP/SFTP 资源管理器集成（NSE）
 开发/日志
 --------
 诊断日志：C:\temp\remotefs-debug.log（ProbeLog）。
+
+WinSCP 绿色版（便携版）支持
+--------------------------
+- "测试连接"与自定义命令(type=script)需要 WinSCP.com。查找顺序：
+  1) GUI 站点管理器点"WinSCP 设置"按钮，手动选择绿色版解压目录里的 WinSCP.com
+     （路径存入注册表 HKCU\Software\ExplorerRemoteFs\WinScpPath）；
+  2) 常见安装路径（Program Files）；
+  3) PATH。
+- 找不到时提示信息会说明如何指定，不再只报"请先安装"。

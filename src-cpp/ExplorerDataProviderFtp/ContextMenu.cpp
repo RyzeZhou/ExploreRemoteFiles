@@ -106,6 +106,34 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
     WaitForSingleObject(pi.hProcess,30000);DWORD code=1;GetExitCodeProcess(pi.hProcess,&code);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);return code==0?0:-1;
 }
 
+// WinSCP.com location for "script" custom commands: registry
+// (HKCU\Software\ExplorerRemoteFs\WinScpPath, set by the GUI client) -> common
+// install paths -> PATH. Supports portable/green WinSCP installs.
+static const WCHAR *GetWinScpPath()
+{
+    static WCHAR s_path[MAX_PATH] = {};
+    if (!s_path[0])
+    {
+        DWORD cb = sizeof(s_path);
+        LONG r = RegGetValueW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", L"WinScpPath",
+                              RRF_RT_REG_SZ, NULL, s_path, &cb);
+        if (r != ERROR_SUCCESS || !s_path[0])
+        {
+            s_path[0] = 0;
+            static const WCHAR *probes[] = {
+                L"C:\\Program Files (x86)\\WinSCP\\WinSCP.com",
+                L"C:\\Program Files\\WinSCP\\WinSCP.com",
+            };
+            for (const WCHAR *p : probes)
+            {
+                if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES)
+                { StringCchCopyW(s_path, ARRAYSIZE(s_path), p); break; }
+            }
+        }
+    }
+    return s_path;
+}
+
 #define BIT(v) ((v)?BST_CHECKED:BST_UNCHECKED)
 typedef struct RemoteMeta {
     WCHAR name[MAX_PATH]; WCHAR type[24]; WCHAR mode[16]; WCHAR owner[40]; WCHAR group[40];
@@ -576,7 +604,7 @@ static void RunCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name,
     if(0==StrCmpIW(c.type,L"script")){
         // Run through winscp.com: open site then run the command line(s)
         WCHAR ws[2600];
-        StringCchPrintf(ws,ARRAYSIZE(ws),L"\"C:\\Program Files (x86)\\WinSCP\\WinSCP.com\" /command \"open \\\"%s\\\"\" \"%s\" \"close\" \"exit\"",site,cmd);
+        StringCchPrintf(ws,ARRAYSIZE(ws),L"\"%s\" /command \"open \\\"%s\\\"\" \"%s\" \"close\" \"exit\"",GetWinScpPath(),site,cmd);
         STARTUPINFOW si={sizeof(si)}; PROCESS_INFORMATION pi={};
         if(CreateProcessW(NULL,ws,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)){
             CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
@@ -647,7 +675,7 @@ static void BgCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, int idx)
     if (0 == StrCmpIW(c.type, L"script"))
     {
         WCHAR ws[2600];
-        StringCchPrintf(ws, ARRAYSIZE(ws), L"\"C:\\Program Files (x86)\\WinSCP\\WinSCP.com\" /command \"open \\\"%s\\\"\" \"%s\" \"close\" \"exit\"", site, cmd);
+        StringCchPrintf(ws, ARRAYSIZE(ws), L"\"%s\" /command \"open \\\"%s\\\"\" \"%s\" \"close\" \"exit\"", GetWinScpPath(), site, cmd);
         STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
         if (CreateProcessW(NULL, ws, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }

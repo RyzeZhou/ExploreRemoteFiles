@@ -7,7 +7,8 @@
         <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="8,8,8,4">
             <Button Content="新建站点" Click="OnNew" Padding="10,4" Margin="0,0,6,0"/>
             <Button Content="编辑" Click="OnEdit" Padding="10,4" Margin="0,0,6,0"/>
-            <Button Content="删除" Click="OnDelete" Padding="10,4"/>
+            <Button Content="删除" Click="OnDelete" Padding="10,4" Margin="0,0,6,0"/>
+            <Button Content="WinSCP 设置" Click="OnWinScpSettings" Padding="10,4"/>
         </StackPanel>
 
         <StatusBar DockPanel.Dock="Bottom">

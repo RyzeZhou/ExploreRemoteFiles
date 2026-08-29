@@ -26,14 +26,57 @@ public static class ConnectionTester
         @"C:\Program Files\WinSCP\WinSCP.com",
     };
 
+    /// <summary>
+    /// 查找 WinSCP.com，支持绿色版/便携版：
+    ///   1) 注册表 HKCU\Software\ExplorerRemoteFs\WinScpPath（GUI 设置里指定）；
+    ///   2) 常见安装路径；
+    ///   3) PATH（where winscp.com）。
+    /// </summary>
+    public static string? FindWinScp()
+    {
+        // 1) user-configured path (portable installs)
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\ExplorerRemoteFs");
+            string? cfg = key?.GetValue("WinScpPath") as string;
+            if (!string.IsNullOrEmpty(cfg) && File.Exists(cfg)) return cfg;
+        }
+        catch { /* fall through */ }
+
+        // 2) common install paths
+        foreach (var p in CandidatePaths)
+            if (File.Exists(p)) return p;
+
+        // 3) PATH
+        try
+        {
+            var psi = new ProcessStartInfo("where.exe", "winscp.com")
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+            };
+            using var p = Process.Start(psi);
+            if (p != null)
+            {
+                string? line = p.StandardOutput.ReadLine();
+                p.WaitForExit(3000);
+                if (!string.IsNullOrEmpty(line) && File.Exists(line.Trim())) return line.Trim();
+            }
+        }
+        catch { /* not on PATH */ }
+
+        return null;
+    }
+
     public static async Task<TestResult> TestAsync(Models.SiteInfo site)
         => await Task.Run(() => Test(site));
 
     private static TestResult Test(Models.SiteInfo site)
     {
-        string? winscp = CandidatePaths.FirstOrDefault(File.Exists);
+        string? winscp = FindWinScp();
         if (winscp == null)
-            return Fail("未找到 WinSCP.com。请先安装 WinSCP。");
+            return Fail("未找到 WinSCP.com。请安装 WinSCP，或在站点管理器设置里指定 WinSCP.com 路径（支持绿色版）。");
 
         string scriptPath = Path.Combine(Path.GetTempPath(), $"rfc-test-{Guid.NewGuid():N}.txt");
         try
