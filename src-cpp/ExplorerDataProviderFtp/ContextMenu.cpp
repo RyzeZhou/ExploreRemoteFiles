@@ -544,36 +544,6 @@ static void RunCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name,
 
 // ---- background (folder empty area) menu helpers ----------------------------
 
-#define MENU_BG_SHOWHIDDEN 200
-#define MENU_BG_COPY_PATH  201
-#define MENU_BG_MKDIR      202
-#define MENU_BG_PASTE      203
-#define MENU_BG_CUSTOM_BASE 210
-
-static BOOL FtpHiddenSetting()
-{
-    DWORD v=0, sz=sizeof(v); HKEY hk;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-            0, KEY_READ, &hk) == ERROR_SUCCESS)
-    {
-        if (RegQueryValueExW(hk, L"Hidden", 0, NULL, (BYTE*)&v, &sz) != ERROR_SUCCESS) v = 0;
-        RegCloseKey(hk);
-    }
-    return v == 1;
-}
-static void FtpSetHiddenSetting(BOOL show)
-{
-    HKEY hk;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-            0, NULL, 0, KEY_WRITE, NULL, &hk, NULL) == ERROR_SUCCESS)
-    {
-        DWORD v = show ? 1 : 0;
-        RegSetValueExW(hk, L"Hidden", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
-        RegCloseKey(hk);
-    }
-}
 static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder)
 {
     WCHAR name[256] = L"New folder";
@@ -650,7 +620,7 @@ public:
  ULONG AddRef(){return InterlockedIncrement(&ref);} ULONG Release(){long n=InterlockedDecrement(&ref);if(!n)delete this;return n;}
  HRESULT QueryContextMenu(HMENU m,UINT i,UINT first,UINT,UINT flags){
     if(flags&CMF_DEFAULTONLY)return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
-    SELDATA sel; if(!CollectSelection(data,&sel)) return BuildBackgroundMenu(m,i,first,flags);
+    SELDATA sel; if(!CollectSelection(data,&sel)) return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
     BOOL multi = sel.count>1;
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_OPEN,L"Open");
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_EDIT,L"Edit");
@@ -672,40 +642,8 @@ public:
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_PROPERTIES,multi?L"Properties (first)":L"Remote properties");
     return MAKE_HRESULT(SEVERITY_SUCCESS,0,12+custom);
  }
- HRESULT BuildBackgroundMenu(HMENU m,UINT i,UINT first,UINT flags){
-    if(flags&CMF_VERBSONLY)return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
-    if(!m_pidlFolder)return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
-    BOOL showHidden=FtpHiddenSetting();
-    InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_SHOWHIDDEN,showHidden?L"Don't show hidden files":L"Show hidden files");
-    InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_COPY_PATH,L"Copy current path");
-    InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_MKDIR,L"New folder...");
-    InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_PASTE,L"Paste files here");
-    int custom=0; CUSTCMD cmds[MAX_CUSTOM]={};
-    custom=LoadCustomCommands(cmds,MAX_CUSTOM);
-    if(custom>0){ InsertMenuW(m,i++,MF_BYPOSITION|MF_SEPARATOR,0,NULL);
-        for(int k=0;k<custom;k++) InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_CUSTOM_BASE+k,cmds[k].name); }
-    return MAKE_HRESULT(SEVERITY_SUCCESS,0,4+custom);
- }
  HRESULT InvokeCommand(LPCMINVOKECOMMANDINFO ci){
     UINT id=IS_INTRESOURCE(ci->lpVerb)?LOWORD((UINT_PTR)ci->lpVerb):99;
-    if(id>=MENU_BG_CUSTOM_BASE || (id>=MENU_BG_SHOWHIDDEN && id<=MENU_BG_PASTE)){
-        WCHAR site[64]={},folder[512]={};
-        if(m_pidlFolder){ PidlSite(m_pidlFolder,site,ARRAYSIZE(site)); PidlPath(m_pidlFolder,folder,ARRAYSIZE(folder)); }
-        switch(id){
-        case MENU_BG_SHOWHIDDEN:
-            FtpSetHiddenSetting(!FtpHiddenSetting());
-            FtpCacheClear();
-            if(m_pidlFolder) SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_IDLIST,m_pidlFolder,NULL);
-            break;
-        case MENU_BG_COPY_PATH:{
-            std::wstring t=site; t+=L":"; t+=folder;
-            CopyTextToClipboard(ci->hwnd,t.c_str()); break; }
-        case MENU_BG_MKDIR: NewFolderRemote(ci->hwnd,site,folder); break;
-        case MENU_BG_PASTE: PasteClipboardToFolder(ci->hwnd,site,folder); break;
-        default: BgCustomCommand(ci->hwnd,site,folder,id-MENU_BG_CUSTOM_BASE); break;
-        }
-        return S_OK;
-    }
     if(!data)return E_INVALIDARG;
     SELDATA sel; if(!CollectSelection(data,&sel))return E_FAIL;
     PCWSTR pnames[MAX_SEL]; for(int k=0;k<sel.count;k++) pnames[k]=sel.names[k];
@@ -939,6 +877,7 @@ public:
     CFolderViewImplBgMenu(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder)
         : ref(1), m_pDefault(pDef), m_site(NULL), m_lastFirst(0), m_defaultCount(0)
     {
+        if (m_pDefault) m_pDefault->AddRef();   // keep the default menu alive
         m_pidl = pidlFolder ? ILCloneFull(pidlFolder) : NULL;
         DllAddRef();
     }
@@ -968,44 +907,50 @@ public:
         }
         m_lastFirst = first;
         m_defaultCount = n;
+        ProbeLog(L"[BG] QueryContextMenu first=%u maxid=%u flags=0x%X defaultCount=%u", first, maxid, flags, n);
 
         UINT pos = i + n;
         UINT our = first + n;
-        BOOL showHidden = FtpHiddenSetting();
-        InsertMenuW(m, pos++, MF_BYPOSITION, our++, showHidden ? L"Don't show hidden files" : L"Show hidden files");
-        InsertMenuW(m, pos++, MF_BYPOSITION, our++, L"Copy current path");
-        InsertMenuW(m, pos++, MF_BYPOSITION, our++, L"New folder...");
-        InsertMenuW(m, pos++, MF_BYPOSITION, our++, L"Paste files here");
-        int custom = LoadCustomCommands(g_cmds, MAX_CUSTOM);
-        if (custom > 0)
+        UINT added = 0;
+#define BG_INSERT(text) do { if (our < maxid) { InsertMenuW(m, pos++, MF_BYPOSITION, our++, (text)); added++; } } while(0)
+        BG_INSERT(L"Copy current path");
+        BG_INSERT(L"New folder...");
+        BG_INSERT(L"Paste files here");
+#undef BG_INSERT
+        int custom = 0;
+        if (added > 0 && our < maxid)
         {
-            InsertMenuW(m, pos++, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-            for (int k = 0; k < custom; k++)
-                InsertMenuW(m, pos++, MF_BYPOSITION, our++, g_cmds[k].name);
+            custom = LoadCustomCommands(g_cmds, MAX_CUSTOM);
+            if (custom > 0)
+            {
+                InsertMenuW(m, pos++, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+                for (int k = 0; k < custom && our < maxid; k++)
+                    InsertMenuW(m, pos++, MF_BYPOSITION, our++, g_cmds[k].name);
+            }
         }
-        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, n + 4 + custom);
+        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, n + added + custom);
     }
 
     HRESULT InvokeCommand(LPCMINVOKECOMMANDINFO ci)
     {
         UINT id = IS_INTRESOURCE(ci->lpVerb) ? LOWORD((UINT_PTR)ci->lpVerb) : 99;
-        UINT ourStart = m_lastFirst + m_defaultCount;
-        if (id < ourStart && m_pDefault)
+        // Explorer may pass either the absolute menu id (first+k) or the
+        // relative index (k). Normalize to relative.
+        UINT rel = id;
+        if (m_lastFirst > 0 && id >= m_lastFirst) rel = id - m_lastFirst;
+        ProbeLog(L"[BG] InvokeCommand id=%u rel=%u defaultCount=%u", id, rel, m_defaultCount);
+        if (m_pDefault && rel < m_defaultCount)
             return m_pDefault->InvokeCommand(ci);           // system item
 
         WCHAR site[64] = {}, folder[512] = {};
         if (m_pidl) { PidlSite(m_pidl, site, ARRAYSIZE(site)); PidlPath(m_pidl, folder, ARRAYSIZE(folder)); }
-        switch (id - ourStart)
+        UINT k = rel - m_defaultCount;
+        switch (k)
         {
-        case 0: // show hidden
-            FtpSetHiddenSetting(!FtpHiddenSetting());
-            FtpCacheClear();
-            if (m_pidl) SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, m_pidl, NULL);
-            break;
-        case 1: { std::wstring t = site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
-        case 2: NewFolderRemote(ci->hwnd, site, folder); break;
-        case 3: PasteClipboardToFolder(ci->hwnd, site, folder); break;
-        default: BgCustomCommand(ci->hwnd, site, folder, id - ourStart - 4); break;
+        case 0: { std::wstring t = site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
+        case 1: NewFolderRemote(ci->hwnd, site, folder); break;
+        case 2: PasteClipboardToFolder(ci->hwnd, site, folder); break;
+        default: BgCustomCommand(ci->hwnd, site, folder, k - 3); break;
         }
         return S_OK;
     }

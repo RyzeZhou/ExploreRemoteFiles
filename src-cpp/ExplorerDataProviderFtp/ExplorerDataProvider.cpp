@@ -1647,20 +1647,6 @@ HRESULT CFolderViewImplEnumIDList::Initialize()
 // Follows the system-wide "Show hidden files" toggle
 // (HKCU\...\Explorer\Advanced\Hidden) — Explorer does not reliably pass
 // SHCONTF_INCLUDEHIDDEN to virtual folders, so we read the setting ourselves.
-static BOOL FtpShowHiddenSetting()
-{
-    DWORD v = 0, sz = sizeof(v);
-    HKEY hk;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-            0, KEY_READ, &hk) == ERROR_SUCCESS)
-    {
-        if (RegQueryValueExW(hk, L"Hidden", NULL, NULL, (LPBYTE)&v, &sz) != ERROR_SUCCESS) v = 0;
-        RegCloseKey(hk);
-    }
-    return v == 1;
-}
-
 HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG *pceltFetched)
 {
     ULONG celtFetched = 0;
@@ -1672,14 +1658,9 @@ HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG 
         while (SUCCEEDED(hr) && i < celt && m_nItem < ARRAYSIZE(m_aData) && m_aData[m_nItem].szName[0])
         {
             BOOL fSkip = FALSE;
-            // Linux-style dotfiles: hidden unless the system "Show hidden files"
-            // toggle is on (or the caller explicitly asked for hidden items).
-            if (m_aData[m_nItem].szName[0] == L'.' &&
-                !(m_grfFlags & SHCONTF_INCLUDEHIDDEN) &&
-                !FtpShowHiddenSetting())
-            {
-                fSkip = TRUE;
-            }
+            // NOTE: dotfiles are ALWAYS shown — matches WSL \\wsl$ behavior
+            // (no hidden-file concept); avoids fighting Explorer's own hidden
+            // filtering and the Advanced\Hidden toggle.
             if (!fSkip)
             {
                 if (m_aData[m_nItem].fIsFolder)
