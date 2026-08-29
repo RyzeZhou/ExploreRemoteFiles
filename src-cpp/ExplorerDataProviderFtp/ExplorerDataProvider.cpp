@@ -212,6 +212,7 @@ static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
 
 static void FormatMode(DWORD mode, BOOL folder, BOOL symlink, PWSTR out, UINT cch);  // fwd
 static BOOL GetFriendlyType(PCWSTR name, BOOL fIsFolder, PWSTR out, UINT cch);        // fwd
+static BOOL GetSiteColumnValue(PCWSTR siteName, UINT col, PWSTR out, UINT cch);       // fwd
 
 static PCFVITEMID IsOursItem(PCUIDLIST_RELATIVE p)
 {
@@ -770,7 +771,9 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
     {
         // Compare child ids by column data (lParam & SHCIDS_COLUMNMASK).
         // Column model matches GetDetailsOf: 0=Name 1=Type 2=Permissions
-        // 3=Owner 4=Group 5=Size 6=Modified.
+        // 3=Owner 4=Group 5=Size 6=Modified (level >=1, remote directory),
+        // or 0=Name 1=Host 2=Protocol 3=Port 4=User 5=Start Path (level 0,
+        // the connection picker — not a remote directory).
         WCHAR name1[MAX_PATH] = {}, name2[MAX_PATH] = {};
         if (FAILED(_GetName(pidl1, name1, ARRAYSIZE(name1))) ||
             FAILED(_GetName(pidl2, name2, ARRAYSIZE(name2))))
@@ -778,63 +781,102 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
             return E_INVALIDARG;
         }
 
-        // Folders always sort before files (Windows convention, independent of
-        // the sort direction Explorer applies).
-        ITEMDATA m1 = {}, m2 = {};
-        GetItemMeta(m_szSiteName, m_szRemotePath, name1, &m1);
-        GetItemMeta(m_szSiteName, m_szRemotePath, name2, &m2);
-        if (m1.fIsFolder != m2.fIsFolder)
-        {
-            return ResultFromShort(m1.fIsFolder ? -1 : 1);
-        }
-
         int cmp = 0;
-        switch (lParam & SHCIDS_COLUMNMASK)
+        if (m_nLevel == 0)
         {
-        case 0: // Name -- natural (number-aware) order.
-            cmp = StrCmpLogicalW(name1, name2);
-            break;
-        case 1: // Type -- friendly type name, tie-break by name.
-        {
-            WCHAR t1[128] = {}, t2[128] = {};
-            GetFriendlyType(name1, m1.fIsFolder, t1, ARRAYSIZE(t1));
-            GetFriendlyType(name2, m2.fIsFolder, t2, ARRAYSIZE(t2));
-            cmp = StrCmpLogicalW(t1, t2);
-            if (!cmp) cmp = StrCmpLogicalW(name1, name2);
-            break;
-        }
-        case 2: // Permissions (Linux mode string).
-        {
-            WCHAR p1[16] = {}, p2[16] = {};
-            FormatMode(m1.dwMode, m1.fIsFolder, m1.fIsSymlink, p1, ARRAYSIZE(p1));
-            FormatMode(m2.dwMode, m2.fIsFolder, m2.fIsSymlink, p2, ARRAYSIZE(p2));
-            cmp = StrCmpW(p1, p2);
-            if (!cmp) cmp = StrCmpLogicalW(name1, name2);
-            break;
-        }
-        case 3: // Owner.
-            cmp = StrCmpLogicalW(m1.szOwner, m2.szOwner);
-            if (!cmp) cmp = StrCmpLogicalW(name1, name2);
-            break;
-        case 4: // Group.
-            cmp = StrCmpLogicalW(m1.szGroup, m2.szGroup);
-            if (!cmp) cmp = StrCmpLogicalW(name1, name2);
-            break;
-        case 5: // Size.
-            if (m1.dwSize != m2.dwSize)
-                cmp = (m1.dwSize < m2.dwSize) ? -1 : 1;
-            else
+            const FTPSITE *s1 = FtpSiteFind(name1), *s2 = FtpSiteFind(name2);
+            switch (lParam & SHCIDS_COLUMNMASK)
+            {
+            case 0: // Name
                 cmp = StrCmpLogicalW(name1, name2);
-            break;
-        case 6: // Modified.
-            if (m1.dwMtime != m2.dwMtime)
-                cmp = (m1.dwMtime < m2.dwMtime) ? -1 : 1;
-            else
+                break;
+            case 1: // Host
+                cmp = StrCmpLogicalW(s1 ? s1->host : L"", s2 ? s2->host : L"");
+                if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 2: // Protocol
+                cmp = StrCmpLogicalW(s1 ? s1->type : L"", s2 ? s2->type : L"");
+                if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 3: // Port
+            {
+                int p1 = s1 ? s1->port : 0, p2 = s2 ? s2->port : 0;
+                if (p1 != p2) cmp = (p1 < p2) ? -1 : 1;
+                else cmp = StrCmpLogicalW(name1, name2);
+                break;
+            }
+            case 4: // User
+                cmp = StrCmpLogicalW(s1 ? s1->user : L"", s2 ? s2->user : L"");
+                if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 5: // Start Path
+                cmp = StrCmpLogicalW(s1 ? s1->startPath : L"", s2 ? s2->startPath : L"");
+                if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+                break;
+            default:
                 cmp = StrCmpLogicalW(name1, name2);
-            break;
-        default:
-            cmp = StrCmpLogicalW(name1, name2);
-            break;
+                break;
+            }
+        }
+        else
+        {
+            // Folders always sort before files (Windows convention, independent of
+            // the sort direction Explorer applies).
+            ITEMDATA m1 = {}, m2 = {};
+            GetItemMeta(m_szSiteName, m_szRemotePath, name1, &m1);
+            GetItemMeta(m_szSiteName, m_szRemotePath, name2, &m2);
+            if (m1.fIsFolder != m2.fIsFolder)
+            {
+                return ResultFromShort(m1.fIsFolder ? -1 : 1);
+            }
+
+            switch (lParam & SHCIDS_COLUMNMASK)
+            {
+            case 0: // Name -- natural (number-aware) order.
+                cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 1: // Type -- friendly type name, tie-break by name.
+            {
+                WCHAR t1[128] = {}, t2[128] = {};
+                GetFriendlyType(name1, m1.fIsFolder, t1, ARRAYSIZE(t1));
+                GetFriendlyType(name2, m2.fIsFolder, t2, ARRAYSIZE(t2));
+                cmp = StrCmpLogicalW(t1, t2);
+                if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+                break;
+            }
+            case 2: // Permissions (Linux mode string).
+            {
+                WCHAR p1[16] = {}, p2[16] = {};
+                FormatMode(m1.dwMode, m1.fIsFolder, m1.fIsSymlink, p1, ARRAYSIZE(p1));
+                FormatMode(m2.dwMode, m2.fIsFolder, m2.fIsSymlink, p2, ARRAYSIZE(p2));
+                cmp = StrCmpW(p1, p2);
+                if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+                break;
+            }
+            case 3: // Owner.
+                cmp = StrCmpLogicalW(m1.szOwner, m2.szOwner);
+                if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 4: // Group.
+                cmp = StrCmpLogicalW(m1.szGroup, m2.szGroup);
+                if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 5: // Size.
+                if (m1.dwSize != m2.dwSize)
+                    cmp = (m1.dwSize < m2.dwSize) ? -1 : 1;
+                else
+                    cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 6: // Modified.
+                if (m1.dwMtime != m2.dwMtime)
+                    cmp = (m1.dwMtime < m2.dwMtime) ? -1 : 1;
+                else
+                    cmp = StrCmpLogicalW(name1, name2);
+                break;
+            default:
+                cmp = StrCmpLogicalW(name1, name2);
+                break;
+            }
         }
         hr = ResultFromShort(cmp);
     }
@@ -982,9 +1024,23 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
             hr = _GetFolderness(apidl[0], &fIsFolder);
             if (SUCCEEDED(hr))
             {
-                // This refers to icon indices in shell32.  You can also supply custom icons or
-                // register IExtractImage to support general images.
-                hr = pdxi->SetNormalIcon(L"shell32.dll", fIsFolder ? 4 : 1);
+                if (m_nLevel == 0)
+                {
+                    // Site picker: saved connections get a server icon so the
+                    // "connection manager" semantics are visually distinct from
+                    // remote directories (which show a folder icon).
+                    SHSTOCKICONINFO sii = { sizeof(sii) };
+                    if (SUCCEEDED(SHGetStockIconInfo(SIID_SERVER, SHGSI_ICONLOCATION, &sii)) && sii.szPath[0])
+                        hr = pdxi->SetNormalIcon(sii.szPath, sii.iIcon);
+                    else
+                        hr = pdxi->SetNormalIcon(L"shell32.dll", 15);
+                }
+                else
+                {
+                    // This refers to icon indices in shell32.  You can also supply custom icons or
+                    // register IExtractImage to support general images.
+                    hr = pdxi->SetNormalIcon(L"shell32.dll", fIsFolder ? 4 : 1);
+                }
             }
             if (SUCCEEDED(hr))
             {
@@ -1256,6 +1312,14 @@ static BOOL GetFriendlyType(PCWSTR name, BOOL fIsFolder, PWSTR out, UINT cch)
 
 HRESULT CFolderViewImplFolder::GetDefaultColumnState(UINT iColumn, SHCOLSTATEF *pcsFlags)
 {
+    if (m_nLevel == 0)
+    {
+        if (iColumn >= 6) return E_INVALIDARG;
+        *pcsFlags = SHCOLSTATE_ONBYDEFAULT;
+        if (iColumn == 3)      *pcsFlags |= SHCOLSTATE_TYPE_INT;   // Port
+        else                   *pcsFlags |= SHCOLSTATE_TYPE_STR;
+        return S_OK;
+    }
     if (iColumn >= 7) return E_INVALIDARG;
     *pcsFlags = SHCOLSTATE_ONBYDEFAULT;
     if (iColumn == 0)          *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Name
@@ -1266,6 +1330,26 @@ HRESULT CFolderViewImplFolder::GetDefaultColumnState(UINT iColumn, SHCOLSTATEF *
     else if (iColumn == 5)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // Size
     else if (iColumn == 6)     *pcsFlags |= SHCOLSTATE_TYPE_DATE;  // Modified
     return S_OK;
+}
+
+//  Column value for a saved site (level-0 site picker). Semantics: a
+//  connection manager, NOT a remote directory — columns describe the
+//  connection, not file metadata.
+static BOOL GetSiteColumnValue(PCWSTR siteName, UINT col, PWSTR out, UINT cch)
+{
+    const FTPSITE *s = FtpSiteFind(siteName);
+    if (!s) return FALSE;
+    switch (col)
+    {
+    case 0: StringCchCopy(out, cch, s->name); break;
+    case 1: StringCchCopy(out, cch, s->host); break;
+    case 2: StringCchCopy(out, cch, s->type); break;
+    case 3: StringCchPrintf(out, cch, L"%d", s->port); break;
+    case 4: StringCchCopy(out, cch, s->user); break;
+    case 5: StringCchCopy(out, cch, s->startPath); break;
+    default: return FALSE;
+    }
+    return TRUE;
 }
 
 //  Requests the GUID of the default search object for the folder.
@@ -1378,45 +1462,95 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
     if (!pidl)
     {
         // No item means we're returning information about the column itself.
-        switch (iColumn)
+        // The FTP root (level 0) is a CONNECTION PICKER, not a remote
+        // directory — it gets its own column set describing the connection.
+        if (m_nLevel == 0)
         {
-        case 0:
-            pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Name");
-            break;
-        case 1:
-            pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Type");
-            break;
-        case 2:
-            pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Permissions");
-            break;
-        case 3:
-            pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Owner");
-            break;
-        case 4:
-            pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Group");
-            break;
-        case 5:
-            pDetails->fmt = LVCFMT_RIGHT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Size");
-            break;
-        case 6:
-            pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Modified");
-            break;
-        default:
-            // GetDetailsOf is called with increasing column indices until failure.
-            hr = E_FAIL;
-            break;
+            switch (iColumn)
+            {
+            case 0:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Name");
+                break;
+            case 1:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Host");
+                break;
+            case 2:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Protocol");
+                break;
+            case 3:
+                pDetails->fmt = LVCFMT_RIGHT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Port");
+                break;
+            case 4:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"User");
+                break;
+            case 5:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Start Path");
+                break;
+            default:
+                hr = E_FAIL;
+                break;
+            }
+        }
+        else
+        {
+            switch (iColumn)
+            {
+            case 0:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Name");
+                break;
+            case 1:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Type");
+                break;
+            case 2:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Permissions");
+                break;
+            case 3:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Owner");
+                break;
+            case 4:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Group");
+                break;
+            case 5:
+                pDetails->fmt = LVCFMT_RIGHT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Size");
+                break;
+            case 6:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Modified");
+                break;
+            default:
+                // GetDetailsOf is called with increasing column indices until failure.
+                hr = E_FAIL;
+                break;
+            }
         }
     }
     else if (SUCCEEDED(hr))
     {
-        hr = _GetColumnDisplayName(pidl, &key, NULL, szRet, ARRAYSIZE(szRet));
+        if (m_nLevel == 0)
+        {
+            WCHAR siteName[MAX_PATH] = {};
+            hr = _GetName(pidl, siteName, ARRAYSIZE(siteName));
+            if (SUCCEEDED(hr) && GetSiteColumnValue(siteName, iColumn, szRet, ARRAYSIZE(szRet)))
+                hr = S_OK;
+            else
+                hr = E_FAIL;
+        }
+        else
+        {
+            hr = _GetColumnDisplayName(pidl, &key, NULL, szRet, ARRAYSIZE(szRet));
+        }
     }
 
     if (SUCCEEDED(hr))
@@ -1432,16 +1566,32 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
 HRESULT CFolderViewImplFolder::MapColumnToSCID(UINT iColumn, PROPERTYKEY *pkey)
 {
     HRESULT hr = S_OK;
-    switch (iColumn)
+    if (m_nLevel == 0)
     {
-    case 0:  *pkey = PKEY_ItemNameDisplay; break;
-    case 1:  *pkey = PKEY_Remote_Type; break;
-    case 2:  *pkey = PKEY_Remote_Permissions; break;
-    case 3:  *pkey = PKEY_Remote_Owner; break;
-    case 4:  *pkey = PKEY_Remote_Group; break;
-    case 5:  *pkey = PKEY_Remote_Size; break;
-    case 6:  *pkey = PKEY_Remote_Modified; break;
-    default: hr = E_FAIL; break;
+        switch (iColumn)
+        {
+        case 0:  *pkey = PKEY_ItemNameDisplay; break;
+        case 1:  *pkey = PKEY_Remote_SiteHost; break;
+        case 2:  *pkey = PKEY_Remote_SiteProto; break;
+        case 3:  *pkey = PKEY_Remote_SitePort; break;
+        case 4:  *pkey = PKEY_Remote_SiteUser; break;
+        case 5:  *pkey = PKEY_Remote_SiteStart; break;
+        default: hr = E_FAIL; break;
+        }
+    }
+    else
+    {
+        switch (iColumn)
+        {
+        case 0:  *pkey = PKEY_ItemNameDisplay; break;
+        case 1:  *pkey = PKEY_Remote_Type; break;
+        case 2:  *pkey = PKEY_Remote_Permissions; break;
+        case 3:  *pkey = PKEY_Remote_Owner; break;
+        case 4:  *pkey = PKEY_Remote_Group; break;
+        case 5:  *pkey = PKEY_Remote_Size; break;
+        case 6:  *pkey = PKEY_Remote_Modified; break;
+        default: hr = E_FAIL; break;
+        }
     }
     return hr;
 }
