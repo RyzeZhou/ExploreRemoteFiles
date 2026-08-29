@@ -47,3 +47,5 @@
 #define IDD_PERMBOX                     4000
 
 #define IDD_PERMPAGE                     4002
+
+#define IDD_SITEPAGE                     4003

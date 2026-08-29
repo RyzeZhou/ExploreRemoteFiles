@@ -29,7 +29,7 @@
 #include "fvcommands.h"
 
 // background context menu wrapper (defined in ContextMenu.cpp)
-HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, REFIID riid, void **ppv);
+HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, int level, REFIID riid, void **ppv);
 
 const int g_nMaxLevel = 5;
 
@@ -278,6 +278,36 @@ public:
     HRESULT GetValue(REFPROPERTYKEY key, PROPVARIANT *pv)
     {
         PropVariantInit(pv);
+        // Site-picker item (no site segment): expose connection properties.
+        if (!szSite[0])
+        {
+            if (IsEqualPropertyKey(key, PKEY_ItemNameDisplay) || IsEqualPropertyKey(key, PKEY_FileName))
+            {
+                pv->vt = VT_LPWSTR;
+                return SHStrDup(szName, &pv->pwszVal);
+            }
+            if (IsEqualPropertyKey(key, PKEY_ItemType))
+            {
+                pv->vt = VT_LPWSTR;
+                return SHStrDup(L"FTP connection", &pv->pwszVal);
+            }
+            const FTPSITE *s = FtpSiteFind(szName);
+            if (s)
+            {
+                if (IsEqualPropertyKey(key, PKEY_Remote_SiteHost))  return SHStrDup(s->host, &pv->pwszVal);
+                if (IsEqualPropertyKey(key, PKEY_Remote_SiteProto)) return SHStrDup(s->type, &pv->pwszVal);
+                if (IsEqualPropertyKey(key, PKEY_Remote_SitePort))
+                {
+                    WCHAR buf[16];
+                    StringCchPrintf(buf, ARRAYSIZE(buf), L"%d", s->port);
+                    pv->vt = VT_LPWSTR;
+                    return SHStrDup(buf, &pv->pwszVal);
+                }
+                if (IsEqualPropertyKey(key, PKEY_Remote_SiteUser))  return SHStrDup(s->user, &pv->pwszVal);
+                if (IsEqualPropertyKey(key, PKEY_Remote_SiteStart)) return SHStrDup(s->startPath, &pv->pwszVal);
+            }
+            return S_OK;
+        }
         if (IsEqualPropertyKey(key, PKEY_ItemNameDisplay) || IsEqualPropertyKey(key, PKEY_FileName))
         {
             pv->vt = VT_LPWSTR;
@@ -934,7 +964,7 @@ HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **p
         hr = SHCreateDefaultContextMenu(&dcm, IID_PPV_ARGS(&pDef));
         if (SUCCEEDED(hr))
         {
-            hr = CFolderViewImplBgMenu_Create(pDef, m_pidl, riid, ppv);
+            hr = CFolderViewImplBgMenu_Create(pDef, m_pidl, m_nLevel, riid, ppv);
             pDef->Release();
         }
     }
@@ -1064,7 +1094,10 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
             WCHAR site[64] = {}, folder[512] = {}, name[MAX_PATH] = {};
             GetPidlSite(m_pidl, site, ARRAYSIZE(site));
             GetPidlPath(m_pidl, folder, ARRAYSIZE(folder));
-            if (SUCCEEDED(_GetName(apidl[0], name, ARRAYSIZE(name))) && site[0])
+            // Level 0 (site picker): the item is a saved connection — the
+            // folder PIDL has no site segment; build the store from the site
+            // name alone (GetValue branches on empty szSite).
+            if (SUCCEEDED(_GetName(apidl[0], name, ARRAYSIZE(name))))
             {
                 CFolderViewImplPropStore *ps = new (std::nothrow) CFolderViewImplPropStore(site, folder, name);
                 hr = ps ? S_OK : E_OUTOFMEMORY;

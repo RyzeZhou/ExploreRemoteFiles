@@ -148,3 +148,23 @@ BEGIN
     EDITTEXT        3022, 52, 189, 44, 14, ES_AUTOHSCROLL
     AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 190, 122, 10
 END
+
+// Read-only connection info page for a saved site (site-picker level 0).
+IDD_SITEPAGE DIALOGEX 0, 0, 220, 112
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD | WS_DISABLED | WS_CAPTION
+CAPTION "Connection"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Name:", IDC_STATIC, 8, 8, 48, 10
+    LTEXT           "", 4001, 62, 8, 150, 10
+    LTEXT           "Host:", IDC_STATIC, 8, 24, 48, 10
+    LTEXT           "", 4002, 62, 24, 150, 10
+    LTEXT           "Protocol:", IDC_STATIC, 8, 40, 48, 10
+    LTEXT           "", 4003, 62, 40, 150, 10
+    LTEXT           "Port:", IDC_STATIC, 8, 56, 48, 10
+    LTEXT           "", 4004, 62, 56, 150, 10
+    LTEXT           "User:", IDC_STATIC, 8, 72, 48, 10
+    LTEXT           "", 4005, 62, 72, 150, 10
+    LTEXT           "Start path:", IDC_STATIC, 8, 88, 48, 10
+    LTEXT           "", 4006, 62, 88, 150, 10
+END

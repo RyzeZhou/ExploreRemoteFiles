@@ -291,7 +291,9 @@ static BOOL CollectSelection(IDataObject *data, SELDATA *out)
             PCUIDLIST_RELATIVE child=(PCUIDLIST_RELATIVE)((BYTE*)cida+cida->aoffset[i]);
             if(IsOurs(child)){ CopyName((const COMPACTITEM*)child,out->names[out->count],ARRAYSIZE(out->names[0])); out->count++; }
         }
-        ok = out->site[0] && out->count>0;
+        // Site-picker items (level 0) have no site segment in the folder PIDL;
+        // accept a non-empty selection regardless so their property sheet works.
+        ok = out->count>0;
     }
     if(cida) GlobalUnlock(st.hGlobal);
     ReleaseStgMedium(&st);
@@ -712,6 +714,41 @@ HRESULT CFolderViewImplContextMenu_CreateInstance(REFIID riid,void**ppv){*ppv=NU
 // ---- property sheet: Ribbon "Properties" button -> standard Properties
 // dialog with our Permissions page (PSN_APPLY writes back via chmod). --------
 
+// Read-only connection info page for a saved site (site-picker level 0).
+static INT_PTR CALLBACK SitePageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_INITDIALOG:
+    {
+        PROPMETA *pm = (PROPMETA*)((LPPROPSHEETPAGE)lp)->lParam;
+        if (!pm) return FALSE;
+        SetWindowLongPtrW(hDlg, DWLP_USER, (LONG_PTR)pm);
+        const FTPSITE *s = FtpSiteFind(pm->site);
+        WCHAR buf[64] = {};
+        SetDlgItemTextW(hDlg, 4001, (s && s->name[0]) ? s->name : pm->site);
+        SetDlgItemTextW(hDlg, 4002, s ? s->host : L"");
+        SetDlgItemTextW(hDlg, 4003, s ? s->type : L"");
+        if (s) StringCchPrintf(buf, ARRAYSIZE(buf), L"%d", s->port);
+        SetDlgItemTextW(hDlg, 4004, buf);
+        SetDlgItemTextW(hDlg, 4005, s ? s->user : L"");
+        SetDlgItemTextW(hDlg, 4006, s ? s->startPath : L"");
+        return TRUE;
+    }
+    case WM_NOTIFY:
+    {
+        NMHDR *nm = (NMHDR*)lp;
+        if (nm && nm->code == PSN_APPLY)
+        {
+            SetWindowLongPtrW(hDlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+            return TRUE;
+        }
+        break;
+    }
+    }
+    return FALSE;
+}
+
 static UINT CALLBACK PermPageCallback(HWND /* hwnd */, UINT uMsg, LPPROPSHEETPAGE ppsp)
 {
     if (uMsg == PSPCB_RELEASE)
@@ -823,7 +860,32 @@ public:
         if (sel.notify) CoTaskMemFree(sel.notify);
         if (!ReadRemoteMeta(sel.site, sel.folder, sel.names[0], &pm->meta))
         {
-            CoTaskMemFree(pm);
+            // Site-picker item (level 0): not a remote file — show a read-only
+            // connection info page instead of a Permissions page.
+            const FTPSITE *s = FtpSiteFind(sel.names[0]);
+            if (!s)
+            {
+                CoTaskMemFree(pm);
+                return S_OK;
+            }
+            StringCchCopy(pm->site, ARRAYSIZE(pm->site), sel.names[0]);
+            PROPSHEETPAGE psp = {};
+            psp.dwSize = sizeof(psp);
+            psp.dwFlags = PSP_USECALLBACK;
+            psp.hInstance = g_hInst;
+            psp.pszTemplate = MAKEINTRESOURCEW(IDD_SITEPAGE);
+            psp.pfnDlgProc = SitePageProc;
+            psp.lParam = (LPARAM)pm;
+            psp.pfnCallback = PermPageCallback;
+            HPROPSHEETPAGE hPage = CreatePropertySheetPage(&psp);
+            if (!hPage)
+            {
+                if (pm->notify) CoTaskMemFree(pm->notify);
+                CoTaskMemFree(pm);
+                return S_OK;
+            }
+            if (!pfnAddPage(hPage, lParam))
+                DestroyPropertySheetPage(hPage);
             return S_OK;
         }
 
@@ -874,8 +936,8 @@ static CUSTCMD g_cmds[MAX_CUSTOM];
 class CFolderViewImplBgMenu : public IContextMenu, public IObjectWithSite
 {
 public:
-    CFolderViewImplBgMenu(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder)
-        : ref(1), m_pDefault(pDef), m_site(NULL), m_lastFirst(0), m_defaultCount(0)
+    CFolderViewImplBgMenu(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, int level)
+        : ref(1), m_pDefault(pDef), m_site(NULL), m_lastFirst(0), m_defaultCount(0), m_nLevel(level)
     {
         if (m_pDefault) m_pDefault->AddRef();   // keep the default menu alive
         m_pidl = pidlFolder ? ILCloneFull(pidlFolder) : NULL;
@@ -913,9 +975,18 @@ public:
         UINT our = first + n;
         UINT added = 0;
 #define BG_INSERT(text) do { if (our < maxid) { InsertMenuW(m, pos++, MF_BYPOSITION, our++, (text)); added++; } } while(0)
-        BG_INSERT(L"Copy current path");
-        BG_INSERT(L"New folder...");
-        BG_INSERT(L"Paste files here");
+        if (m_nLevel == 0)
+        {
+            // Site picker (connection manager): the only useful action here is
+            // creating a new site, which launches the GUI site manager.
+            BG_INSERT(L"New site...");
+        }
+        else
+        {
+            BG_INSERT(L"Copy current path");
+            BG_INSERT(L"New folder...");
+            BG_INSERT(L"Paste files here");
+        }
 #undef BG_INSERT
         int custom = 0;
         if (added > 0 && our < maxid)
@@ -945,6 +1016,15 @@ public:
         WCHAR site[64] = {}, folder[512] = {};
         if (m_pidl) { PidlSite(m_pidl, site, ARRAYSIZE(site)); PidlPath(m_pidl, folder, ARRAYSIZE(folder)); }
         UINT k = rel - m_defaultCount;
+        if (m_nLevel == 0)
+        {
+            // Site picker: new site launches the GUI client's site manager.
+            if (k == 0)
+                ShellExecuteW(ci->hwnd, NULL,
+                    L"D:\\tools\\explorer-remote-fs\\src-client\\RemoteFsClient\\bin\\Release\\net8.0-windows\\RemoteFsClient.exe",
+                    NULL, NULL, SW_SHOWNORMAL);
+            return S_OK;
+        }
         switch (k)
         {
         case 0: { std::wstring t = site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
@@ -991,12 +1071,13 @@ private:
     PIDLIST_ABSOLUTE m_pidl;
     UINT m_lastFirst;
     UINT m_defaultCount;
+    int m_nLevel;
 };
 
-HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, REFIID riid, void **ppv)
+HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, int level, REFIID riid, void **ppv)
 {
     *ppv = NULL;
-    CFolderViewImplBgMenu *bg = new (std::nothrow) CFolderViewImplBgMenu(pDef, pidlFolder);
+    CFolderViewImplBgMenu *bg = new (std::nothrow) CFolderViewImplBgMenu(pDef, pidlFolder, level);
     if (!bg) return E_OUTOFMEMORY;
     HRESULT hr = bg->QueryInterface(riid, ppv);
     bg->Release();
