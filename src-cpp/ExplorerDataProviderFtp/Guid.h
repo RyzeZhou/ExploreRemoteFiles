@@ -46,3 +46,5 @@ DEFINE_PROPERTYKEY(PKEY_Remote_Modified, 0x3d0e1bf8, 0xfa3a, 0x4f1f, 0xbd, 0xbc,
 // Property sheet handler (Ribbon "Properties" -> standard dialog with our
 // Permissions page). {5DD84779-FEF1-46A3-8FCF-9F1A9603BB8F}
 DEFINE_GUID(CLSID_RemoteFsPropSheet, 0x5dd84779, 0xfef1, 0x46a3, 0x8f, 0xcf, 0x9f, 0x1a, 0x96, 0x03, 0xbb, 0x8f);
+// Type column (friendly type name resolved by Explorer's association system).
+DEFINE_PROPERTYKEY(PKEY_Remote_Type, 0x7f782df7, 0xbf57, 0x428f, 0xb1, 0x57, 0xe4, 0x17, 0x7b, 0xb7, 0x55, 0x1a, 2);

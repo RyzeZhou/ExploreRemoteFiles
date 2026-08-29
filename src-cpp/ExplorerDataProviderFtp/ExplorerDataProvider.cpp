@@ -211,6 +211,7 @@ static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
 // GetUIObjectOf's IPropertyStore branch, so defined before both) ------------
 
 static void FormatMode(DWORD mode, BOOL folder, BOOL symlink, PWSTR out, UINT cch);  // fwd
+static BOOL GetFriendlyType(PCWSTR name, BOOL fIsFolder, PWSTR out, UINT cch);        // fwd
 
 static PCFVITEMID IsOursItem(PCUIDLIST_RELATIVE p)
 {
@@ -306,6 +307,13 @@ public:
             WCHAR mode[16];
             FormatMode(meta.dwMode, meta.fIsFolder, meta.fIsSymlink, mode, ARRAYSIZE(mode));
             return SHStrDup(mode, &pv->pwszVal);
+        }
+        if (IsEqualPropertyKey(key, PKEY_Remote_Type))
+        {
+            pv->vt = VT_LPWSTR;
+            WCHAR type[128];
+            GetFriendlyType(szName, meta.fIsFolder, type, ARRAYSIZE(type));
+            return SHStrDup(type, &pv->pwszVal);
         }
         return S_OK;
     }
@@ -1211,16 +1219,75 @@ HRESULT CFolderViewImplFolder::GetDefaultColumn(DWORD /* dwRes */,
 }
 
 //  Retrieves the default state for a specified column.
+//  Friendly type name for the "Type" column, resolved by Explorer's own
+//  association system (same strings the shell shows for local files).
+//  Rule: a dotfile with no second dot (.bashrc) has NO extension; otherwise
+//  the extension is from the LAST dot (.hidden-test.txt -> ".txt",
+//  archive.tar.gz -> ".gz").
+static BOOL GetFriendlyType(PCWSTR name, BOOL fIsFolder, PWSTR out, UINT cch)
+{
+    if (fIsFolder)
+    {
+        SHFILEINFOW sfi = {};
+        if (SHGetFileInfoW(L"x", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+                           SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES) && sfi.szTypeName[0])
+        {
+            StringCchCopy(out, cch, sfi.szTypeName);
+            return TRUE;
+        }
+        StringCchCopy(out, cch, L"Folder");
+        return TRUE;
+    }
+
+    const WCHAR *dot = wcsrchr(name, L'.');
+    // no dot / dot is the first char (dotfile w/o second dot) / trailing dot -> no extension
+    if (!dot || dot == name || !dot[1])
+    {
+        SHFILEINFOW sfi = {};
+        if (SHGetFileInfoW(L"x", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
+                           SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES) && sfi.szTypeName[0])
+        {
+            StringCchCopy(out, cch, sfi.szTypeName);
+            return TRUE;
+        }
+        StringCchCopy(out, cch, L"File");
+        return TRUE;
+    }
+
+    // Cache ext -> friendly type (GetDetailsOf is called per item per column).
+    static struct { WCHAR ext[16]; WCHAR type[64]; } s_cache[32];
+    static int s_n = 0;
+    for (int i = 0; i < s_n; i++)
+        if (!_wcsicmp(s_cache[i].ext, dot))
+        {
+            StringCchCopy(out, cch, s_cache[i].type);
+            return TRUE;
+        }
+
+    WCHAR buf[128] = {};
+    DWORD cchBuf = ARRAYSIZE(buf);
+    HRESULT hr = AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_FRIENDLYDOCNAME, dot, NULL, buf, &cchBuf);
+    if (FAILED(hr) || !buf[0])
+        StringCchPrintf(buf, ARRAYSIZE(buf), L"%s file", dot + 1);   // unknown extension
+
+    int slot = (s_n < 32) ? s_n++ : 0;
+    StringCchCopyN(s_cache[slot].ext, ARRAYSIZE(s_cache[slot].ext), dot, ARRAYSIZE(s_cache[slot].ext) - 1);
+    StringCchCopy(s_cache[slot].type, ARRAYSIZE(s_cache[slot].type), buf);
+    StringCchCopy(out, cch, buf);
+    return TRUE;
+}
+
 HRESULT CFolderViewImplFolder::GetDefaultColumnState(UINT iColumn, SHCOLSTATEF *pcsFlags)
 {
-    if (iColumn >= 6) return E_INVALIDARG;
+    if (iColumn >= 7) return E_INVALIDARG;
     *pcsFlags = SHCOLSTATE_ONBYDEFAULT;
-    if (iColumn == 0)          *pcsFlags |= SHCOLSTATE_TYPE_STR;
-    else if (iColumn == 1)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Permissions
-    else if (iColumn == 2)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Owner
-    else if (iColumn == 3)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Group
-    else if (iColumn == 4)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // Size
-    else if (iColumn == 5)     *pcsFlags |= SHCOLSTATE_TYPE_DATE;  // Modified
+    if (iColumn == 0)          *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Name
+    else if (iColumn == 1)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Type
+    else if (iColumn == 2)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Permissions
+    else if (iColumn == 3)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Owner
+    else if (iColumn == 4)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Group
+    else if (iColumn == 5)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // Size
+    else if (iColumn == 6)     *pcsFlags |= SHCOLSTATE_TYPE_DATE;  // Modified
     return S_OK;
 }
 
@@ -1251,6 +1318,10 @@ HRESULT CFolderViewImplFolder::_GetColumnDisplayName(PCUITEMID_CHILD pidl,
     if (IsEqualPropertyKey(*pkey, PKEY_ItemNameDisplay))
     {
         StringCchCopy(szVal, ARRAYSIZE(szVal), name);
+    }
+    else if (IsEqualPropertyKey(*pkey, PKEY_Remote_Type))
+    {
+        GetFriendlyType(name, fIsFolder, szVal, ARRAYSIZE(szVal));
     }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_Permissions))
     {
@@ -1338,21 +1409,25 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
             break;
         case 1:
             pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Permissions");
+            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Type");
             break;
         case 2:
             pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Owner");
+            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Permissions");
             break;
         case 3:
             pDetails->fmt = LVCFMT_LEFT;
-            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Group");
+            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Owner");
             break;
         case 4:
+            pDetails->fmt = LVCFMT_LEFT;
+            hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Group");
+            break;
+        case 5:
             pDetails->fmt = LVCFMT_RIGHT;
             hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Size");
             break;
-        case 5:
+        case 6:
             pDetails->fmt = LVCFMT_LEFT;
             hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Modified");
             break;
@@ -1383,11 +1458,12 @@ HRESULT CFolderViewImplFolder::MapColumnToSCID(UINT iColumn, PROPERTYKEY *pkey)
     switch (iColumn)
     {
     case 0:  *pkey = PKEY_ItemNameDisplay; break;
-    case 1:  *pkey = PKEY_Remote_Permissions; break;
-    case 2:  *pkey = PKEY_Remote_Owner; break;
-    case 3:  *pkey = PKEY_Remote_Group; break;
-    case 4:  *pkey = PKEY_Remote_Size; break;
-    case 5:  *pkey = PKEY_Remote_Modified; break;
+    case 1:  *pkey = PKEY_Remote_Type; break;
+    case 2:  *pkey = PKEY_Remote_Permissions; break;
+    case 3:  *pkey = PKEY_Remote_Owner; break;
+    case 4:  *pkey = PKEY_Remote_Group; break;
+    case 5:  *pkey = PKEY_Remote_Size; break;
+    case 6:  *pkey = PKEY_Remote_Modified; break;
     default: hr = E_FAIL; break;
     }
     return hr;
