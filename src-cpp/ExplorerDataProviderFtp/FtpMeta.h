@@ -144,9 +144,19 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
         if (line.rfind("ITEM\t", 0) != 0) continue;
         WCHAR wide[2048];
         if (!MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, wide, ARRAYSIZE(wide))) continue;
-        WCHAR *fields[12] = {}; int nf = 0; WCHAR *ctx = NULL;
-        WCHAR *tok = wcstok_s(wide, L"\t", &ctx);
-        while (tok && nf < 12) { fields[nf++] = tok; tok = wcstok_s(NULL, L"\t", &ctx); }
+        // Manual split that KEEPS empty fields. wcstok_s would skip consecutive
+        // tabs (e.g. SFTP rows have empty owner/group => "\t\t"), shifting every
+        // field index and corrupting the name/uid/gid columns.
+        WCHAR *fields[12] = {}; int nf = 0;
+        WCHAR *p = wide;
+        while (nf < 12)
+        {
+            WCHAR *tab = wcschr(p, L'\t');
+            if (tab) *tab = 0;
+            fields[nf++] = p;
+            if (!tab) break;
+            p = tab + 1;
+        }
         if (nf < 10) continue;
         FTPENTRY &item = out[count];
         DWORD mode = 0;
