@@ -9,6 +9,7 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#include <shobjidl_core.h>
 #include <propkey.h>
 #include <shlwapi.h>
 #include <strsafe.h>
@@ -54,7 +55,8 @@ typedef UNALIGNED FVITEMID *PFVITEMID;
 typedef const UNALIGNED FVITEMID *PCFVITEMID;
 
 class CFolderViewImplFolder : public IShellFolder2,
-                              public IPersistFolder2
+                              public IPersistFolder2,
+                              public IExplorerPaneVisibility
 {
 public:
     CFolderViewImplFolder(UINT nLevel, PCWSTR pszSite, PCWSTR pszRemotePath);
@@ -95,6 +97,9 @@ public:
 
     // IPersistFolder2
     IFACEMETHODIMP GetCurFolder(PIDLIST_ABSOLUTE *ppidl);
+
+    // IExplorerPaneVisibility (Ribbon opt-in, see MSDN "Extending the Ribbon")
+    IFACEMETHODIMP GetPaneState(REFEXPLORERPANE ep, EXPLORERPANESTATE *pps);
 
     // IDList constructor public for the enumerator object
     HRESULT CreateChildID(PCWSTR pszName, int nLevel, int nSize, int nSides, BOOL fIsFolder, PITEMID_CHILD *ppidl);
@@ -298,6 +303,7 @@ HRESULT CFolderViewImplFolder::QueryInterface(REFIID riid, void **ppv)
         QITABENT(CFolderViewImplFolder, IPersist),
         QITABENT(CFolderViewImplFolder, IPersistFolder),
         QITABENT(CFolderViewImplFolder, IPersistFolder2),
+        QITABENT(CFolderViewImplFolder, IExplorerPaneVisibility),
         { 0 },
     };
     return QISearch(this, qit, riid, ppv);
@@ -818,6 +824,11 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
                 {
                     dwAttribs |= SFGAO_HASSUBFOLDER;
                 }
+                WCHAR szName[MAX_PATH] = {};
+                if (SUCCEEDED(_GetName(apidl[0], szName, ARRAYSIZE(szName))) && szName[0] == L'.')
+                {
+                    dwAttribs |= SFGAO_HIDDEN;   // Linux-style dotfiles are hidden
+                }
                 *rgfInOut &= dwAttribs;
             }
         }
@@ -1270,6 +1281,21 @@ HRESULT CFolderViewImplFolder::GetCurFolder(PIDLIST_ABSOLUTE *ppidl)
     return hr;
 }
 
+// Ribbon opt-in: MSDN "Extending the Ribbon" — namespace extensions must
+// request EP_Ribbon via IExplorerPaneVisibility::GetPaneState
+// (EPS_FORCE | EPS_DEFAULT_ON) or Explorer falls back to the old command bar.
+HRESULT CFolderViewImplFolder::GetPaneState(REFEXPLORERPANE ep, EXPLORERPANESTATE *pps)
+{
+    if (!pps) return E_POINTER;
+    *pps = EPS_DEFAULT_OFF;
+    if (IsEqualGUID(ep, EP_Ribbon))
+    {
+        *pps = EPS_FORCE | EPS_DEFAULT_ON;
+        return S_OK;
+    }
+    return E_NOTIMPL;
+}
+
 // Item idlists passed to folder methods are guaranteed to have accessible memory as specified
 // by the cbSize in the itemid.  However they may be loaded from a persisted form (for example
 // shortcuts on disk) where they could be corrupted.  It is the shell folder's responsibility
@@ -1518,7 +1544,13 @@ HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG 
         while (SUCCEEDED(hr) && i < celt && m_nItem < ARRAYSIZE(m_aData) && m_aData[m_nItem].szName[0])
         {
             BOOL fSkip = FALSE;
-            if (!(m_grfFlags & SHCONTF_STORAGE))
+            // Linux-style dotfiles: hidden unless the "Show hidden files" view
+            // option (SHCONTF_INCLUDEHIDDEN) is active.
+            if (m_aData[m_nItem].szName[0] == L'.' && !(m_grfFlags & SHCONTF_INCLUDEHIDDEN))
+            {
+                fSkip = TRUE;
+            }
+            if (!fSkip)
             {
                 if (m_aData[m_nItem].fIsFolder)
                 {
@@ -1610,8 +1642,20 @@ public:
     }
 
     // IShellFolderViewCB
-    IFACEMETHODIMP MessageSFVCB(UINT /* uMsg */, WPARAM /* wParam */, LPARAM /* lParam */)
-        { return E_NOTIMPL; }
+    IFACEMETHODIMP MessageSFVCB(UINT uMsg, WPARAM /* wParam */, LPARAM /* lParam */)
+    {
+        // SFVM_GETVIEWSTATE (0x23) asks the callback for FOLDERVIEWOPTIONS bits.
+        // The value is stable legacy API; newer SDKs trimmed the enum, so the
+        // constant is hardcoded here.
+        if (uMsg == 0x23)
+        {
+            // FVO_SHOWEXT (0x80): force file extensions to be shown (Linux
+            // semantics — no "hide known extensions" concept). The Ribbon's
+            // "file extensions" checkbox renders checked & disabled here.
+            return (HRESULT)0x80;
+        }
+        return E_NOTIMPL;
+    }
 
     // IFolderViewSettings
     IFACEMETHODIMP GetColumnPropertyList(REFIID /* riid */, void **ppv)
