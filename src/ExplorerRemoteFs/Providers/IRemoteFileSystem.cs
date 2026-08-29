@@ -33,6 +33,12 @@ public interface IRemoteFileSystem : IDisposable
     /// <summary>递归修改目录树权限（chmod -R；mode 为 8 进制数字）。</summary>
     void SetPermissionsRecursive(string path, int mode);
 
+    /// <summary>
+    /// 修改所有者/组（chown/chgrp）。user/group 传 null 表示不修改；数字或名字均可（
+    /// 实现层按协议能力处理：SFTP 支持，FTP 一般不支持）。
+    /// </summary>
+    void SetOwner(string path, string? user, string? group);
+
     /// <summary>服务器端复制（duplicate：远端到远端，源到目标）。</summary>
     void Copy(string from, string to);
 

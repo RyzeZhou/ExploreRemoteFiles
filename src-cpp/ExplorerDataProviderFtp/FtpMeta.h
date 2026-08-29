@@ -14,6 +14,8 @@ typedef struct
     DWORD   dwMode;
     DWORD   dwSize;
     DWORD   dwMtime;
+    DWORD   dwUid;      // 0 = unknown (FTP has no numeric ids)
+    DWORD   dwGid;
     BOOL    fIsFolder;
     BOOL    fIsSymlink;
     WCHAR   szOwner[40];
@@ -142,9 +144,9 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
         if (line.rfind("ITEM\t", 0) != 0) continue;
         WCHAR wide[2048];
         if (!MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, wide, ARRAYSIZE(wide))) continue;
-        WCHAR *fields[10] = {}; int nf = 0; WCHAR *ctx = NULL;
+        WCHAR *fields[12] = {}; int nf = 0; WCHAR *ctx = NULL;
         WCHAR *tok = wcstok_s(wide, L"\t", &ctx);
-        while (tok && nf < 10) { fields[nf++] = tok; tok = wcstok_s(NULL, L"\t", &ctx); }
+        while (tok && nf < 12) { fields[nf++] = tok; tok = wcstok_s(NULL, L"\t", &ctx); }
         if (nf < 10) continue;
         FTPENTRY &item = out[count];
         DWORD mode = 0;
@@ -156,6 +158,8 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
         StringCchCopy(item.szGroup, ARRAYSIZE(item.szGroup), fields[5]);
         item.fIsFolder  = _wtoi(fields[6]) != 0;
         item.fIsSymlink = _wtoi(fields[7]) != 0;
+        item.dwUid = (nf > 10 && fields[10]) ? (DWORD)_wtoi64(fields[10]) : 0;
+        item.dwGid = (nf > 11 && fields[11]) ? (DWORD)_wtoi64(fields[11]) : 0;
         StringCchCopy(item.szName, ARRAYSIZE(item.szName), fields[9]);
         count++;
     }

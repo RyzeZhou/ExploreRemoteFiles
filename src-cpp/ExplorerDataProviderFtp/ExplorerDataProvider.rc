@@ -70,7 +70,7 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 118, 38, 48, 14
 END
 
-IDD_PERMBOX DIALOGEX 0, 0, 240, 236
+IDD_PERMBOX DIALOGEX 0, 0, 240, 268
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Remote Permissions"
 FONT 9, "Segoe UI"
@@ -89,30 +89,34 @@ BEGIN
     LTEXT           "", 3006, 60, 92, 170, 10
     LTEXT           "Modified:", IDC_STATIC, 12, 108, 48, 10
     LTEXT           "", 3007, 64, 108, 166, 10
-    GROUPBOX        "Permissions", IDC_STATIC, 12, 126, 218, 56
-    LTEXT           "Owner", IDC_STATIC, 22, 140, 40, 10
-    AUTOCHECKBOX    "Read", 3011, 72, 140, 42, 10
-    AUTOCHECKBOX    "Write", 3012, 118, 140, 42, 10
-    AUTOCHECKBOX    "Exec", 3013, 164, 140, 42, 10
-    LTEXT           "Group", IDC_STATIC, 22, 156, 40, 10
-    AUTOCHECKBOX    "Read", 3014, 72, 156, 42, 10
-    AUTOCHECKBOX    "Write", 3015, 118, 156, 42, 10
-    AUTOCHECKBOX    "Exec", 3016, 164, 156, 42, 10
-    LTEXT           "Others", IDC_STATIC, 22, 172, 40, 10
-    AUTOCHECKBOX    "Read", 3017, 72, 172, 42, 10
-    AUTOCHECKBOX    "Write", 3018, 118, 172, 42, 10
-    AUTOCHECKBOX    "Exec", 3019, 164, 172, 42, 10
-    LTEXT           "Octal:", IDC_STATIC, 12, 191, 36, 10
-    EDITTEXT        3022, 52, 189, 44, 14, ES_AUTOHSCROLL
-    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 190, 122, 10
-    DEFPUSHBUTTON   "OK", IDOK, 82, 212, 56, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 146, 212, 56, 14
+    LTEXT           "New owner (UID):", IDC_STATIC, 12, 124, 72, 10
+    EDITTEXT        3024, 88, 122, 142, 14, ES_AUTOHSCROLL
+    LTEXT           "New group (GID):", IDC_STATIC, 12, 140, 72, 10
+    EDITTEXT        3025, 88, 138, 142, 14, ES_AUTOHSCROLL
+    GROUPBOX        "Permissions", IDC_STATIC, 12, 158, 218, 56
+    LTEXT           "Owner", IDC_STATIC, 22, 172, 40, 10
+    AUTOCHECKBOX    "Read", 3011, 72, 172, 42, 10
+    AUTOCHECKBOX    "Write", 3012, 118, 172, 42, 10
+    AUTOCHECKBOX    "Exec", 3013, 164, 172, 42, 10
+    LTEXT           "Group", IDC_STATIC, 22, 188, 40, 10
+    AUTOCHECKBOX    "Read", 3014, 72, 188, 42, 10
+    AUTOCHECKBOX    "Write", 3015, 118, 188, 42, 10
+    AUTOCHECKBOX    "Exec", 3016, 164, 188, 42, 10
+    LTEXT           "Others", IDC_STATIC, 22, 204, 40, 10
+    AUTOCHECKBOX    "Read", 3017, 72, 204, 42, 10
+    AUTOCHECKBOX    "Write", 3018, 118, 204, 42, 10
+    AUTOCHECKBOX    "Exec", 3019, 164, 204, 42, 10
+    LTEXT           "Octal:", IDC_STATIC, 12, 223, 36, 10
+    EDITTEXT        3022, 52, 221, 44, 14, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 222, 122, 10
+    DEFPUSHBUTTON   "OK", IDOK, 82, 244, 56, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 146, 244, 56, 14
 END
 
 // Property-sheet version of the permissions page (no buttons; the standard
 // Properties dialog provides OK/Cancel). Standard property-page template
 // style: DS_FIXEDSYS | WS_CHILD | WS_DISABLED.
-IDD_PERMPAGE DIALOGEX 0, 0, 240, 220
+IDD_PERMPAGE DIALOGEX 0, 0, 240, 252
 STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD | WS_DISABLED | WS_CAPTION
 CAPTION "Permissions"
 FONT 9, "Segoe UI"
@@ -131,22 +135,26 @@ BEGIN
     LTEXT           "", 3006, 60, 92, 170, 10
     LTEXT           "Modified:", IDC_STATIC, 12, 108, 48, 10
     LTEXT           "", 3007, 64, 108, 166, 10
-    GROUPBOX        "Permissions", IDC_STATIC, 12, 126, 218, 56
-    LTEXT           "Owner", IDC_STATIC, 22, 140, 40, 10
-    AUTOCHECKBOX    "Read", 3011, 72, 140, 42, 10
-    AUTOCHECKBOX    "Write", 3012, 118, 140, 42, 10
-    AUTOCHECKBOX    "Exec", 3013, 164, 140, 42, 10
-    LTEXT           "Group", IDC_STATIC, 22, 156, 40, 10
-    AUTOCHECKBOX    "Read", 3014, 72, 156, 42, 10
-    AUTOCHECKBOX    "Write", 3015, 118, 156, 42, 10
-    AUTOCHECKBOX    "Exec", 3016, 164, 156, 42, 10
-    LTEXT           "Others", IDC_STATIC, 22, 172, 40, 10
-    AUTOCHECKBOX    "Read", 3017, 72, 172, 42, 10
-    AUTOCHECKBOX    "Write", 3018, 118, 172, 42, 10
-    AUTOCHECKBOX    "Exec", 3019, 164, 172, 42, 10
-    LTEXT           "Octal:", IDC_STATIC, 12, 191, 36, 10
-    EDITTEXT        3022, 52, 189, 44, 14, ES_AUTOHSCROLL
-    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 190, 122, 10
+    LTEXT           "New owner (UID):", IDC_STATIC, 12, 124, 72, 10
+    EDITTEXT        3024, 88, 122, 142, 14, ES_AUTOHSCROLL
+    LTEXT           "New group (GID):", IDC_STATIC, 12, 140, 72, 10
+    EDITTEXT        3025, 88, 138, 142, 14, ES_AUTOHSCROLL
+    GROUPBOX        "Permissions", IDC_STATIC, 12, 158, 218, 56
+    LTEXT           "Owner", IDC_STATIC, 22, 172, 40, 10
+    AUTOCHECKBOX    "Read", 3011, 72, 172, 42, 10
+    AUTOCHECKBOX    "Write", 3012, 118, 172, 42, 10
+    AUTOCHECKBOX    "Exec", 3013, 164, 172, 42, 10
+    LTEXT           "Group", IDC_STATIC, 22, 188, 40, 10
+    AUTOCHECKBOX    "Read", 3014, 72, 188, 42, 10
+    AUTOCHECKBOX    "Write", 3015, 118, 188, 42, 10
+    AUTOCHECKBOX    "Exec", 3016, 164, 188, 42, 10
+    LTEXT           "Others", IDC_STATIC, 22, 204, 40, 10
+    AUTOCHECKBOX    "Read", 3017, 72, 204, 42, 10
+    AUTOCHECKBOX    "Write", 3018, 118, 204, 42, 10
+    AUTOCHECKBOX    "Exec", 3019, 164, 204, 42, 10
+    LTEXT           "Octal:", IDC_STATIC, 12, 223, 36, 10
+    EDITTEXT        3022, 52, 221, 44, 14, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 222, 122, 10
 END
 
 // Read-only connection info page for a saved site (site-picker level 0).

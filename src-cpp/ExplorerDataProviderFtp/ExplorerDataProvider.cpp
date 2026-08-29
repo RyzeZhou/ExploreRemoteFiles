@@ -136,6 +136,8 @@ typedef struct
     DWORD   dwMode;       // unix permission bits
     DWORD   dwSize;       // bytes
     DWORD   dwMtime;      // unix epoch seconds
+    DWORD   dwUid;        // 0 = unknown (FTP)
+    DWORD   dwGid;
     BOOL    fIsFolder;
     BOOL    fIsSymlink;
     WCHAR   szOwner[40];
@@ -345,6 +347,20 @@ public:
             WCHAR type[128];
             GetFriendlyType(szName, meta.fIsFolder, type, ARRAYSIZE(type));
             return SHStrDup(type, &pv->pwszVal);
+        }
+        if (IsEqualPropertyKey(key, PKEY_Remote_OwnerUid))
+        {
+            pv->vt = VT_LPWSTR;
+            WCHAR buf[16] = {};
+            if (meta.dwUid) StringCchPrintf(buf, ARRAYSIZE(buf), L"%u", meta.dwUid);
+            return SHStrDup(buf, &pv->pwszVal);
+        }
+        if (IsEqualPropertyKey(key, PKEY_Remote_GroupGid))
+        {
+            pv->vt = VT_LPWSTR;
+            WCHAR buf[16] = {};
+            if (meta.dwGid) StringCchPrintf(buf, ARRAYSIZE(buf), L"%u", meta.dwGid);
+            return SHStrDup(buf, &pv->pwszVal);
         }
         return S_OK;
     }
@@ -887,17 +903,29 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
                 cmp = StrCmpLogicalW(m1.szOwner, m2.szOwner);
                 if (!cmp) cmp = StrCmpLogicalW(name1, name2);
                 break;
-            case 4: // Group.
+            case 4: // UID.
+                if (m1.dwUid != m2.dwUid)
+                    cmp = (m1.dwUid < m2.dwUid) ? -1 : 1;
+                else
+                    cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 5: // Group.
                 cmp = StrCmpLogicalW(m1.szGroup, m2.szGroup);
                 if (!cmp) cmp = StrCmpLogicalW(name1, name2);
                 break;
-            case 5: // Size.
+            case 6: // GID.
+                if (m1.dwGid != m2.dwGid)
+                    cmp = (m1.dwGid < m2.dwGid) ? -1 : 1;
+                else
+                    cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 7: // Size.
                 if (m1.dwSize != m2.dwSize)
                     cmp = (m1.dwSize < m2.dwSize) ? -1 : 1;
                 else
                     cmp = StrCmpLogicalW(name1, name2);
                 break;
-            case 6: // Modified.
+            case 8: // Modified.
                 if (m1.dwMtime != m2.dwMtime)
                     cmp = (m1.dwMtime < m2.dwMtime) ? -1 : 1;
                 else
@@ -1353,15 +1381,17 @@ HRESULT CFolderViewImplFolder::GetDefaultColumnState(UINT iColumn, SHCOLSTATEF *
         else                   *pcsFlags |= SHCOLSTATE_TYPE_STR;
         return S_OK;
     }
-    if (iColumn >= 7) return E_INVALIDARG;
+    if (iColumn >= 9) return E_INVALIDARG;
     *pcsFlags = SHCOLSTATE_ONBYDEFAULT;
     if (iColumn == 0)          *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Name
     else if (iColumn == 1)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Type
     else if (iColumn == 2)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Permissions
     else if (iColumn == 3)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Owner
-    else if (iColumn == 4)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Group
-    else if (iColumn == 5)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // Size
-    else if (iColumn == 6)     *pcsFlags |= SHCOLSTATE_TYPE_DATE;  // Modified
+    else if (iColumn == 4)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // UID
+    else if (iColumn == 5)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Group
+    else if (iColumn == 6)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // GID
+    else if (iColumn == 7)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // Size
+    else if (iColumn == 8)     *pcsFlags |= SHCOLSTATE_TYPE_DATE;  // Modified
     return S_OK;
 }
 
@@ -1425,9 +1455,17 @@ HRESULT CFolderViewImplFolder::_GetColumnDisplayName(PCUITEMID_CHILD pidl,
     {
         StringCchCopy(szVal, ARRAYSIZE(szVal), meta.szOwner[0] ? meta.szOwner : L"?");
     }
+    else if (IsEqualPropertyKey(*pkey, PKEY_Remote_OwnerUid))
+    {
+        if (meta.dwUid) StringCchPrintf(szVal, ARRAYSIZE(szVal), L"%u", meta.dwUid);
+    }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_Group))
     {
         StringCchCopy(szVal, ARRAYSIZE(szVal), meta.szGroup[0] ? meta.szGroup : L"?");
+    }
+    else if (IsEqualPropertyKey(*pkey, PKEY_Remote_GroupGid))
+    {
+        if (meta.dwGid) StringCchPrintf(szVal, ARRAYSIZE(szVal), L"%u", meta.dwGid);
     }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_Size))
     {
@@ -1551,14 +1589,22 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
                 hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Owner");
                 break;
             case 4:
+                pDetails->fmt = LVCFMT_RIGHT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"UID");
+                break;
+            case 5:
                 pDetails->fmt = LVCFMT_LEFT;
                 hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Group");
                 break;
-            case 5:
+            case 6:
+                pDetails->fmt = LVCFMT_RIGHT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"GID");
+                break;
+            case 7:
                 pDetails->fmt = LVCFMT_RIGHT;
                 hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Size");
                 break;
-            case 6:
+            case 8:
                 pDetails->fmt = LVCFMT_LEFT;
                 hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Modified");
                 break;
@@ -1620,9 +1666,11 @@ HRESULT CFolderViewImplFolder::MapColumnToSCID(UINT iColumn, PROPERTYKEY *pkey)
         case 1:  *pkey = PKEY_Remote_Type; break;
         case 2:  *pkey = PKEY_Remote_Permissions; break;
         case 3:  *pkey = PKEY_Remote_Owner; break;
-        case 4:  *pkey = PKEY_Remote_Group; break;
-        case 5:  *pkey = PKEY_Remote_Size; break;
-        case 6:  *pkey = PKEY_Remote_Modified; break;
+        case 4:  *pkey = PKEY_Remote_OwnerUid; break;
+        case 5:  *pkey = PKEY_Remote_Group; break;
+        case 6:  *pkey = PKEY_Remote_GroupGid; break;
+        case 7:  *pkey = PKEY_Remote_Size; break;
+        case 8:  *pkey = PKEY_Remote_Modified; break;
         default: hr = E_FAIL; break;
         }
     }

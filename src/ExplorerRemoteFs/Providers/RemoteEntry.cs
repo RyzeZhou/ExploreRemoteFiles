@@ -20,6 +20,12 @@ public sealed class RemoteEntry
     /// <summary>Group（名字或数字 GID）。</summary>
     public string? Group { get; init; }
 
+    /// <summary>数字 UID；未知为 -1（FTP LIST 无数字 ID；SFTP 有）。</summary>
+    public long Uid { get; init; } = -1;
+
+    /// <summary>数字 GID；未知为 -1。</summary>
+    public long Gid { get; init; } = -1;
+
     public long Size { get; init; }
 
     public DateTime? LastWriteTime { get; init; }

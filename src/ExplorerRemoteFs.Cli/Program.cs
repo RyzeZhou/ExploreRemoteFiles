@@ -43,6 +43,9 @@ switch (argv[0].ToLowerInvariant())
     case "chmodr":
         CmdChmodR(argv);
         break;
+    case "chown":
+        CmdChown(argv);
+        break;
     case "get":
         CmdGet(argv);
         break;
@@ -70,6 +73,7 @@ static void PrintUsage()
           rename <name> <old> <new>  Rename/move remote item
           mkdir <name> <path>   Create remote directory
           chmod <name> <path> <mode>  Change permissions (octal, e.g. 640)
+          chown <name> <path> <user[:group]>  Change owner/group (SFTP; - = keep)
           get <name> <remote> <local> Download remote file to local path
           dup <name> <from> <to>  Duplicate remote file (server-side copy)
         """);
@@ -160,8 +164,8 @@ static void CmdShow()
 }
 
 // Pipe 格式（供 C++ Shell 桥消费）：每行一个条目，tab 分隔，字段顺序固定：
-//   ITEM\tmode\tmtimeUnix\tsize\towner\tgroup\tisFolder\tisSymlink\tremotePath\tname
-// mode 为 Unix 风格字符串（-rw-r--r--），mtime 为 Unix epoch 秒。
+//   ITEM\tmode\tmtimeUnix\tsize\towner\tgroup\tisFolder\tisSymlink\tremotePath\tname\tuid\tgid
+// mode 为 Unix 风格字符串（-rw-r--r--），mtime 为 Unix epoch 秒；uid/gid 未知为 -1。
 static void CmdPipe(string[] args)
 {
     if (args.Length < 2) { PrintUsage(); return; }
@@ -178,7 +182,7 @@ static void CmdPipe(string[] args)
             var mtime = e.LastWriteTime.HasValue
                 ? new DateTimeOffset(e.LastWriteTime.Value.ToUniversalTime()).ToUnixTimeSeconds().ToString()
                 : "0";
-            Console.WriteLine($"ITEM\t{mode}\t{mtime}\t{e.Size}\t{e.OwnerDisplay}\t{e.GroupDisplay}\t{(e.IsDirectory ? 1 : 0)}\t{(e.IsSymlink ? 1 : 0)}\t{path}\t{e.Name}");
+            Console.WriteLine($"ITEM\t{mode}\t{mtime}\t{e.Size}\t{e.OwnerDisplay}\t{e.GroupDisplay}\t{(e.IsDirectory ? 1 : 0)}\t{(e.IsSymlink ? 1 : 0)}\t{path}\t{e.Name}\t{e.Uid}\t{e.Gid}");
         }
     }
     catch (Exception ex)
@@ -276,6 +280,35 @@ static void CmdChmodR(string[] args)
         var fs = ProviderFactory.Get(conn);
         fs.SetPermissionsRecursive(args[2], mode);
         Console.WriteLine($"CHMOD-R: {args[2]} = {args[3]}");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+// chown <site> <path> <user[:group]>   （"-" 或空表示不改该字段，如 "chown s /x -:staff"）
+static void CmdChown(string[] args)
+{
+    if (args.Length < 4) { PrintUsage(); return; }
+    var conn = Find(args[1]);
+    try
+    {
+        string spec = args[3];
+        string? user = null, group = null;
+        int colon = spec.IndexOf(':');
+        if (colon >= 0)
+        {
+            string u = spec.Substring(0, colon), g = spec.Substring(colon + 1);
+            user  = (u is "" or "-") ? null : u;
+            group = (g is "" or "-") ? null : g;
+        }
+        else user = spec == "-" ? null : spec;
+        var fs = ProviderFactory.Get(conn);
+        fs.SetOwner(args[2], user, group);
+        Console.WriteLine($"CHOWN: {args[2]} user={user ?? "-"} group={group ?? "-"}");
     }
     catch (Exception ex)
     {

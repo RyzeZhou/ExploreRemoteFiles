@@ -73,8 +73,12 @@ public sealed class SftpFileSystem : IRemoteFileSystem
                 IsDirectory = isDir,
                 IsSymlink = f.IsSymbolicLink,
                 Mode = FormatMode(f, isDir, f.IsSymbolicLink),
-                Owner = f.UserId >= 0 ? f.UserId.ToString() : null,
-                Group = f.GroupId >= 0 ? f.GroupId.ToString() : null,
+                // SSH.NET exposes numeric UserId/GroupId but no account names;
+                // name columns stay empty (numeric columns carry the values).
+                Owner = null,
+                Group = null,
+                Uid = f.UserId >= 0 ? f.UserId : -1,
+                Gid = f.GroupId >= 0 ? f.GroupId : -1,
                 Size = f.Length,
                 LastWriteTime = f.LastWriteTime,
                 SymlinkTarget = f.IsSymbolicLink ? f.FullName : null
@@ -158,6 +162,34 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         short wire = (short)int.Parse(Convert.ToString(mode, 8));
         _client.ChangePermissions(path, wire);
         Utils.ShellLog.Write($"SFTP chmod: {path} = {Convert.ToString(mode, 8)}");
+    }
+
+    public void SetOwner(string path, string? user, string? group)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        // SFTP 协议（SSH_FXP_SETSTAT）可写 uid/gid；SSH.NET 通过
+        // GetAttributes → 改 UserId/GroupId → SetAttributes 实现（SetLastWriteTime 同模式）。
+        // 名字解析（user → uid）需要服务器侧命令，暂仅支持数字。
+        var attrs = _client.GetAttributes(path)
+            ?? throw new InvalidOperationException($"No such file: {path}");
+        bool changed = false;
+        if (!string.IsNullOrEmpty(user))
+        {
+            if (!uint.TryParse(user, out uint uid))
+                throw new InvalidOperationException($"UID must be numeric: {user}");
+            attrs.UserId = (int)uid;
+            changed = true;
+        }
+        if (!string.IsNullOrEmpty(group))
+        {
+            if (!uint.TryParse(group, out uint gid))
+                throw new InvalidOperationException($"GID must be numeric: {group}");
+            attrs.GroupId = (int)gid;
+            changed = true;
+        }
+        if (changed) _client.SetAttributes(path, attrs);
+        Utils.ShellLog.Write($"SFTP chown: {path} user={user} group={group}");
     }
 
     public void SetPermissionsRecursive(string path, int mode)

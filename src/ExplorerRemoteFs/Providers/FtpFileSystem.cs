@@ -174,6 +174,12 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"FTP chmod: {path} = {modeStr}");
     }
 
+    public void SetOwner(string path, string? user, string? group)
+    {
+        // FTP 协议没有标准的 chown/chgrp；SITE CHOWN 只有极少数服务器实现。
+        throw new InvalidOperationException("FTP does not support changing owner/group (SFTP only)");
+    }
+
     private static bool IsError(FluentFTP.FtpReply resp)
         => resp.Code is { } c && (c.StartsWith("4") || c.StartsWith("5"));
 

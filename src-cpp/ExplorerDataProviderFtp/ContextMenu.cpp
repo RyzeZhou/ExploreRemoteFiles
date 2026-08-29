@@ -109,7 +109,9 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
 #define BIT(v) ((v)?BST_CHECKED:BST_UNCHECKED)
 typedef struct RemoteMeta {
     WCHAR name[MAX_PATH]; WCHAR type[24]; WCHAR mode[16]; WCHAR owner[40]; WCHAR group[40];
-    WCHAR size[32]; WCHAR mtime[32]; DWORD bits; DWORD dwSize; DWORD dwMtime; BOOL fIsFolder; BOOL fIsSymlink;
+    WCHAR size[32]; WCHAR mtime[32]; DWORD bits; DWORD dwSize; DWORD dwMtime;
+    DWORD dwUid; DWORD dwGid;          // 0 = unknown
+    BOOL fIsFolder; BOOL fIsSymlink;
 } REMOTEMETA;
 static DWORD ParseModeFromLine(const WCHAR *fields[])
 {
@@ -158,6 +160,8 @@ static BOOL ReadRemoteMeta(PCWSTR site, PCWSTR folder, PCWSTR name, REMOTEMETA *
         meta->bits = entries[i].dwMode;
         meta->fIsFolder = entries[i].fIsFolder;
         meta->fIsSymlink = entries[i].fIsSymlink;
+        meta->dwUid = entries[i].dwUid;
+        meta->dwGid = entries[i].dwGid;
         WCHAR mode[16];
         FormatModeString(entries[i].dwMode, entries[i].fIsFolder, entries[i].fIsSymlink, mode, ARRAYSIZE(mode));
         StringCchCopy(meta->mode, ARRAYSIZE(meta->mode), mode);
@@ -209,6 +213,43 @@ static void PermSyncOctalToChecks(HWND hDlg)
     if((DWORD)v != PermCollectChecks(hDlg)) PermSetChecks(hDlg,(DWORD)v);
 }
 
+// Owner/Group rows show "name [uid]" / "group [gid]"; the edit boxes below
+// let the user change the numeric uid/gid (SFTP chown; FTP will fail cleanly).
+static void PermInitOwnerGroup(HWND hDlg, const REMOTEMETA *m)
+{
+    WCHAR buf[128];
+    StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%u]", m->owner[0] ? m->owner : L"-", m->dwUid);
+    SetDlgItemTextW(hDlg, 3004, buf);
+    StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%u]", m->group[0] ? m->group : L"-", m->dwGid);
+    SetDlgItemTextW(hDlg, 3005, buf);
+    if (m->dwUid) { WCHAR u[16]; StringCchPrintf(u, ARRAYSIZE(u), L"%u", m->dwUid); SetDlgItemTextW(hDlg, 3024, u); }
+    if (m->dwGid) { WCHAR g[16]; StringCchPrintf(g, ARRAYSIZE(g), L"%u", m->dwGid); SetDlgItemTextW(hDlg, 3025, g); }
+}
+
+// Read the uid/gid edit boxes and chown if either differs from current.
+// Returns TRUE when a change was submitted (even if it failed) so callers
+// can decide whether to refresh.
+static void PermApplyChown(HWND hDlg, PROPMETA *pm)
+{
+    WCHAR newU[32] = {}, newG[32] = {}, curU[16] = {}, curG[16] = {};
+    GetDlgItemTextW(hDlg, 3024, newU, ARRAYSIZE(newU));
+    GetDlgItemTextW(hDlg, 3025, newG, ARRAYSIZE(newG));
+    if (pm->meta.dwUid) StringCchPrintf(curU, ARRAYSIZE(curU), L"%u", pm->meta.dwUid);
+    if (pm->meta.dwGid) StringCchPrintf(curG, ARRAYSIZE(curG), L"%u", pm->meta.dwGid);
+    BOOL changeU = newU[0] && StrCmp(newU, curU) != 0;
+    BOOL changeG = newG[0] && StrCmp(newG, curG) != 0;
+    if (!changeU && !changeG) return;
+    WCHAR spec[64];
+    StringCchPrintf(spec, ARRAYSIZE(spec), L"%s:%s", changeU ? newU : L"-", changeG ? newG : L"-");
+    if (RunCli(pm->site, L"chown", pm->path, spec, NULL) != 0)
+        MessageBoxW(hDlg, L"chown failed (SFTP only; server may deny permission).", L"Remote", MB_OK | MB_ICONERROR);
+    else
+    {
+        FtpCacheClear();
+        if (pm->notify) SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, pm->notify, NULL);
+    }
+}
+
 static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
 {
     switch(msg){
@@ -217,8 +258,8 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
         SetWindowLongPtrW(hDlg,DWLP_USER,(LONG_PTR)pm);
         REMOTEMETA *m=&pm->meta;
         SetDlgItemTextW(hDlg,3001,m->name); SetDlgItemTextW(hDlg,3002,m->type);
-        SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3004,m->owner);
-        SetDlgItemTextW(hDlg,3005,m->group); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
+        SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
+        PermInitOwnerGroup(hDlg,m);
         PermSetChecks(hDlg,m->bits);
         PermSyncChecksToOctal(hDlg);
         // Recursive apply is only meaningful for directories.
@@ -241,6 +282,7 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
                         if(pm->notify) SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_IDLIST,pm->notify,NULL);
                     } else MessageBoxW(hDlg,L"chmod failed.",L"Remote",MB_OK|MB_ICONERROR);
                 }
+                PermApplyChown(hDlg,pm);
             }
             EndDialog(hDlg,IDOK); return TRUE;}
         break;
@@ -779,8 +821,8 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         SetWindowLongPtrW(hDlg, DWLP_USER, (LONG_PTR)pm);
         REMOTEMETA *m = &pm->meta;
         SetDlgItemTextW(hDlg,3001,m->name); SetDlgItemTextW(hDlg,3002,m->type);
-        SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3004,m->owner);
-        SetDlgItemTextW(hDlg,3005,m->group); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
+        SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
+        PermInitOwnerGroup(hDlg,m);
         PermSetChecks(hDlg,m->bits);
         PermSyncChecksToOctal(hDlg);
         EnableWindow(GetDlgItem(hDlg,3023), m->fIsFolder ? TRUE : FALSE);
@@ -811,6 +853,7 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     }
                     else MessageBoxW(hDlg,L"chmod failed.",L"Remote",MB_OK|MB_ICONERROR);
                 }
+                PermApplyChown(hDlg, pm);
             }
             SetWindowLongPtrW(hDlg, DWLP_MSGRESULT, PSNRET_NOERROR);
             return TRUE;
