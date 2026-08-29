@@ -37,6 +37,21 @@ switch (argv[0].ToLowerInvariant())
     case "mkdir":
         CmdMkdir(argv);
         break;
+    case "chmod":
+        CmdChmod(argv);
+        break;
+    case "chmodr":
+        CmdChmodR(argv);
+        break;
+    case "get":
+        CmdGet(argv);
+        break;
+    case "dup":
+        CmdDup(argv);
+        break;
+    case "put":
+        CmdPut(argv);
+        break;
     default:
         PrintUsage();
         break;
@@ -54,6 +69,9 @@ static void PrintUsage()
           delete <name> <path>  Delete remote file/dir
           rename <name> <old> <new>  Rename/move remote item
           mkdir <name> <path>   Create remote directory
+          chmod <name> <path> <mode>  Change permissions (octal, e.g. 640)
+          get <name> <remote> <local> Download remote file to local path
+          dup <name> <from> <to>  Duplicate remote file (server-side copy)
         """);
 }
 
@@ -64,6 +82,13 @@ static ConnectionConfig Find(string name)
     {
         Console.Error.WriteLine($"Connection '{name}' not found. Use: add ...");
         Environment.Exit(1);
+    }
+    // Password fallback: connections.json no longer holds plaintext passwords;
+    // the GUI client stores them in Windows Credential Manager (DPAPI).
+    if (string.IsNullOrEmpty(conn.Password) &&
+        ExplorerRemoteFs.Config.CredentialManager.TryRead(conn.Name, out _, out string secret))
+    {
+        conn.Password = secret;
     }
     return conn;
 }
@@ -211,6 +236,100 @@ static void CmdMkdir(string[] args)
         var fs = ProviderFactory.Get(conn);
         fs.CreateDirectory(args[2]);
         Console.WriteLine($"MKDIR: {args[2]}");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+static void CmdChmod(string[] args)
+{
+    if (args.Length < 4) { PrintUsage(); return; }
+    var conn = Find(args[1]);
+    bool recursive = args.Length > 4 && args[4] == "-r";
+    try
+    {
+        int mode = Convert.ToInt32(args[3], 8);
+        var fs = ProviderFactory.Get(conn);
+        if (recursive) fs.SetPermissionsRecursive(args[2], mode);
+        else fs.SetPermissions(args[2], mode);
+        Console.WriteLine($"CHMOD: {args[2]} = {args[3]}" + (recursive ? " (recursive)" : ""));
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+static void CmdChmodR(string[] args)
+{
+    if (args.Length < 4) { PrintUsage(); return; }
+    var conn = Find(args[1]);
+    try
+    {
+        int mode = Convert.ToInt32(args[3], 8);
+        var fs = ProviderFactory.Get(conn);
+        fs.SetPermissionsRecursive(args[2], mode);
+        Console.WriteLine($"CHMOD-R: {args[2]} = {args[3]}");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+static void CmdGet(string[] args)
+{
+    if (args.Length < 4) { PrintUsage(); return; }
+    var conn = Find(args[1]);
+    try
+    {
+        var fs = ProviderFactory.Get(conn);
+        fs.Download(args[2], args[3]);
+        Console.WriteLine($"GET: {args[2]} -> {args[3]}");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+static void CmdDup(string[] args)
+{
+    if (args.Length < 4) { PrintUsage(); return; }
+    var conn = Find(args[1]);
+    try
+    {
+        var fs = ProviderFactory.Get(conn);
+        fs.Copy(args[2], args[3]);
+        Console.WriteLine($"DUP: {args[2]} -> {args[3]}");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+static void CmdPut(string[] args)
+{
+    if (args.Length < 4) { PrintUsage(); return; }
+    var conn = Find(args[1]);
+    try
+    {
+        var fs = ProviderFactory.Get(conn);
+        fs.Upload(args[2], args[3]);
+        Console.WriteLine($"PUT: {args[2]} -> {args[3]}");
     }
     catch (Exception ex)
     {

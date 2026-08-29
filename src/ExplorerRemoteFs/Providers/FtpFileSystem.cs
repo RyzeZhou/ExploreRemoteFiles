@@ -136,6 +136,68 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"FTP mkdir: {path}");
     }
 
+    public void Download(string remotePath, string localPath)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        var result = _client.DownloadFile(localPath, remotePath, FtpLocalExists.Overwrite);
+        if (result == FtpStatus.Failed)
+            throw new InvalidOperationException($"FTP download failed: {remotePath}");
+        Utils.ShellLog.Write($"FTP get: {remotePath} -> {localPath}");
+    }
+
+    public void Upload(string localPath, string remotePath)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        var result = _client.UploadFile(localPath, remotePath, FtpRemoteExists.Overwrite, true, FtpVerify.None, null);
+        if (result == FtpStatus.Failed)
+            throw new InvalidOperationException($"FTP upload failed: {remotePath}");
+        Utils.ShellLog.Write($"FTP put: {localPath} -> {remotePath}");
+    }
+
+    public void SetPermissions(string path, int mode)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        // Some servers (e.g. pyftpdlib) expect "SITE CHMOD <mode> <path>" — mode FIRST.
+        // FluentFTP's SetFilePermissions may emit the opposite order and get 550.
+        string modeStr = Convert.ToString(mode, 8).PadLeft(3, '0');
+        // Servers disagree on argument order: try "<mode> <path>" first (pyftpdlib),
+        // fall back to "<path> <mode>" (some vsftpd-style servers).
+        var resp = _client.Execute($"SITE CHMOD {modeStr} {path}");
+        if (IsError(resp))
+            resp = _client.Execute($"SITE CHMOD {path} {modeStr}");
+        if (IsError(resp))
+            throw new InvalidOperationException($"SITE CHMOD failed ({resp.Code} {resp.Message})");
+        Utils.ShellLog.Write($"FTP chmod: {path} = {modeStr}");
+    }
+
+    private static bool IsError(FluentFTP.FtpReply resp)
+        => resp.Code is { } c && (c.StartsWith("4") || c.StartsWith("5"));
+
+    public void SetPermissionsRecursive(string path, int mode)
+    {
+        SetPermissions(path, mode);
+        foreach (var e in List(path))
+        {
+            if (e.IsDirectory && !e.IsSymlink)
+                SetPermissionsRecursive(e.Path, mode);
+        }
+    }
+
+    public void Copy(string from, string to)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        using var ms = new MemoryStream();
+        bool dl = _client.DownloadStream(ms, from, 0, null, 0);
+        if (!dl) throw new InvalidOperationException($"FTP download failed: {from}");
+        ms.Position = 0;
+        _client.UploadStream(ms, to, FtpRemoteExists.Overwrite, true, null);
+        Utils.ShellLog.Write($"FTP dup: {from} -> {to}");
+    }
+
     public void Dispose()
     {
         try

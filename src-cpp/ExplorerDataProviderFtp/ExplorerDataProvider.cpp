@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 #include <time.h>
+#include "FtpMeta.h"
+#include "FtpSites.h"
 
 #include "resource.h"
 #include "Utils.h"
@@ -55,7 +57,7 @@ class CFolderViewImplFolder : public IShellFolder2,
                               public IPersistFolder2
 {
 public:
-    CFolderViewImplFolder(UINT nLevel, PCWSTR pszRemotePath);
+    CFolderViewImplFolder(UINT nLevel, PCWSTR pszSite, PCWSTR pszRemotePath);
 
     // IUnknown methods
     IFACEMETHODIMP QueryInterface(REFIID riid, void **ppv);
@@ -117,6 +119,7 @@ private:
     PWSTR               m_rgNames[MAX_OBJS];
     WCHAR               m_szModuleName[MAX_PATH];
     WCHAR               m_szRemotePath[512];
+    WCHAR               m_szSiteName[64];   // empty only at level 0 (site picker)
 };
 
 typedef struct
@@ -145,60 +148,32 @@ static DWORD ModeFromString(const WCHAR *pszMode)
     }
     return mode;
 }
-static BOOL RunFtpList(PCWSTR path, ITEMDATA *out, int maxItems)
+static BOOL RunFtpList(PCWSTR site, PCWSTR path, ITEMDATA *out, int maxItems)
 {
-    WCHAR cmd[1200];
-    StringCchPrintf(cmd, ARRAYSIZE(cmd),
-        L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" pipe \"local-ftp\" \"%s\"",
-        (path && path[0]) ? path : L"/");
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    HANDLE rd = NULL, wr = NULL;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return FALSE;
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-    STARTUPINFOW si = { sizeof(si) };
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    PROCESS_INFORMATION pi = {};
-    BOOL spawned = CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-    CloseHandle(wr);
-    if (!spawned) { CloseHandle(rd); return FALSE; }
-    std::string text; char buf[4096]; DWORD got = 0;
-    while (ReadFile(rd, buf, sizeof(buf), &got, NULL) && got) text.append(buf, got);
-    CloseHandle(rd); WaitForSingleObject(pi.hProcess, 8000); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    int count = 0; size_t pos = 0;
-    while (count < maxItems && pos < text.size())
+    FTPENTRY entries[MAX_OBJS] = {};
+    int n = FtpListCached(site, path, entries, maxItems > MAX_OBJS ? MAX_OBJS : maxItems);
+    for (int i = 0; i < n; i++)
     {
-        size_t end = text.find('\n', pos); if (end == std::string::npos) end = text.size();
-        std::string line = text.substr(pos, end - pos); pos = end + 1;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.rfind("ITEM\t", 0) != 0) continue;
-        WCHAR wide[2048];
-        if (!MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, wide, ARRAYSIZE(wide))) continue;
-        WCHAR *fields[10] = {}; int nf = 0; WCHAR *ctx = NULL;
-        WCHAR *tok = wcstok_s(wide, L"\t", &ctx);
-        while (tok && nf < 10) { fields[nf++] = tok; tok = wcstok_s(NULL, L"\t", &ctx); }
-        if (nf < 10) continue;
-        ITEMDATA &item = out[count];
+        ITEMDATA &item = out[i];
         item.nLevel = 0;
-        item.dwMode  = ModeFromString(fields[1]);
-        item.dwMtime = (DWORD)_wtoi64(fields[2]);
-        item.dwSize  = (DWORD)_wtoi64(fields[3]);
-        StringCchCopy(item.szOwner, ARRAYSIZE(item.szOwner), fields[4]);
-        StringCchCopy(item.szGroup, ARRAYSIZE(item.szGroup), fields[5]);
-        item.fIsFolder  = _wtoi(fields[6]) != 0;
-        item.fIsSymlink = _wtoi(fields[7]) != 0;
-        StringCchCopy(item.szName, ARRAYSIZE(item.szName), fields[9]);
-        count++;
+        item.dwMode  = entries[i].dwMode;
+        item.dwMtime = entries[i].dwMtime;
+        item.dwSize  = entries[i].dwSize;
+        StringCchCopy(item.szOwner, ARRAYSIZE(item.szOwner), entries[i].szOwner);
+        StringCchCopy(item.szGroup, ARRAYSIZE(item.szGroup), entries[i].szGroup);
+        item.fIsFolder  = entries[i].fIsFolder;
+        item.fIsSymlink = entries[i].fIsSymlink;
+        StringCchCopy(item.szName, ARRAYSIZE(item.szName), entries[i].szName);
     }
-    ProbeLog(L"[FTP-SAMPLE] list path='%s' count=%d", path, count);
-    return count >= 0 ? count : 0;
+    return n > 0 ? n : 0;
 }
-static int RunFtpOperation(PCWSTR verb, PCWSTR path1, PCWSTR path2)
+
+static int RunFtpOperation(PCWSTR site, PCWSTR verb, PCWSTR path1, PCWSTR path2)
 {
     WCHAR cmd[1600];
     HRESULT hr = path2 && path2[0]
-        ? StringCchPrintf(cmd, ARRAYSIZE(cmd), L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" %s \"local-ftp\" \"%s\" \"%s\"", verb, path1, path2)
-        : StringCchPrintf(cmd, ARRAYSIZE(cmd), L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" %s \"local-ftp\" \"%s\"", verb, path1);
+        ? StringCchPrintf(cmd, ARRAYSIZE(cmd), L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" %s \"%s\" \"%s\" \"%s\"", verb, site, path1, path2)
+        : StringCchPrintf(cmd, ARRAYSIZE(cmd), L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" %s \"%s\" \"%s\"", verb, site, path1);
     if (FAILED(hr)) return -1;
     STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
     BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
@@ -209,14 +184,14 @@ static int RunFtpOperation(PCWSTR verb, PCWSTR path1, PCWSTR path2)
     ProbeLog(L"[FTP-SAMPLE] op=%s path1='%s' path2='%s' exit=%u", verb, path1, path2 ? path2 : L"", code);
     return code == 0 ? 0 : -1;
 }
-static BOOL GetItemMeta(PCWSTR path, PCWSTR name, ITEMDATA *out)
+static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
 {
     if (!name || !name[0]) return FALSE;
     ITEMDATA items[MAX_OBJS] = {};
-    RunFtpList(path ? path : L"/", items, ARRAYSIZE(items));
+    RunFtpList(site, path ? path : L"/", items, ARRAYSIZE(items));
     for (int i = 0; i < ARRAYSIZE(items) && items[i].szName[0]; i++)
     {
-        if (0 == StrCmpI(items[i].szName, name))
+        if (0 == StrCmp(items[i].szName, name))
         {
             *out = items[i];
             return TRUE;
@@ -254,7 +229,7 @@ static void FormatMtime(DWORD mtime, PWSTR out, UINT cch)
 class CFolderViewImplEnumIDList : public IEnumIDList
 {
 public:
-    CFolderViewImplEnumIDList(DWORD grfFlags, int nCurrent, PCWSTR pszPath, CFolderViewImplFolder *pFolderViewImplShellFolder);
+    CFolderViewImplEnumIDList(DWORD grfFlags, int nCurrent, PCWSTR pszSite, PCWSTR pszPath, CFolderViewImplFolder *pFolderViewImplShellFolder);
 
     // IUnknown methods
     IFACEMETHODIMP QueryInterface(REFIID riid, void **ppv);
@@ -278,6 +253,7 @@ private:
     int m_nLevel;
     ITEMDATA m_aData[MAX_OBJS];
     WCHAR m_szPath[512];
+    WCHAR m_szSite[64];
 
     CFolderViewImplFolder *m_pFolder;
 };
@@ -285,7 +261,7 @@ private:
 HRESULT CFolderViewImplFolder_CreateInstance(REFIID riid, void **ppv)
 {
     *ppv = NULL;
-    CFolderViewImplFolder* pFolderViewImplShellFolder = new (std::nothrow) CFolderViewImplFolder(0, L"");
+    CFolderViewImplFolder* pFolderViewImplShellFolder = new (std::nothrow) CFolderViewImplFolder(0, L"", L"");
     HRESULT hr = pFolderViewImplShellFolder ? S_OK : E_OUTOFMEMORY;
     if (SUCCEEDED(hr))
     {
@@ -295,9 +271,10 @@ HRESULT CFolderViewImplFolder_CreateInstance(REFIID riid, void **ppv)
     return hr;
 }
 
-CFolderViewImplFolder::CFolderViewImplFolder(UINT nLevel, PCWSTR pszRemotePath) : m_cRef(1), m_nLevel(nLevel), m_pidl(NULL)
+CFolderViewImplFolder::CFolderViewImplFolder(UINT nLevel, PCWSTR pszSite, PCWSTR pszRemotePath) : m_cRef(1), m_nLevel(nLevel), m_pidl(NULL)
 {
     DllAddRef();
+    StringCchCopy(m_szSiteName, ARRAYSIZE(m_szSiteName), pszSite ? pszSite : L"");
     StringCchCopy(m_szRemotePath, ARRAYSIZE(m_szRemotePath), pszRemotePath ? pszRemotePath : L"");
     ZeroMemory(m_rgNames, sizeof(m_rgNames));
 }
@@ -354,11 +331,87 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
         : StringCchCopy(component, ARRAYSIZE(component), pszName);
     if (FAILED(hr)) return hr;
     PathRemoveBackslash(component);
+
+    // Level 0 is the site picker: the first path segment must be a site name.
+    if (m_nLevel == 0)
+    {
+        // Address bar direct entry: "<site>:/unix/path".
+        WCHAR *colon = wcschr(component, L':');
+        if (colon && colon != component)
+        {
+            WCHAR site[64];
+            StringCchCopyN(site, ARRAYSIZE(site), component, (int)(colon - component));
+            const FTPSITE *s = FtpSiteFind(site);
+            if (!s) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+
+            PIDLIST_RELATIVE result = NULL;
+            hr = CreateChildID(site, 1, 1, 3, TRUE, &result);
+            if (FAILED(hr)) return hr;
+
+            // Split the unix path into segments and bind step by step.
+            std::vector<std::wstring> segs;
+            std::wstring cur;
+            for (PCWSTR c = colon + 1; ; c++)
+            {
+                if (*c == L'/' || *c == 0) { if (!cur.empty()) segs.push_back(cur); cur.clear(); if (!*c) break; }
+                else cur += *c;
+            }
+            IShellFolder *folder = NULL;
+            hr = BindToObject(result, pbc, IID_PPV_ARGS(&folder));
+            for (size_t k = 0; SUCCEEDED(hr) && k < segs.size(); k++)
+            {
+                PIDLIST_RELATIVE child = NULL;
+                hr = folder->ParseDisplayName(hwnd, pbc, (PWSTR)segs[k].c_str(), NULL, &child, NULL);
+                if (SUCCEEDED(hr))
+                {
+                    IShellFolder *nextFolder = NULL;
+                    hr = folder->BindToObject(child, pbc, IID_PPV_ARGS(&nextFolder));
+                    PIDLIST_RELATIVE combined = ILCombine(result, child);
+                    ILFree(child);
+                    if (!combined) hr = E_OUTOFMEMORY;
+                    if (SUCCEEDED(hr)) { ILFree(result); result = combined; }
+                    folder->Release();
+                    folder = nextFolder;
+                }
+            }
+            if (folder) folder->Release();
+            if (SUCCEEDED(hr))
+            {
+                *ppidl = result;
+                if (pchEaten) *pchEaten = (ULONG)lstrlen(pszName);
+                if (pdwAttributes) *pdwAttributes = 0;
+            }
+            else if (result) ILFree(result);
+            return hr;
+        }
+
+        const FTPSITE *site = FtpSiteFind(component);
+        if (!site) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        PIDLIST_RELATIVE current = NULL;
+        hr = CreateChildID(component, 1, 1, 3, TRUE, &current);
+        if (FAILED(hr)) return hr;
+        if (next && *next)
+        {
+            IShellFolder *child = NULL;
+            hr = BindToObject(current, pbc, IID_PPV_ARGS(&child));
+            if (SUCCEEDED(hr))
+            {
+                PIDLIST_RELATIVE tail = NULL;
+                hr = child->ParseDisplayName(hwnd, pbc, next, pchEaten, &tail, pdwAttributes);
+                if (SUCCEEDED(hr)) { *ppidl = ILCombine(current, tail); ILFree(tail); }
+                child->Release();
+            }
+            ILFree(current);
+        }
+        else *ppidl = current;
+        return hr;
+    }
+
     ITEMDATA items[MAX_OBJS] = {};
-    RunFtpList(m_szRemotePath, items, ARRAYSIZE(items));
+    RunFtpList(m_szSiteName, m_szRemotePath, items, ARRAYSIZE(items));
     for (int i = 0; i < ARRAYSIZE(items) && items[i].szName[0]; i++)
     {
-        if (0 != StrCmpI(items[i].szName, component)) continue;
+        if (0 != StrCmp(items[i].szName, component)) continue;
         PIDLIST_RELATIVE current = NULL;
         hr = CreateChildID(component, m_nLevel + 1, 1, 3, items[i].fIsFolder, &current);
         if (FAILED(hr)) return hr;
@@ -396,7 +449,7 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
     }
     else
     {
-        CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szRemotePath, this);
+        CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
         hr = penum ? S_OK : E_OUTOFMEMORY;
         if (SUCCEEDED(hr))
         {
@@ -427,12 +480,24 @@ HRESULT CFolderViewImplFolder::BindToObject(PCUIDLIST_RELATIVE pidl,
         if (SUCCEEDED(hr))
         {
             WCHAR childPath[512];
-            if (!m_szRemotePath[0] || (m_szRemotePath[0] == L'/' && !m_szRemotePath[1]))
-                StringCchPrintf(childPath, ARRAYSIZE(childPath), L"/%s", name);
+            CFolderViewImplFolder *child = NULL;
+            if (m_nLevel == 0)
+            {
+                // Site picker: bind to the site root (path = site StartPath).
+                const FTPSITE *site = FtpSiteFind(name);
+                if (!site) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+                child = new (std::nothrow) CFolderViewImplFolder(1, name, site->startPath);
+                hr = child ? S_OK : E_OUTOFMEMORY;
+            }
             else
-                StringCchPrintf(childPath, ARRAYSIZE(childPath), L"%s/%s", m_szRemotePath, name);
-            CFolderViewImplFolder *child = new (std::nothrow) CFolderViewImplFolder(m_nLevel + 1, childPath);
-            hr = child ? S_OK : E_OUTOFMEMORY;
+            {
+                if (!m_szRemotePath[0] || (m_szRemotePath[0] == L'/' && !m_szRemotePath[1]))
+                    StringCchPrintf(childPath, ARRAYSIZE(childPath), L"/%s", name);
+                else
+                    StringCchPrintf(childPath, ARRAYSIZE(childPath), L"%s/%s", m_szRemotePath, name);
+                child = new (std::nothrow) CFolderViewImplFolder(m_nLevel + 1, m_szSiteName, childPath);
+                hr = child ? S_OK : E_OUTOFMEMORY;
+            }
             if (SUCCEEDED(hr))
             {
                 PITEMID_CHILD first = ILCloneFirst(pidl);
@@ -835,6 +900,46 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
     return hr;
 }
 
+// ---- server-style addressing: "<site>:/<unix path>" -------------------------
+
+static PCFVITEMID IsOursItem(PCUIDLIST_RELATIVE p)
+{
+    return (p && p->mkid.cb >= FIELD_OFFSET(FVITEMID, szName) + sizeof(WCHAR) &&
+            ((PCFVITEMID)p)->MyObjID == MYOBJID) ? (PCFVITEMID)p : NULL;
+}
+static BOOL GetPidlSite(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
+{
+    out[0] = 0;
+    PCUIDLIST_RELATIVE p = (PCUIDLIST_RELATIVE)abs;
+    while (p && p->mkid.cb)
+    {
+        PCFVITEMID it = IsOursItem(p);
+        if (it) { StringCchCopyN(out, cch, it->szName, it->cchName); return out[0] != 0; }
+        p = ILNext(p);
+    }
+    return FALSE;
+}
+static void GetPidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
+{
+    // First IsOurs segment is the site name; join the rest with '/'.
+    out[0] = 0;
+    PCUIDLIST_RELATIVE p = (PCUIDLIST_RELATIVE)abs;
+    BOOL first = TRUE;
+    while (p && p->mkid.cb)
+    {
+        PCFVITEMID it = IsOursItem(p);
+        if (it)
+        {
+            WCHAR name[256];
+            StringCchCopyN(name, ARRAYSIZE(name), it->szName, it->cchName);
+            if (name[0] && !first) { StringCchCat(out, cch, L"/"); StringCchCat(out, cch, name); }
+            first = FALSE;
+        }
+        p = ILNext(p);
+    }
+    if (!out[0]) StringCchCopy(out, cch, L"/");
+}
+
 //  Retrieves the display name for the specified file object or subfolder.
 HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shgdnFlags, STRRET *pName)
 {
@@ -849,20 +954,40 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
         }
         else
         {
-            PWSTR pszThisFolder;
-            hr = SHGetNameFromIDList(m_pidl, (shgdnFlags & SHGDN_FORADDRESSBAR) ? SIGDN_DESKTOPABSOLUTEEDITING : SIGDN_DESKTOPABSOLUTEPARSING, &pszThisFolder);
+            // Server-style address: "<site>:/<unix path>[/<child>]"
+            // (used for both the address bar and FORPARSING, keeping input/output symmetric).
+            WCHAR site[64] = {}, path[600] = {};
+            BOOL hasSite = GetPidlSite(m_pidl, site, ARRAYSIZE(site));
+            GetPidlPath(m_pidl, path, ARRAYSIZE(path));
+            if (!hasSite)
+            {
+                // Site picker root: the child PIDL itself may BE the site segment
+                // (e.g. address bar shows the site root -> want "WSL-FTP:/").
+                WCHAR childSite[64];
+                if (GetPidlSite((PCIDLIST_ABSOLUTE)pidl, childSite, ARRAYSIZE(childSite)))
+                {
+                    StringCchCopy(site, ARRAYSIZE(site), childSite);
+                    hasSite = TRUE;
+                    StringCchCopy(path, ARRAYSIZE(path), L"/");
+                }
+            }
+
+            WCHAR szName[MAX_PATH] = {};
+            hr = _GetName(pidl, szName, ARRAYSIZE(szName));
             if (SUCCEEDED(hr))
             {
-                StringCchCopy(szDisplayName, ARRAYSIZE(szDisplayName), pszThisFolder);
-                StringCchCat(szDisplayName, ARRAYSIZE(szDisplayName), L"\\");
-
-                WCHAR szName[MAX_PATH];
-                hr = _GetName(pidl, szName, ARRAYSIZE(szName));
-                if (SUCCEEDED(hr))
+                if (hasSite)
                 {
+                    StringCchPrintf(szDisplayName, ARRAYSIZE(szDisplayName), L"%s:%s", site, path);
+                    BOOL pathIsRoot = (path[0] == L'/' && !path[1]);
+                    if (!pathIsRoot && szName[0]) StringCchCat(szDisplayName, ARRAYSIZE(szDisplayName), L"/");
                     StringCchCat(szDisplayName, ARRAYSIZE(szDisplayName), szName);
                 }
-                CoTaskMemFree(pszThisFolder);
+                else
+                {
+                    // Site picker root has no site segment; fall back to the plain name.
+                    StringCchCopy(szDisplayName, ARRAYSIZE(szDisplayName), szName);
+                }
             }
         }
         if (SUCCEEDED(hr))
@@ -904,7 +1029,7 @@ HRESULT CFolderViewImplFolder::SetNameOf(HWND hwnd, PCUITEMID_CHILD pidl,
         StringCchPrintf(oldPath, ARRAYSIZE(oldPath), L"%s/%s", base, oldName);
         StringCchPrintf(newPath, ARRAYSIZE(newPath), L"%s/%s", base, pszName);
     }
-    if (RunFtpOperation(L"rename", oldPath, newPath) != 0)
+    if (RunFtpOperation(m_szSiteName, L"rename", oldPath, newPath) != 0)
     {
         MessageBoxW(hwnd, L"Rename failed.", L"Remote", MB_OK | MB_ICONERROR);
         return E_FAIL;
@@ -912,6 +1037,7 @@ HRESULT CFolderViewImplFolder::SetNameOf(HWND hwnd, PCUITEMID_CHILD pidl,
     BOOL folder = FALSE; int size = 0;
     _GetFolderness(pidl, &folder); _GetSize(pidl, &size);
     if (ppidlOut) hr = CreateChildID(pszName, m_nLevel + 1, size > 0 ? size : 1, 3, folder, ppidlOut);
+    FtpCacheClear();
     SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, m_pidl, NULL);
     return SUCCEEDED(hr) ? S_OK : hr;
 }
@@ -982,7 +1108,7 @@ HRESULT CFolderViewImplFolder::_GetColumnDisplayName(PCUITEMID_CHILD pidl,
     hr = _GetName(pidl, name, ARRAYSIZE(name));
     if (FAILED(hr)) return hr;
     ITEMDATA meta = {};
-    GetItemMeta(m_szRemotePath, name, &meta);
+    GetItemMeta(m_szSiteName, m_szRemotePath, name, &meta);
 
     WCHAR szVal[256] = {};
     if (IsEqualPropertyKey(*pkey, PKEY_ItemNameDisplay))
@@ -1296,10 +1422,11 @@ HRESULT CFolderViewImplFolder::CreateChildID(PCWSTR pszName, int nLevel, int nSi
 
 
 
-CFolderViewImplEnumIDList::CFolderViewImplEnumIDList(DWORD grfFlags, int nLevel, PCWSTR pszPath, CFolderViewImplFolder *pFolderViewImplShellFolder) :
+CFolderViewImplEnumIDList::CFolderViewImplEnumIDList(DWORD grfFlags, int nLevel, PCWSTR pszSite, PCWSTR pszPath, CFolderViewImplFolder *pFolderViewImplShellFolder) :
     m_cRef(1), m_grfFlags(grfFlags), m_nLevel(nLevel), m_nItem(0), m_pFolder(pFolderViewImplShellFolder)
 {
     m_pFolder->AddRef();
+    StringCchCopy(m_szSite, ARRAYSIZE(m_szSite), pszSite ? pszSite : L"");
     StringCchCopy(m_szPath, ARRAYSIZE(m_szPath), pszPath ? pszPath : L"/");
 }
 
@@ -1335,10 +1462,45 @@ ULONG CFolderViewImplEnumIDList::Release()
 // This initializes the enumerator.  In this case we set up a default array of items, this represents our
 // data source.  In a real-world implementation the array would be replaced and would be backed by some
 // other data source that you traverse and convert into IShellFolder item IDs.
+// Explorer convention: folders first, then files; natural (numeric-aware) name order.
+static int __cdecl CmpItems(void const *a, void const *b)
+{
+    ITEMDATA const *ia = (ITEMDATA const *)a;
+    ITEMDATA const *ib = (ITEMDATA const *)b;
+    if (!ia->szName[0] && !ib->szName[0]) return 0;
+    if (!ia->szName[0]) return 1;    // terminator sorts last
+    if (!ib->szName[0]) return -1;
+    if (ia->fIsFolder != ib->fIsFolder) return ia->fIsFolder ? -1 : 1;
+    return StrCmpLogicalW(ia->szName, ib->szName);
+}
+static void SortItems(ITEMDATA *a, int maxItems)
+{
+    int n = 0;
+    while (n < maxItems && a[n].szName[0]) n++;
+    if (n > 1) qsort(a, n, sizeof(ITEMDATA), CmpItems);
+}
+
 HRESULT CFolderViewImplEnumIDList::Initialize()
 {
     ZeroMemory(m_aData, sizeof(m_aData));
-    RunFtpList(m_szPath, m_aData, ARRAYSIZE(m_aData));
+    if (m_nLevel == 1)
+    {
+        // Enumerating children of level 0 (the site picker): list configured sites.
+        FTPSITE sites[MAX_OBJS] = {};
+        int n = FtpSitesGet(sites, ARRAYSIZE(sites));
+        for (int i = 0; i < n && i < ARRAYSIZE(m_aData); i++)
+        {
+            ITEMDATA &item = m_aData[i];
+            item.nLevel = 1;
+            item.fIsFolder = TRUE;
+            item.fIsSymlink = FALSE;
+            StringCchCopy(item.szName, ARRAYSIZE(item.szName), sites[i].name);
+        }
+        SortItems(m_aData, ARRAYSIZE(m_aData));
+        return S_OK;
+    }
+    RunFtpList(m_szSite, m_szPath, m_aData, ARRAYSIZE(m_aData));
+    SortItems(m_aData, ARRAYSIZE(m_aData));
     return S_OK;
 }
 
@@ -1502,3 +1664,4 @@ HRESULT CFolderViewCB_CreateInstance(REFIID riid, void **ppv)
     }
     return hr;
 }
+

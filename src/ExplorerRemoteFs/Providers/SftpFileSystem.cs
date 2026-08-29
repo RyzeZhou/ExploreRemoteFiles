@@ -2,6 +2,7 @@ using ExplorerRemoteFs.Config;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
+using System.IO;
 
 namespace ExplorerRemoteFs.Providers;
 
@@ -127,6 +128,57 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         if (_client is null) return;
         _client.CreateDirectory(path);
         Utils.ShellLog.Write($"SFTP mkdir: {path}");
+    }
+
+    public void Download(string remotePath, string localPath)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        using var fs = File.Create(localPath);
+        _client.DownloadFile(remotePath, fs);
+        Utils.ShellLog.Write($"SFTP get: {remotePath} -> {localPath}");
+    }
+
+    public void Upload(string localPath, string remotePath)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        using var fs = File.OpenRead(localPath);
+        _client.UploadFile(fs, remotePath);
+        Utils.ShellLog.Write($"SFTP put: {localPath} -> {remotePath}");
+    }
+
+    public void SetPermissions(string path, int mode)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        // mode 是八进制数值（如 0640 的数值 416）。SSH.NET 的 ChangePermissions 把
+        // 传入值按十进制 ToString 发给服务器（服务器按八进制解释），
+        // 所以这里必须还原为"八进制字符串的十进制形式"（640 → 传 640）。
+        short wire = (short)int.Parse(Convert.ToString(mode, 8));
+        _client.ChangePermissions(path, wire);
+        Utils.ShellLog.Write($"SFTP chmod: {path} = {Convert.ToString(mode, 8)}");
+    }
+
+    public void SetPermissionsRecursive(string path, int mode)
+    {
+        SetPermissions(path, mode);
+        foreach (var e in List(path))
+        {
+            if (e.IsDirectory && !e.IsSymlink)
+                SetPermissionsRecursive(e.Path, mode);
+        }
+    }
+
+    public void Copy(string from, string to)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        using var ms = new MemoryStream();
+        _client.DownloadFile(from, ms);
+        ms.Position = 0;
+        _client.UploadFile(ms, to);
+        Utils.ShellLog.Write($"SFTP dup: {from} -> {to}");
     }
 
     public void Dispose()

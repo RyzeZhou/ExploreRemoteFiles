@@ -1,0 +1,64 @@
+<Window x:Class="RemoteFsClient.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="RemoteFs Client" Height="520" Width="760"
+        Loaded="OnLoaded">
+    <DockPanel>
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="8,8,8,4">
+            <Button Content="新建站点" Click="OnNew" Padding="10,4" Margin="0,0,6,0"/>
+            <Button Content="编辑" Click="OnEdit" Padding="10,4" Margin="0,0,6,0"/>
+            <Button Content="删除" Click="OnDelete" Padding="10,4"/>
+        </StackPanel>
+
+        <StatusBar DockPanel.Dock="Bottom">
+            <TextBlock x:Name="StatusText" Text="就绪"/>
+        </StatusBar>
+
+        <Grid Margin="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="230"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <ListBox x:Name="SiteList" SelectionChanged="OnSiteSelected"/>
+
+            <StackPanel Grid.Column="1" Margin="16,0,0,0">
+                <TextBlock Text="站点详情" FontSize="14" FontWeight="Medium" Margin="0,0,0,8"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="90"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                        <RowDefinition/><RowDefinition/><RowDefinition/>
+                    </Grid.RowDefinitions>
+                    <Grid.Resources>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="VerticalAlignment" Value="Center"/>
+                            <Setter Property="Margin" Value="0,3"/>
+                        </Style>
+                    </Grid.Resources>
+                    <TextBlock Grid.Row="0" Text="名称"/>
+                    <TextBlock Grid.Row="0" Grid.Column="1" x:Name="DName"/>
+                    <TextBlock Grid.Row="1" Text="协议"/>
+                    <TextBlock Grid.Row="1" Grid.Column="1" x:Name="DType"/>
+                    <TextBlock Grid.Row="2" Text="主机:端口"/>
+                    <TextBlock Grid.Row="2" Grid.Column="1" x:Name="DHost"/>
+                    <TextBlock Grid.Row="3" Text="用户名"/>
+                    <TextBlock Grid.Row="3" Grid.Column="1" x:Name="DUser"/>
+                    <TextBlock Grid.Row="4" Text="起始路径"/>
+                    <TextBlock Grid.Row="4" Grid.Column="1" x:Name="DPath"/>
+                    <TextBlock Grid.Row="5" Text="密码"/>
+                    <TextBlock Grid.Row="5" Grid.Column="1" x:Name="DPwd"/>
+                    <TextBlock Grid.Row="6" Text="WinSCP 站点"/>
+                    <TextBlock Grid.Row="6" Grid.Column="1" x:Name="DShared"/>
+                </Grid>
+                <Button Content="测试连接" Click="OnTest" Padding="12,4" HorizontalAlignment="Left" Margin="0,12,0,8"/>
+                <TextBox x:Name="TestOutput" IsReadOnly="True" TextWrapping="Wrap"
+                         VerticalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="12"
+                         Height="150" Background="#FAFAFA"/>
+            </StackPanel>
+        </Grid>
+    </DockPanel>
+</Window>

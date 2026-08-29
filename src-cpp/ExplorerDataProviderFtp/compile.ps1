@@ -11,5 +11,5 @@ $cpps = @('Category.cpp','ContextMenu.cpp','Dll.cpp','ExplorerDataProvider.cpp',
 rc.exe /nologo /dUNICODE /d_UNICODE /fo ExplorerDataProvider.res ExplorerDataProvider.rc
 foreach($cpp in $cpps){ cl.exe /nologo /c /EHsc /MD /std:c++17 /W3 /utf-8 /D_WINDOWS /D_USRDLL /DUNICODE /D_UNICODE $cpp; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE} }
 $objs=$cpps | ForEach-Object {[IO.Path]::GetFileNameWithoutExtension($_)+'.obj'}
-link.exe /nologo /DLL /OUT:ExplorerDataProviderFtp.dll /DEF:ExplorerDataProvider.def /MACHINE:X64 $objs ExplorerDataProvider.res propsys.lib user32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib uuid.lib comctl32.lib
+link.exe /nologo /DLL /OUT:ExplorerDataProviderFtp.dll /DEF:ExplorerDataProvider.def /MACHINE:X64 $objs ExplorerDataProvider.res propsys.lib user32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib uuid.lib comctl32.lib comdlg32.lib
 exit $LASTEXITCODE

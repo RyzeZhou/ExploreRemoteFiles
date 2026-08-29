@@ -2,6 +2,14 @@
 bin/
 obj/
 publish/
+dist/
+*.obj
+*.res
+*.exp
+*.lib
+*.dll
+*.exe
+*.pdb
 *.user
 *.suo
 *.nupkg
@@ -12,6 +20,13 @@ reference/
 # Local test server runtime files
 research/ftpserver/test_host_key
 research/ftpserver/__pycache__/
+research/ftpserver/root/www/subdir/
 
-# Debug log
-C:\temp\
+# Debug log (absolute paths are intentionally not represented here; .gitignore
+# patterns are repository-relative).
+remotefs-debug.log
+
+# SSH test keys — NEVER commit
+research/keys/
+# WinSCP capability-test outputs (session logs)
+research/winscp-test/out/
