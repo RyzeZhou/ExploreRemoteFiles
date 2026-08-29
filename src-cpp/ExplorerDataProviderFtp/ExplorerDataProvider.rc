@@ -109,3 +109,44 @@ BEGIN
     PUSHBUTTON      "All", 3020, 64, 212, 36, 14
     PUSHBUTTON      "None", 3021, 104, 212, 40, 14
 END
+
+// Property-sheet version of the permissions page (no OK/Cancel; the standard
+// Properties dialog provides those). All/None are kept as in-page buttons.
+IDD_PERMPAGE DIALOGEX 0, 0, 240, 220
+STYLE DS_SETFONT | DS_3DLOOK | DS_CONTROL | WS_CHILD | WS_DISABLED | WS_CAPTION
+CAPTION "Permissions"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Name:", IDC_STATIC, 12, 12, 44, 10
+    LTEXT           "", 3001, 60, 12, 170, 10
+    LTEXT           "Type:", IDC_STATIC, 12, 28, 44, 10
+    LTEXT           "", 3002, 60, 28, 170, 10
+    LTEXT           "Permissions:", IDC_STATIC, 12, 44, 60, 10
+    LTEXT           "", 3003, 80, 44, 150, 10
+    LTEXT           "Owner:", IDC_STATIC, 12, 60, 44, 10
+    LTEXT           "", 3004, 60, 60, 170, 10
+    LTEXT           "Group:", IDC_STATIC, 12, 76, 44, 10
+    LTEXT           "", 3005, 60, 76, 170, 10
+    LTEXT           "Size:", IDC_STATIC, 12, 92, 44, 10
+    LTEXT           "", 3006, 60, 92, 170, 10
+    LTEXT           "Modified:", IDC_STATIC, 12, 108, 48, 10
+    LTEXT           "", 3007, 64, 108, 166, 10
+    GROUPBOX        "Permissions", IDC_STATIC, 12, 126, 218, 56
+    LTEXT           "Owner", IDC_STATIC, 22, 140, 40, 10
+    AUTOCHECKBOX    "Read", 3011, 72, 140, 42, 10
+    AUTOCHECKBOX    "Write", 3012, 118, 140, 42, 10
+    AUTOCHECKBOX    "Exec", 3013, 164, 140, 42, 10
+    LTEXT           "Group", IDC_STATIC, 22, 156, 40, 10
+    AUTOCHECKBOX    "Read", 3014, 72, 156, 42, 10
+    AUTOCHECKBOX    "Write", 3015, 118, 156, 42, 10
+    AUTOCHECKBOX    "Exec", 3016, 164, 156, 42, 10
+    LTEXT           "Others", IDC_STATIC, 22, 172, 40, 10
+    AUTOCHECKBOX    "Read", 3017, 72, 172, 42, 10
+    AUTOCHECKBOX    "Write", 3018, 118, 172, 42, 10
+    AUTOCHECKBOX    "Exec", 3019, 164, 172, 42, 10
+    LTEXT           "Octal:", IDC_STATIC, 12, 191, 36, 10
+    EDITTEXT        3022, 52, 189, 44, 14, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 190, 122, 10
+    PUSHBUTTON      "All", 3020, 154, 198, 36, 14
+    PUSHBUTTON      "None", 3021, 194, 198, 40, 14
+END

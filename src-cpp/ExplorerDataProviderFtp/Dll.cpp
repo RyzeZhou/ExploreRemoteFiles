@@ -24,6 +24,7 @@
 
 HRESULT CFolderViewImplFolder_CreateInstance(REFIID riid, void **ppv);
 HRESULT CFolderViewImplContextMenu_CreateInstance(REFIID riid, void **ppv);
+HRESULT CFolderViewImplPropSheet_CreateInstance(REFIID riid, void **ppv);
 
 typedef HRESULT (*PFNCREATEINSTANCE)(REFIID riid, void **ppvObject);
 struct CLASS_OBJECT_INIT
@@ -37,6 +38,7 @@ const CLASS_OBJECT_INIT c_rgClassObjectInit[] =
 {
     { &CLSID_FolderViewImpl,            CFolderViewImplFolder_CreateInstance },
     { &CLSID_FolderViewImplContextMenu, CFolderViewImplContextMenu_CreateInstance },
+    { &CLSID_RemoteFsPropSheet,         CFolderViewImplPropSheet_CreateInstance },
 };
 
 

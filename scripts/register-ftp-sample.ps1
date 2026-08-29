@@ -18,6 +18,13 @@ Set-Default "$hk\CLSID\$ctx" $display
 Set-Default "$hk\CLSID\$ctx\InprocServer32" $dll
 & reg.exe add "$hk\CLSID\$ctx\InprocServer32" /v ThreadingModel /t REG_SZ /d Apartment /f|Out-Null
 Set-Default "$hk\RemoteFsMicrosoftCoreType\shellex\ContextMenuHandlers\$ctx" $ctx
+# Property sheet handler: Ribbon "Properties" button -> standard Properties
+# dialog with our Permissions page (chmod write-back).
+$props='{5DD84779-FEF1-46A3-8FCF-9F1A9603BB8F}'
+Set-Default "$hk\CLSID\$props" $display
+Set-Default "$hk\CLSID\$props\InprocServer32" $dll
+& reg.exe add "$hk\CLSID\$props\InprocServer32" /v ThreadingModel /t REG_SZ /d Apartment /f|Out-Null
+Set-Default "$hk\RemoteFsMicrosoftCoreType\shellex\PropertySheetHandlers\$props" $props
 # Deliberately do NOT register ShellEx\MayChangeDefaultMenu: default folder Open stays native.
 
 # Junction point: Desktop namespace (top-level in navigation pane), NOT MyComputer.

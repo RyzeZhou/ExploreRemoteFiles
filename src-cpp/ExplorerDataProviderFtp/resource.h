@@ -45,3 +45,5 @@
 
 #define IDD_NAMEBOX                     4001
 #define IDD_PERMBOX                     4000
+
+#define IDD_PERMPAGE                     4002

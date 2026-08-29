@@ -634,3 +634,159 @@ private:
  long ref;IDataObject*data;IUnknown*site;
 };
 HRESULT CFolderViewImplContextMenu_CreateInstance(REFIID riid,void**ppv){*ppv=NULL;CMenu*m=new(std::nothrow)CMenu();if(!m)return E_OUTOFMEMORY;HRESULT hr=m->QueryInterface(riid,ppv);m->Release();return hr;}
+
+// ---- property sheet: Ribbon "Properties" button -> standard Properties
+// dialog with our Permissions page (PSN_APPLY writes back via chmod). --------
+
+static UINT CALLBACK PermPageCallback(HWND /* hwnd */, UINT uMsg, LPPROPSHEETPAGE ppsp)
+{
+    if (uMsg == PSPCB_RELEASE)
+    {
+        PROPMETA *pm = (PROPMETA*)ppsp->lParam;
+        if (pm)
+        {
+            if (pm->notify) CoTaskMemFree(pm->notify);
+            CoTaskMemFree(pm);
+        }
+    }
+    return 1;
+}
+
+static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_INITDIALOG:
+    {
+        PROPMETA *pm = (PROPMETA*)((LPPROPSHEETPAGE)lp)->lParam;
+        if (!pm) return FALSE;
+        SetWindowLongPtrW(hDlg, DWLP_USER, (LONG_PTR)pm);
+        REMOTEMETA *m = &pm->meta;
+        SetDlgItemTextW(hDlg,3001,m->name); SetDlgItemTextW(hDlg,3002,m->type);
+        SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3004,m->owner);
+        SetDlgItemTextW(hDlg,3005,m->group); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
+        PermSetChecks(hDlg,m->bits);
+        PermSyncChecksToOctal(hDlg);
+        EnableWindow(GetDlgItem(hDlg,3023), m->fIsFolder ? TRUE : FALSE);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if(HIWORD(wp)==BN_CLICKED && LOWORD(wp)>=3011 && LOWORD(wp)<=3019){ PermSyncChecksToOctal(hDlg); return TRUE; }
+        if(HIWORD(wp)==EN_CHANGE && LOWORD(wp)==3022){ PermSyncOctalToChecks(hDlg); return TRUE; }
+        if(LOWORD(wp)==3020){ PermSetChecks(hDlg,0777); PermSyncChecksToOctal(hDlg); return TRUE; }
+        if(LOWORD(wp)==3021){ PermSetChecks(hDlg,0); PermSyncChecksToOctal(hDlg); return TRUE; }
+        break;
+    case WM_NOTIFY:
+    {
+        NMHDR *nm = (NMHDR*)lp;
+        if (nm && nm->code == PSN_APPLY)
+        {
+            PROPMETA *pm = (PROPMETA*)GetWindowLongPtrW(hDlg, DWLP_USER);
+            if (pm)
+            {
+                PermSyncOctalToChecks(hDlg);
+                DWORD mode = PermCollectChecks(hDlg);
+                BOOL recursive = IsDlgButtonChecked(hDlg,3023)!=0;
+                if (mode != pm->meta.bits || recursive)
+                {
+                    WCHAR modeStr[8]; StringCchPrintf(modeStr,ARRAYSIZE(modeStr),L"%03o",mode);
+                    if (RunCli(pm->site, recursive?L"chmodr":L"chmod", pm->path, modeStr, NULL)==0)
+                    {
+                        FtpCacheClear();
+                        if (pm->notify) SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_IDLIST,pm->notify,NULL);
+                    }
+                    else MessageBoxW(hDlg,L"chmod failed.",L"Remote",MB_OK|MB_ICONERROR);
+                }
+            }
+            SetWindowLongPtrW(hDlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+            return TRUE;
+        }
+        break;
+    }
+    }
+    return FALSE;
+}
+
+class CFolderViewImplPropSheet : public IShellPropSheetExt, public IShellExtInit
+{
+public:
+    CFolderViewImplPropSheet() : ref(1), data(NULL) { DllAddRef(); }
+    ~CFolderViewImplPropSheet() { if(data) data->Release(); DllRelease(); }
+
+    HRESULT QueryInterface(REFIID r, void **p)
+    {
+        static const QITAB q[] = { QITABENT(CFolderViewImplPropSheet, IShellPropSheetExt),
+                                   QITABENT(CFolderViewImplPropSheet, IShellExtInit), {0} };
+        return QISearch(this, q, r, p);
+    }
+    ULONG AddRef() { return InterlockedIncrement(&ref); }
+    ULONG Release() { long n = InterlockedDecrement(&ref); if(!n) delete this; return n; }
+
+    // IShellExtInit: Explorer gives us the selection (IDataObject).
+    HRESULT Initialize(PCIDLIST_ABSOLUTE, IDataObject *d, HKEY)
+    {
+        if (data) data->Release();
+        data = d;
+        if (data) data->AddRef();
+        return S_OK;
+    }
+
+    // IShellPropSheetExt
+    HRESULT AddPages(LPFNADDPROPSHEETPAGE pfnAddPage, LPARAM)
+    {
+        if (!pfnAddPage || !data) return S_OK;   // no selection -> nothing to add
+        SELDATA sel;
+        if (!CollectSelection(data, &sel)) return S_OK;
+
+        PROPMETA *pm = (PROPMETA*)CoTaskMemAlloc(sizeof(PROPMETA));
+        if (!pm) return E_OUTOFMEMORY;
+        ZeroMemory(pm, sizeof(*pm));
+        StringCchCopy(pm->site, ARRAYSIZE(pm->site), sel.site);
+        JoinPath(sel.folder, sel.names[0], pm->path, ARRAYSIZE(pm->path));
+        pm->notify = sel.notify ? ILCloneFull(sel.notify) : NULL;
+        if (sel.notify) CoTaskMemFree(sel.notify);
+        if (!ReadRemoteMeta(sel.site, sel.folder, sel.names[0], &pm->meta))
+        {
+            CoTaskMemFree(pm);
+            return S_OK;
+        }
+
+        PROPSHEETPAGE psp = {};
+        psp.dwSize = sizeof(psp);
+        psp.dwFlags = PSP_USETITLE | PSP_USECALLBACK;
+        psp.hInstance = g_hInst;
+        psp.pszTemplate = MAKEINTRESOURCEW(IDD_PERMPAGE);
+        psp.pszTitle = L"Permissions";
+        psp.pfnDlgProc = PermPageProc;
+        psp.lParam = (LPARAM)pm;
+        psp.pfnCallback = PermPageCallback;
+
+        HPROPSHEETPAGE hPage = CreatePropertySheetPage(&psp);
+        if (!hPage)
+        {
+            if (pm->notify) CoTaskMemFree(pm->notify);
+            CoTaskMemFree(pm);
+            return S_OK;
+        }
+        if (!pfnAddPage(hPage, (LPARAM)this))
+        {
+            DestroyPropertySheetPage(hPage);
+        }
+        return S_OK;
+    }
+    HRESULT ReplacePage(EXPPS, LPFNSVADDPROPSHEETPAGE, LPARAM) { return E_NOTIMPL; }
+
+private:
+    long ref;
+    IDataObject *data;
+};
+
+HRESULT CFolderViewImplPropSheet_CreateInstance(REFIID riid, void **ppv)
+{
+    *ppv = NULL;
+    CFolderViewImplPropSheet *m = new (std::nothrow) CFolderViewImplPropSheet();
+    if (!m) return E_OUTOFMEMORY;
+    HRESULT hr = m->QueryInterface(riid, ppv);
+    m->Release();
+    return hr;
+}
