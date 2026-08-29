@@ -352,14 +352,14 @@ public:
         {
             pv->vt = VT_LPWSTR;
             WCHAR buf[16] = {};
-            if (meta.dwUid) StringCchPrintf(buf, ARRAYSIZE(buf), L"%u", meta.dwUid);
+            if (meta.dwUid != 0xFFFFFFFF) StringCchPrintf(buf, ARRAYSIZE(buf), L"%u", meta.dwUid);
             return SHStrDup(buf, &pv->pwszVal);
         }
         if (IsEqualPropertyKey(key, PKEY_Remote_GroupGid))
         {
             pv->vt = VT_LPWSTR;
             WCHAR buf[16] = {};
-            if (meta.dwGid) StringCchPrintf(buf, ARRAYSIZE(buf), L"%u", meta.dwGid);
+            if (meta.dwGid != 0xFFFFFFFF) StringCchPrintf(buf, ARRAYSIZE(buf), L"%u", meta.dwGid);
             return SHStrDup(buf, &pv->pwszVal);
         }
         return S_OK;
@@ -1453,19 +1453,19 @@ HRESULT CFolderViewImplFolder::_GetColumnDisplayName(PCUITEMID_CHILD pidl,
     }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_Owner))
     {
-        StringCchCopy(szVal, ARRAYSIZE(szVal), meta.szOwner[0] ? meta.szOwner : L"?");
+        StringCchCopy(szVal, ARRAYSIZE(szVal), meta.szOwner);
     }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_OwnerUid))
     {
-        if (meta.dwUid) StringCchPrintf(szVal, ARRAYSIZE(szVal), L"%u", meta.dwUid);
+        if (meta.dwUid != 0xFFFFFFFF) StringCchPrintf(szVal, ARRAYSIZE(szVal), L"%u", meta.dwUid);
     }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_Group))
     {
-        StringCchCopy(szVal, ARRAYSIZE(szVal), meta.szGroup[0] ? meta.szGroup : L"?");
+        StringCchCopy(szVal, ARRAYSIZE(szVal), meta.szGroup);
     }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_GroupGid))
     {
-        if (meta.dwGid) StringCchPrintf(szVal, ARRAYSIZE(szVal), L"%u", meta.dwGid);
+        if (meta.dwGid != 0xFFFFFFFF) StringCchPrintf(szVal, ARRAYSIZE(szVal), L"%u", meta.dwGid);
     }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_Size))
     {

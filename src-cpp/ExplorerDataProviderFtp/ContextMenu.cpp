@@ -155,8 +155,8 @@ static BOOL ReadRemoteMeta(PCWSTR site, PCWSTR folder, PCWSTR name, REMOTEMETA *
         if (0 != StrCmp(entries[i].szName, name)) continue;
         ZeroMemory(meta, sizeof(*meta));
         StringCchCopy(meta->name, ARRAYSIZE(meta->name), entries[i].szName);
-        StringCchCopy(meta->owner, ARRAYSIZE(meta->owner), entries[i].szOwner[0] ? entries[i].szOwner : L"?");
-        StringCchCopy(meta->group, ARRAYSIZE(meta->group), entries[i].szGroup[0] ? entries[i].szGroup : L"?");
+        StringCchCopy(meta->owner, ARRAYSIZE(meta->owner), entries[i].szOwner);
+        StringCchCopy(meta->group, ARRAYSIZE(meta->group), entries[i].szGroup);
         meta->bits = entries[i].dwMode;
         meta->fIsFolder = entries[i].fIsFolder;
         meta->fIsSymlink = entries[i].fIsSymlink;
@@ -217,13 +217,15 @@ static void PermSyncOctalToChecks(HWND hDlg)
 // let the user change the numeric uid/gid (SFTP chown; FTP will fail cleanly).
 static void PermInitOwnerGroup(HWND hDlg, const REMOTEMETA *m)
 {
-    WCHAR buf[128];
-    StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%u]", m->owner[0] ? m->owner : L"-", m->dwUid);
+    WCHAR u[16] = {}, g[16] = {}, buf[128];
+    if (m->dwUid != 0xFFFFFFFF) StringCchPrintf(u, ARRAYSIZE(u), L"%u", m->dwUid);
+    if (m->dwGid != 0xFFFFFFFF) StringCchPrintf(g, ARRAYSIZE(g), L"%u", m->dwGid);
+    StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%s]", m->owner[0] ? m->owner : L"-", u[0] ? u : L"-");
     SetDlgItemTextW(hDlg, 3004, buf);
-    StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%u]", m->group[0] ? m->group : L"-", m->dwGid);
+    StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%s]", m->group[0] ? m->group : L"-", g[0] ? g : L"-");
     SetDlgItemTextW(hDlg, 3005, buf);
-    if (m->dwUid) { WCHAR u[16]; StringCchPrintf(u, ARRAYSIZE(u), L"%u", m->dwUid); SetDlgItemTextW(hDlg, 3024, u); }
-    if (m->dwGid) { WCHAR g[16]; StringCchPrintf(g, ARRAYSIZE(g), L"%u", m->dwGid); SetDlgItemTextW(hDlg, 3025, g); }
+    SetDlgItemTextW(hDlg, 3024, u);
+    SetDlgItemTextW(hDlg, 3025, g);
 }
 
 // Read the uid/gid edit boxes and chown if either differs from current.
@@ -234,8 +236,8 @@ static void PermApplyChown(HWND hDlg, PROPMETA *pm)
     WCHAR newU[32] = {}, newG[32] = {}, curU[16] = {}, curG[16] = {};
     GetDlgItemTextW(hDlg, 3024, newU, ARRAYSIZE(newU));
     GetDlgItemTextW(hDlg, 3025, newG, ARRAYSIZE(newG));
-    if (pm->meta.dwUid) StringCchPrintf(curU, ARRAYSIZE(curU), L"%u", pm->meta.dwUid);
-    if (pm->meta.dwGid) StringCchPrintf(curG, ARRAYSIZE(curG), L"%u", pm->meta.dwGid);
+    if (pm->meta.dwUid != 0xFFFFFFFF) StringCchPrintf(curU, ARRAYSIZE(curU), L"%u", pm->meta.dwUid);
+    if (pm->meta.dwGid != 0xFFFFFFFF) StringCchPrintf(curG, ARRAYSIZE(curG), L"%u", pm->meta.dwGid);
     BOOL changeU = newU[0] && StrCmp(newU, curU) != 0;
     BOOL changeG = newG[0] && StrCmp(newG, curG) != 0;
     if (!changeU && !changeG) return;

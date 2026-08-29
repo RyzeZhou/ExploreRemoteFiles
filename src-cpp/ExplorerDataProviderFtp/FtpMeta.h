@@ -14,7 +14,7 @@ typedef struct
     DWORD   dwMode;
     DWORD   dwSize;
     DWORD   dwMtime;
-    DWORD   dwUid;      // 0 = unknown (FTP has no numeric ids)
+    DWORD   dwUid;      // 0xFFFFFFFF = unknown; 0 (root) is a VALID value
     DWORD   dwGid;
     BOOL    fIsFolder;
     BOOL    fIsSymlink;
@@ -158,8 +158,8 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
         StringCchCopy(item.szGroup, ARRAYSIZE(item.szGroup), fields[5]);
         item.fIsFolder  = _wtoi(fields[6]) != 0;
         item.fIsSymlink = _wtoi(fields[7]) != 0;
-        item.dwUid = (nf > 10 && fields[10]) ? (DWORD)_wtoi64(fields[10]) : 0;
-        item.dwGid = (nf > 11 && fields[11]) ? (DWORD)_wtoi64(fields[11]) : 0;
+        item.dwUid = (nf > 10 && fields[10] && fields[10][0]) ? (DWORD)_wtoi64(fields[10]) : 0xFFFFFFFF;
+        item.dwGid = (nf > 11 && fields[11] && fields[11][0]) ? (DWORD)_wtoi64(fields[11]) : 0xFFFFFFFF;
         StringCchCopy(item.szName, ARRAYSIZE(item.szName), fields[9]);
         count++;
     }
