@@ -204,6 +204,120 @@ static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
     }
     return FALSE;
 }
+// ---- server-style addressing helpers (used by GetDisplayNameOf and
+// GetUIObjectOf's IPropertyStore branch, so defined before both) ------------
+
+static void FormatMode(DWORD mode, BOOL folder, BOOL symlink, PWSTR out, UINT cch);  // fwd
+
+static PCFVITEMID IsOursItem(PCUIDLIST_RELATIVE p)
+{
+    return (p && p->mkid.cb >= FIELD_OFFSET(FVITEMID, szName) + sizeof(WCHAR) &&
+            ((PCFVITEMID)p)->MyObjID == MYOBJID) ? (PCFVITEMID)p : NULL;
+}
+static BOOL GetPidlSite(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
+{
+    out[0] = 0;
+    PCUIDLIST_RELATIVE p = (PCUIDLIST_RELATIVE)abs;
+    while (p && p->mkid.cb)
+    {
+        PCFVITEMID it = IsOursItem(p);
+        if (it) { StringCchCopyN(out, cch, it->szName, it->cchName); return out[0] != 0; }
+        p = ILNext(p);
+    }
+    return FALSE;
+}
+static void GetPidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
+{
+    out[0] = 0;
+    PCUIDLIST_RELATIVE p = (PCUIDLIST_RELATIVE)abs;
+    BOOL first = TRUE;
+    while (p && p->mkid.cb)
+    {
+        PCFVITEMID it = IsOursItem(p);
+        if (it)
+        {
+            WCHAR name[256];
+            StringCchCopyN(name, ARRAYSIZE(name), it->szName, it->cchName);
+            if (name[0] && !first) { StringCchCat(out, cch, L"/"); StringCchCat(out, cch, name); }
+            first = FALSE;
+        }
+        p = ILNext(p);
+    }
+    if (!out[0]) StringCchCopy(out, cch, L"/");
+}
+
+// Per-item IPropertyStore so the standard Properties dialog will open for our
+// items (and then load the registered property sheet handler with the
+// Permissions page). Read-only: values come from the cached directory snapshot.
+class CFolderViewImplPropStore : public IPropertyStore
+{
+public:
+    CFolderViewImplPropStore(PCWSTR site, PCWSTR folder, PCWSTR name) : ref(1)
+    {
+        StringCchCopy(szSite, ARRAYSIZE(szSite), site);
+        StringCchCopy(szFolder, ARRAYSIZE(szFolder), folder);
+        StringCchCopy(szName, ARRAYSIZE(szName), name);
+        GetItemMeta(site, folder, name, &meta);
+    }
+    HRESULT QueryInterface(REFIID r, void **p)
+    {
+        static const QITAB q[] = { QITABENT(CFolderViewImplPropStore, IPropertyStore), {0} };
+        return QISearch(this, q, r, p);
+    }
+    ULONG AddRef() { return InterlockedIncrement(&ref); }
+    ULONG Release() { long n = InterlockedDecrement(&ref); if (!n) delete this; return n; }
+
+    // IPropertyStore
+    HRESULT GetCount(DWORD *pcProps) { if (pcProps) *pcProps = 0; return S_OK; }
+    HRESULT GetAt(DWORD, PROPERTYKEY *) { return E_NOTIMPL; }
+    HRESULT GetValue(REFPROPERTYKEY key, PROPVARIANT *pv)
+    {
+        PropVariantInit(pv);
+        if (IsEqualPropertyKey(key, PKEY_ItemNameDisplay) || IsEqualPropertyKey(key, PKEY_FileName))
+        {
+            pv->vt = VT_LPWSTR;
+            return SHStrDup(szName, &pv->pwszVal);
+        }
+        if (IsEqualPropertyKey(key, PKEY_ItemType))
+        {
+            pv->vt = VT_LPWSTR;
+            return SHStrDup(meta.fIsFolder ? L"Folder" : L"File", &pv->pwszVal);
+        }
+        if (IsEqualPropertyKey(key, PKEY_Size))
+        {
+            pv->vt = VT_UI8;
+            pv->uhVal.QuadPart = meta.dwSize;
+            return S_OK;
+        }
+        if (IsEqualPropertyKey(key, PKEY_DateModified))
+        {
+            pv->vt = VT_FILETIME;
+            ULONGLONG ft = ((ULONGLONG)meta.dwMtime) * 10000000ULL + 116444736000000000ULL;
+            pv->filetime.dwLowDateTime = (DWORD)(ft & 0xFFFFFFFF);
+            pv->filetime.dwHighDateTime = (DWORD)(ft >> 32);
+            return S_OK;
+        }
+        if (IsEqualPropertyKey(key, PKEY_Remote_Permissions))
+        {
+            pv->vt = VT_LPWSTR;
+            WCHAR mode[16];
+            FormatMode(meta.dwMode, meta.fIsFolder, meta.fIsSymlink, mode, ARRAYSIZE(mode));
+            return SHStrDup(mode, &pv->pwszVal);
+        }
+        return S_OK;
+    }
+    HRESULT SetValue(REFPROPERTYKEY, const PROPVARIANT &) { return STG_E_ACCESSDENIED; }
+    HRESULT Commit() { return E_NOTIMPL; }
+
+private:
+    ~CFolderViewImplPropStore() { }
+    long ref;
+    WCHAR szSite[64];
+    WCHAR szFolder[512];
+    WCHAR szName[MAX_PATH];
+    ITEMDATA meta;
+};
+
 static void FormatMode(DWORD mode, BOOL folder, BOOL symlink, PWSTR out, UINT cch)
 {
     WCHAR type = symlink ? L'l' : (folder ? L'd' : L'-');
@@ -877,6 +991,29 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
     {
         hr = SHCreateDataObject(m_pidl, cidl, apidl, NULL, riid, ppv);
     }
+    else if (riid == IID_IPropertyStore)
+    {
+        // Standard Properties dialog needs a per-item IPropertyStore before it
+        // will open (and load our property sheet handlers). Provide the remote
+        // metadata we already cache; write-back is handled by the property
+        // sheet page / our commands.
+        if (cidl >= 1)
+        {
+            WCHAR site[64] = {}, folder[512] = {}, name[MAX_PATH] = {};
+            GetPidlSite(m_pidl, site, ARRAYSIZE(site));
+            GetPidlPath(m_pidl, folder, ARRAYSIZE(folder));
+            if (SUCCEEDED(_GetName(apidl[0], name, ARRAYSIZE(name))) && site[0])
+            {
+                CFolderViewImplPropStore *ps = new (std::nothrow) CFolderViewImplPropStore(site, folder, name);
+                hr = ps ? S_OK : E_OUTOFMEMORY;
+                if (SUCCEEDED(hr))
+                {
+                    hr = ps->QueryInterface(riid, ppv);
+                    ps->Release();
+                }
+            }
+        }
+    }
     else if (riid == IID_IQueryAssociations)
     {
         BOOL fIsFolder = FALSE;
@@ -909,46 +1046,6 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
         hr = E_NOINTERFACE;
     }
     return hr;
-}
-
-// ---- server-style addressing: "<site>:/<unix path>" -------------------------
-
-static PCFVITEMID IsOursItem(PCUIDLIST_RELATIVE p)
-{
-    return (p && p->mkid.cb >= FIELD_OFFSET(FVITEMID, szName) + sizeof(WCHAR) &&
-            ((PCFVITEMID)p)->MyObjID == MYOBJID) ? (PCFVITEMID)p : NULL;
-}
-static BOOL GetPidlSite(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
-{
-    out[0] = 0;
-    PCUIDLIST_RELATIVE p = (PCUIDLIST_RELATIVE)abs;
-    while (p && p->mkid.cb)
-    {
-        PCFVITEMID it = IsOursItem(p);
-        if (it) { StringCchCopyN(out, cch, it->szName, it->cchName); return out[0] != 0; }
-        p = ILNext(p);
-    }
-    return FALSE;
-}
-static void GetPidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
-{
-    // First IsOurs segment is the site name; join the rest with '/'.
-    out[0] = 0;
-    PCUIDLIST_RELATIVE p = (PCUIDLIST_RELATIVE)abs;
-    BOOL first = TRUE;
-    while (p && p->mkid.cb)
-    {
-        PCFVITEMID it = IsOursItem(p);
-        if (it)
-        {
-            WCHAR name[256];
-            StringCchCopyN(name, ARRAYSIZE(name), it->szName, it->cchName);
-            if (name[0] && !first) { StringCchCat(out, cch, L"/"); StringCchCat(out, cch, name); }
-            first = FALSE;
-        }
-        p = ILNext(p);
-    }
-    if (!out[0]) StringCchCopy(out, cch, L"/");
 }
 
 //  Retrieves the display name for the specified file object or subfolder.
@@ -1533,6 +1630,23 @@ HRESULT CFolderViewImplEnumIDList::Initialize()
 // Retrieves the specified number of item identifiers in
 // the enumeration sequence and advances the current position
 // by the number of items retrieved.
+// Follows the system-wide "Show hidden files" toggle
+// (HKCU\...\Explorer\Advanced\Hidden) — Explorer does not reliably pass
+// SHCONTF_INCLUDEHIDDEN to virtual folders, so we read the setting ourselves.
+static BOOL FtpShowHiddenSetting()
+{
+    DWORD v = 0, sz = sizeof(v);
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+            0, KEY_READ, &hk) == ERROR_SUCCESS)
+    {
+        if (RegQueryValueExW(hk, L"Hidden", NULL, NULL, (LPBYTE)&v, &sz) != ERROR_SUCCESS) v = 0;
+        RegCloseKey(hk);
+    }
+    return v == 1;
+}
+
 HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG *pceltFetched)
 {
     ULONG celtFetched = 0;
@@ -1544,9 +1658,11 @@ HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG 
         while (SUCCEEDED(hr) && i < celt && m_nItem < ARRAYSIZE(m_aData) && m_aData[m_nItem].szName[0])
         {
             BOOL fSkip = FALSE;
-            // Linux-style dotfiles: hidden unless the "Show hidden files" view
-            // option (SHCONTF_INCLUDEHIDDEN) is active.
-            if (m_aData[m_nItem].szName[0] == L'.' && !(m_grfFlags & SHCONTF_INCLUDEHIDDEN))
+            // Linux-style dotfiles: hidden unless the system "Show hidden files"
+            // toggle is on (or the caller explicitly asked for hidden items).
+            if (m_aData[m_nItem].szName[0] == L'.' &&
+                !(m_grfFlags & SHCONTF_INCLUDEHIDDEN) &&
+                !FtpShowHiddenSetting())
             {
                 fSkip = TRUE;
             }
