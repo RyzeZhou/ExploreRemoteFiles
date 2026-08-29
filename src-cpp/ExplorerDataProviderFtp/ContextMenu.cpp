@@ -93,9 +93,9 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
 {
     WCHAR cmd[2400];
     if (p2 && p2[0])
-        StringCchPrintf(cmd,ARRAYSIZE(cmd),L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" %s \"%s\" \"%s\" \"%s\"",verb,site,p1,p2);
+        StringCchPrintf(cmd,ARRAYSIZE(cmd),L"\"%s\" %s \"%s\" \"%s\" \"%s\"",GetCliPath(),verb,site,p1,p2);
     else
-        StringCchPrintf(cmd,ARRAYSIZE(cmd),L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" %s \"%s\" \"%s\"",verb,site,p1);
+        StringCchPrintf(cmd,ARRAYSIZE(cmd),L"\"%s\" %s \"%s\" \"%s\"",GetCliPath(),verb,site,p1);
     SECURITY_ATTRIBUTES sa={sizeof(sa),NULL,TRUE}; HANDLE rd=NULL,wr=NULL;
     if(captured && !CreatePipe(&rd,&wr,&sa,0)) return -1;
     if(captured) SetHandleInformation(rd,HANDLE_FLAG_INHERIT,0);

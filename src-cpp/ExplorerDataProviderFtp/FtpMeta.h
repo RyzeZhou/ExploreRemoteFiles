@@ -6,6 +6,23 @@
 #include <windows.h>
 #include <shlwapi.h>
 #include <strsafe.h>
+
+// CLI bridge path: HKCU\Software\ExplorerRemoteFs\CliPath (set by install.ps1)
+// so a released package works on any machine; falls back to the dev checkout.
+inline const WCHAR *GetCliPath()
+{
+    static WCHAR s_path[MAX_PATH] = {};
+    if (!s_path[0])
+    {
+        DWORD cb = sizeof(s_path);
+        LONG r = RegGetValueW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", L"CliPath",
+                              RRF_RT_REG_SZ, NULL, s_path, &cb);
+        if (r != ERROR_SUCCESS || !s_path[0])
+            StringCchCopyW(s_path, ARRAYSIZE(s_path),
+                           L"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe");
+    }
+    return s_path;
+}
 #include <string>
 #include <vector>
 
@@ -115,8 +132,8 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
     PCWSTR pszPath = (path && path[0]) ? path : L"/";
     WCHAR cmd[1200];
     StringCchPrintf(cmd, ARRAYSIZE(cmd),
-        L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" pipe \"%s\" \"%s\"",
-        site, pszPath);
+        L"\"%s\" pipe \"%s\" \"%s\"",
+        GetCliPath(), site, pszPath);
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE rd = NULL, wr = NULL;
     if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
