@@ -1081,6 +1081,7 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
             WCHAR site[64] = {}, path[600] = {};
             BOOL hasSite = GetPidlSite(m_pidl, site, ARRAYSIZE(site));
             GetPidlPath(m_pidl, path, ARRAYSIZE(path));
+            BOOL siteFromPidl = FALSE;   // child PIDL IS the site root itself
             if (!hasSite)
             {
                 // Site picker root: the child PIDL itself may BE the site segment
@@ -1091,6 +1092,7 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
                     StringCchCopy(site, ARRAYSIZE(site), childSite);
                     hasSite = TRUE;
                     StringCchCopy(path, ARRAYSIZE(path), L"/");
+                    siteFromPidl = TRUE;
                 }
             }
 
@@ -1101,9 +1103,15 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
                 if (hasSite)
                 {
                     StringCchPrintf(szDisplayName, ARRAYSIZE(szDisplayName), L"%s:%s", site, path);
-                    BOOL pathIsRoot = (path[0] == L'/' && !path[1]);
-                    if (!pathIsRoot && szName[0]) StringCchCat(szDisplayName, ARRAYSIZE(szDisplayName), L"/");
-                    StringCchCat(szDisplayName, ARRAYSIZE(szDisplayName), szName);
+                    if (!siteFromPidl && szName[0])
+                    {
+                        // Append the child name ("WSL-FTP:/file" at the site root,
+                        // "WSL-FTP:/tmp/file" in deep folders).
+                        BOOL pathIsRoot = (path[0] == L'/' && !path[1]);
+                        if (!pathIsRoot) StringCchCat(szDisplayName, ARRAYSIZE(szDisplayName), L"/");
+                        StringCchCat(szDisplayName, ARRAYSIZE(szDisplayName), szName);
+                    }
+                    // siteFromPidl: the site root itself -> keep just "WSL-FTP:/"
                 }
                 else
                 {
