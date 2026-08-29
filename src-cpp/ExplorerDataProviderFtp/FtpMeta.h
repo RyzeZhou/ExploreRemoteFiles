@@ -159,6 +159,11 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
         StringCchCopy(item.szName, ARRAYSIZE(item.szName), fields[9]);
         count++;
     }
-    FtpCacheStore(site, pszPath, out, count);
+    // Only cache when the listing actually succeeded: a FAIL: output (bad
+    // credentials, missing dir, CLI error) must not be cached as an "empty dir".
+    if (text.rfind("FAIL:", 0) == std::string::npos)
+    {
+        FtpCacheStore(site, pszPath, out, count);
+    }
     return count;
 }

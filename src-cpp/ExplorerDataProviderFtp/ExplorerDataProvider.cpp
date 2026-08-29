@@ -1644,9 +1644,6 @@ HRESULT CFolderViewImplEnumIDList::Initialize()
 // Retrieves the specified number of item identifiers in
 // the enumeration sequence and advances the current position
 // by the number of items retrieved.
-// Follows the system-wide "Show hidden files" toggle
-// (HKCU\...\Explorer\Advanced\Hidden) — Explorer does not reliably pass
-// SHCONTF_INCLUDEHIDDEN to virtual folders, so we read the setting ourselves.
 HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG *pceltFetched)
 {
     ULONG celtFetched = 0;
@@ -1657,6 +1654,7 @@ HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG 
         ULONG i = 0;
         while (SUCCEEDED(hr) && i < celt && m_nItem < ARRAYSIZE(m_aData) && m_aData[m_nItem].szName[0])
         {
+            ProbeLog(L"[ENUM] item='%s' folder=%d flags=0x%X", m_aData[m_nItem].szName, m_aData[m_nItem].fIsFolder, m_grfFlags);
             BOOL fSkip = FALSE;
             // NOTE: dotfiles are ALWAYS shown — matches WSL \\wsl$ behavior
             // (no hidden-file concept); avoids fighting Explorer's own hidden

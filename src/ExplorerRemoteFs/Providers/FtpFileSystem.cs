@@ -59,8 +59,9 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         try
         {
             // ForceList：MLSD 不携带 unix.mode/owner/group fact，必须用 LIST 才能拿到 Unix 权限。
-            // Unix 服务器（vsftpd/pyftpdlib/ProFTPD）LIST 输出为标准 -rw-r--r-- owner group 格式。
-            items = _client.GetListing(path, FtpListOption.ForceList);
+            // AllFiles：FluentFTP 默认过滤 . 开头的隐藏文件；FTP 服务器（如 pyftpdlib）LIST 会
+            // 返回它们，Linux 语义下必须显示（与 WSL \\wsl$ 行为一致）。
+            items = _client.GetListing(path, FtpListOption.ForceList | FtpListOption.AllFiles);
         }
         catch (System.IO.IOException ex)
         {
