@@ -623,6 +623,10 @@ public:
  HRESULT QueryContextMenu(HMENU m,UINT i,UINT first,UINT,UINT flags){
     if(flags&CMF_DEFAULTONLY)return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
     SELDATA sel; if(!CollectSelection(data,&sel)) return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
+    // Site-picker items (no site segment in the folder PIDL) get the system
+    // default menu (Open/Pin/Rename/Delete/Properties) only — our WinSCP-style
+    // commands operate on remote files, not on saved connections.
+    if(!sel.site[0]) return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
     BOOL multi = sel.count>1;
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_OPEN,L"Open");
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_EDIT,L"Edit");
