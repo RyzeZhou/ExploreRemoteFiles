@@ -12,6 +12,7 @@
 #include "FtpSites.h"
 #include "Utils.h"
 #include "resource.h"
+#include "ProbeLog.h"
 #include <new>
 
 #define MENU_DELETE 0
@@ -226,8 +227,6 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
     case WM_COMMAND:
         if(HIWORD(wp)==BN_CLICKED && LOWORD(wp)>=3011 && LOWORD(wp)<=3019){ PermSyncChecksToOctal(hDlg); return TRUE; }
         if(HIWORD(wp)==EN_CHANGE && LOWORD(wp)==3022){ PermSyncOctalToChecks(hDlg); return TRUE; }
-        if(LOWORD(wp)==3020){ PermSetChecks(hDlg,0777); PermSyncChecksToOctal(hDlg); return TRUE; }
-        if(LOWORD(wp)==3021){ PermSetChecks(hDlg,0); PermSyncChecksToOctal(hDlg); return TRUE; }
         if(LOWORD(wp)==IDCANCEL){EndDialog(hDlg,IDCANCEL);return TRUE;}
         if(LOWORD(wp)==IDOK){
             PROPMETA *pm=(PROPMETA*)GetWindowLongPtrW(hDlg,DWLP_USER);
@@ -543,14 +542,115 @@ static void RunCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name,
     }
 }
 
+// ---- background (folder empty area) menu helpers ----------------------------
+
+#define MENU_BG_SHOWHIDDEN 200
+#define MENU_BG_COPY_PATH  201
+#define MENU_BG_MKDIR      202
+#define MENU_BG_PASTE      203
+#define MENU_BG_CUSTOM_BASE 210
+
+static BOOL FtpHiddenSetting()
+{
+    DWORD v=0, sz=sizeof(v); HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+            0, KEY_READ, &hk) == ERROR_SUCCESS)
+    {
+        if (RegQueryValueExW(hk, L"Hidden", 0, NULL, (BYTE*)&v, &sz) != ERROR_SUCCESS) v = 0;
+        RegCloseKey(hk);
+    }
+    return v == 1;
+}
+static void FtpSetHiddenSetting(BOOL show)
+{
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+            0, NULL, 0, KEY_WRITE, NULL, &hk, NULL) == ERROR_SUCCESS)
+    {
+        DWORD v = show ? 1 : 0;
+        RegSetValueExW(hk, L"Hidden", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        RegCloseKey(hk);
+    }
+}
+static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder)
+{
+    WCHAR name[256] = L"New folder";
+    if (!PromptText(hwnd, L"New folder", name, ARRAYSIZE(name), name)) return;
+    WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
+    if (RunCli(site, L"mkdir", full, NULL, NULL) != 0)
+        MessageBoxW(hwnd, L"Failed to create folder.", L"Remote", MB_OK|MB_ICONERROR);
+    else FtpCacheClear();
+}
+static void PasteClipboardToFolder(HWND hwnd, PCWSTR site, PCWSTR folder)
+{
+    if (!OpenClipboard(hwnd)) return;
+    HANDLE h = GetClipboardData(CF_HDROP);
+    if (h)
+    {
+        DROPFILES *df = (DROPFILES*)GlobalLock(h);
+        if (df)
+        {
+            BOOL wide = df->fWide;
+            PCWSTR pw = (PCWSTR)((BYTE*)df + df->pFiles);
+            PCSTR  pa = (PCSTR)((BYTE*)df + df->pFiles);
+            BOOL ok = TRUE;
+            while (wide ? *pw : *pa)
+            {
+                WCHAR local[MAX_PATH], name[MAX_PATH];
+                if (wide) { StringCchCopy(local, MAX_PATH, pw); pw += wcslen(pw) + 1; }
+                else      { MultiByteToWideChar(CP_ACP, 0, pa, -1, local, MAX_PATH); pa += strlen(pa) + 1; }
+                StringCchCopy(name, MAX_PATH, PathFindFileNameW(local));
+                WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
+                if (RunCli(site, L"put", local, full, NULL) != 0) ok = FALSE;
+            }
+            GlobalUnlock(h);
+            FtpCacheClear();
+            if (!ok) MessageBoxW(hwnd, L"Some files could not be uploaded.", L"Remote", MB_OK|MB_ICONERROR);
+        }
+    }
+    CloseClipboard();
+}
+static void BgCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, int idx)
+{
+    CUSTCMD cmds[MAX_CUSTOM] = {};
+    int n = LoadCustomCommands(cmds, MAX_CUSTOM);
+    if (idx < 0 || idx >= n) return;
+    CUSTCMD &c = cmds[idx];
+    WCHAR cmd[2400] = {};
+    {
+        std::wstring s = c.command;
+        auto rep = [&](PCWSTR t, PCWSTR v) {
+            std::wstring tt = t; size_t at = 0;
+            while ((at = s.find(tt, at)) != std::wstring::npos) { s.replace(at, tt.size(), v); at += wcslen(v); }
+        };
+        rep(L"{site}", site); rep(L"{path}", folder); rep(L"{name}", L""); rep(L"{full}", L"");
+        StringCchCopyW(cmd, ARRAYSIZE(cmd), s.c_str());
+    }
+    if (0 == StrCmpIW(c.type, L"script"))
+    {
+        WCHAR ws[2600];
+        StringCchPrintf(ws, ARRAYSIZE(ws), L"\"C:\\Program Files (x86)\\WinSCP\\WinSCP.com\" /command \"open \\\"%s\\\"\" \"%s\" \"close\" \"exit\"", site, cmd);
+        STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
+        if (CreateProcessW(NULL, ws, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    }
+    else
+    {
+        HINSTANCE hr = ShellExecuteW(hwnd, NULL, cmd, NULL, NULL, SW_SHOWNORMAL);
+        if ((INT_PTR)hr <= 32) MessageBoxW(hwnd, L"Custom command failed.", L"Remote", MB_OK|MB_ICONERROR);
+    }
+}
+
 class CMenu : public IContextMenu, public IShellExtInit, public IObjectWithSite {
 public:
- CMenu():ref(1),data(NULL),site(NULL){DllAddRef();}
+ CMenu():ref(1),data(NULL),site(NULL),m_pidlFolder(NULL){DllAddRef();}
  HRESULT QueryInterface(REFIID r,void**p){static const QITAB q[]={QITABENT(CMenu,IContextMenu),QITABENT(CMenu,IShellExtInit),QITABENT(CMenu,IObjectWithSite),{0}};return QISearch(this,q,r,p);}
  ULONG AddRef(){return InterlockedIncrement(&ref);} ULONG Release(){long n=InterlockedDecrement(&ref);if(!n)delete this;return n;}
  HRESULT QueryContextMenu(HMENU m,UINT i,UINT first,UINT,UINT flags){
     if(flags&CMF_DEFAULTONLY)return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
-    SELDATA sel; if(!CollectSelection(data,&sel)) return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
+    SELDATA sel; if(!CollectSelection(data,&sel)) return BuildBackgroundMenu(m,i,first,flags);
     BOOL multi = sel.count>1;
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_OPEN,L"Open");
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_EDIT,L"Edit");
@@ -572,8 +672,40 @@ public:
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_PROPERTIES,multi?L"Properties (first)":L"Remote properties");
     return MAKE_HRESULT(SEVERITY_SUCCESS,0,12+custom);
  }
+ HRESULT BuildBackgroundMenu(HMENU m,UINT i,UINT first,UINT flags){
+    if(flags&CMF_VERBSONLY)return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
+    if(!m_pidlFolder)return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
+    BOOL showHidden=FtpHiddenSetting();
+    InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_SHOWHIDDEN,showHidden?L"Don't show hidden files":L"Show hidden files");
+    InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_COPY_PATH,L"Copy current path");
+    InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_MKDIR,L"New folder...");
+    InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_PASTE,L"Paste files here");
+    int custom=0; CUSTCMD cmds[MAX_CUSTOM]={};
+    custom=LoadCustomCommands(cmds,MAX_CUSTOM);
+    if(custom>0){ InsertMenuW(m,i++,MF_BYPOSITION|MF_SEPARATOR,0,NULL);
+        for(int k=0;k<custom;k++) InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_BG_CUSTOM_BASE+k,cmds[k].name); }
+    return MAKE_HRESULT(SEVERITY_SUCCESS,0,4+custom);
+ }
  HRESULT InvokeCommand(LPCMINVOKECOMMANDINFO ci){
     UINT id=IS_INTRESOURCE(ci->lpVerb)?LOWORD((UINT_PTR)ci->lpVerb):99;
+    if(id>=MENU_BG_CUSTOM_BASE || (id>=MENU_BG_SHOWHIDDEN && id<=MENU_BG_PASTE)){
+        WCHAR site[64]={},folder[512]={};
+        if(m_pidlFolder){ PidlSite(m_pidlFolder,site,ARRAYSIZE(site)); PidlPath(m_pidlFolder,folder,ARRAYSIZE(folder)); }
+        switch(id){
+        case MENU_BG_SHOWHIDDEN:
+            FtpSetHiddenSetting(!FtpHiddenSetting());
+            FtpCacheClear();
+            if(m_pidlFolder) SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_IDLIST,m_pidlFolder,NULL);
+            break;
+        case MENU_BG_COPY_PATH:{
+            std::wstring t=site; t+=L":"; t+=folder;
+            CopyTextToClipboard(ci->hwnd,t.c_str()); break; }
+        case MENU_BG_MKDIR: NewFolderRemote(ci->hwnd,site,folder); break;
+        case MENU_BG_PASTE: PasteClipboardToFolder(ci->hwnd,site,folder); break;
+        default: BgCustomCommand(ci->hwnd,site,folder,id-MENU_BG_CUSTOM_BASE); break;
+        }
+        return S_OK;
+    }
     if(!data)return E_INVALIDARG;
     SELDATA sel; if(!CollectSelection(data,&sel))return E_FAIL;
     PCWSTR pnames[MAX_SEL]; for(int k=0;k<sel.count;k++) pnames[k]=sel.names[k];
@@ -627,11 +759,15 @@ public:
     if(type==GCS_VERBA){ char a[64]; WideCharToMultiByte(CP_ACP,0,v,-1,a,ARRAYSIZE(a),NULL,NULL); return StringCchCopyA(s,c,a); }
     return E_NOTIMPL;
  }
- HRESULT Initialize(PCIDLIST_ABSOLUTE,IDataObject*d,HKEY){if(data)data->Release();data=d;if(data)data->AddRef();return S_OK;}
+ HRESULT Initialize(PCIDLIST_ABSOLUTE pidlFolder,IDataObject*d,HKEY){
+    if(data)data->Release();data=d;if(data)data->AddRef();
+    if(m_pidlFolder)ILFree(m_pidlFolder);
+    m_pidlFolder=pidlFolder?ILCloneFull(pidlFolder):NULL;
+    return S_OK;}
  HRESULT SetSite(IUnknown*s){if(site)site->Release();site=s;if(site)site->AddRef();return S_OK;} HRESULT GetSite(REFIID r,void**p){return site?site->QueryInterface(r,p):E_FAIL;}
 private:
- ~CMenu(){if(data)data->Release();if(site)site->Release();DllRelease();}
- long ref;IDataObject*data;IUnknown*site;
+ ~CMenu(){if(data)data->Release();if(site)site->Release();if(m_pidlFolder)ILFree(m_pidlFolder);DllRelease();}
+ long ref;IDataObject*data;IUnknown*site;PIDLIST_ABSOLUTE m_pidlFolder;
 };
 HRESULT CFolderViewImplContextMenu_CreateInstance(REFIID riid,void**ppv){*ppv=NULL;CMenu*m=new(std::nothrow)CMenu();if(!m)return E_OUTOFMEMORY;HRESULT hr=m->QueryInterface(riid,ppv);m->Release();return hr;}
 
@@ -658,6 +794,7 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_INITDIALOG:
     {
+        ProbeLog(L"[DIAG] PermPage WM_INITDIALOG created");
         PROPMETA *pm = (PROPMETA*)((LPPROPSHEETPAGE)lp)->lParam;
         if (!pm) return FALSE;
         SetWindowLongPtrW(hDlg, DWLP_USER, (LONG_PTR)pm);
@@ -673,8 +810,6 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         if(HIWORD(wp)==BN_CLICKED && LOWORD(wp)>=3011 && LOWORD(wp)<=3019){ PermSyncChecksToOctal(hDlg); return TRUE; }
         if(HIWORD(wp)==EN_CHANGE && LOWORD(wp)==3022){ PermSyncOctalToChecks(hDlg); return TRUE; }
-        if(LOWORD(wp)==3020){ PermSetChecks(hDlg,0777); PermSyncChecksToOctal(hDlg); return TRUE; }
-        if(LOWORD(wp)==3021){ PermSetChecks(hDlg,0); PermSyncChecksToOctal(hDlg); return TRUE; }
         break;
     case WM_NOTIFY:
     {
@@ -732,11 +867,14 @@ public:
     }
 
     // IShellPropSheetExt
-    HRESULT AddPages(LPFNADDPROPSHEETPAGE pfnAddPage, LPARAM)
+    HRESULT AddPages(LPFNADDPROPSHEETPAGE pfnAddPage, LPARAM lParam)
     {
+        ProbeLog(L"[DIAG] PropSheet AddPages called, data=%p pfnAddPage=%p", (void*)data, (void*)pfnAddPage);
         if (!pfnAddPage || !data) return S_OK;   // no selection -> nothing to add
         SELDATA sel;
         if (!CollectSelection(data, &sel)) return S_OK;
+        ProbeLog(L"[DIAG] PropSheet selection ok: site='%s' folder='%s' name='%s' count=%d",
+                 sel.site, sel.folder, sel.names[0], sel.count);
 
         PROPMETA *pm = (PROPMETA*)CoTaskMemAlloc(sizeof(PROPMETA));
         if (!pm) return E_OUTOFMEMORY;
@@ -753,22 +891,24 @@ public:
 
         PROPSHEETPAGE psp = {};
         psp.dwSize = sizeof(psp);
-        psp.dwFlags = PSP_USETITLE | PSP_USECALLBACK;
+        psp.dwFlags = PSP_USECALLBACK;              // title comes from template CAPTION
         psp.hInstance = g_hInst;
         psp.pszTemplate = MAKEINTRESOURCEW(IDD_PERMPAGE);
-        psp.pszTitle = L"Permissions";
         psp.pfnDlgProc = PermPageProc;
         psp.lParam = (LPARAM)pm;
         psp.pfnCallback = PermPageCallback;
 
         HPROPSHEETPAGE hPage = CreatePropertySheetPage(&psp);
+        ProbeLog(L"[DIAG] PropSheet CreatePropertySheetPage hPage=%p lastErr=%u", (void*)hPage, GetLastError());
         if (!hPage)
         {
             if (pm->notify) CoTaskMemFree(pm->notify);
             CoTaskMemFree(pm);
             return S_OK;
         }
-        if (!pfnAddPage(hPage, (LPARAM)this))
+        BOOL added = pfnAddPage(hPage, lParam);     // pass Explorer's lParam back verbatim
+        ProbeLog(L"[DIAG] PropSheet pfnAddPage returned %d", added);
+        if (!added)
         {
             DestroyPropertySheetPage(hPage);
         }

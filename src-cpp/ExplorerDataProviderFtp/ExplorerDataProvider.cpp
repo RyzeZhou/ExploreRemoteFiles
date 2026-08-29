@@ -938,11 +938,10 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
                 {
                     dwAttribs |= SFGAO_HASSUBFOLDER;
                 }
-                WCHAR szName[MAX_PATH] = {};
-                if (SUCCEEDED(_GetName(apidl[0], szName, ARRAYSIZE(szName))) && szName[0] == L'.')
-                {
-                    dwAttribs |= SFGAO_HIDDEN;   // Linux-style dotfiles are hidden
-                }
+                // NOTE: no SFGAO_HIDDEN for dotfiles — Explorer would apply its
+                // own hidden filtering on top of ours, which fought the "Show
+                // hidden files" toggle. Hidden-state is handled entirely by our
+                // enumeration filter, driven by HKCU Advanced\Hidden.
                 *rgfInOut &= dwAttribs;
             }
         }
@@ -957,6 +956,10 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
 {
     *ppv = NULL;
     HRESULT hr;
+
+    ProbeLog(L"[DIAG] GetUIObjectOf riid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X cidl=%u level=%d",
+             riid.Data1, riid.Data2, riid.Data3, riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3],
+             riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7], cidl, m_nLevel);
 
     if (riid == IID_IContextMenu)
     {
