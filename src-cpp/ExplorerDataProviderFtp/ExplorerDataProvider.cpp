@@ -769,97 +769,74 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
     else
     {
         // Compare child ids by column data (lParam & SHCIDS_COLUMNMASK).
-        hr = ResultFromShort(0);
+        // Column model matches GetDetailsOf: 0=Name 1=Type 2=Permissions
+        // 3=Owner 4=Group 5=Size 6=Modified.
+        WCHAR name1[MAX_PATH] = {}, name2[MAX_PATH] = {};
+        if (FAILED(_GetName(pidl1, name1, ARRAYSIZE(name1))) ||
+            FAILED(_GetName(pidl2, name2, ARRAYSIZE(name2))))
+        {
+            return E_INVALIDARG;
+        }
+
+        // Folders always sort before files (Windows convention, independent of
+        // the sort direction Explorer applies).
+        ITEMDATA m1 = {}, m2 = {};
+        GetItemMeta(m_szSiteName, m_szRemotePath, name1, &m1);
+        GetItemMeta(m_szSiteName, m_szRemotePath, name2, &m2);
+        if (m1.fIsFolder != m2.fIsFolder)
+        {
+            return ResultFromShort(m1.fIsFolder ? -1 : 1);
+        }
+
+        int cmp = 0;
         switch (lParam & SHCIDS_COLUMNMASK)
         {
-            case 0: // Column one, Name.
-            {
-                // Load the strings that represent the names
-                if (!m_rgNames[0])
-                {
-                    hr = LoadFolderViewImplDisplayStrings(m_rgNames, ARRAYSIZE(m_rgNames));
-                }
-                if (SUCCEEDED(hr))
-                {
-                    PWSTR psz1;
-                    hr = _GetName(pidl1, &psz1);
-                    if (SUCCEEDED(hr))
-                    {
-                        PWSTR psz2;
-                        hr = _GetName(pidl2, &psz2);
-                        if (SUCCEEDED(hr))
-                        {
-                            // Find their place in the array.
-                            // This is a display sort so we want to sort by "one" "two" "three" instead of alphabetically.
-                            int nPidlOne = 0, nPidlTwo = 0;
-                            for (int i = 0; i < ARRAYSIZE(m_rgNames); i++)
-                            {
-                                if (0 == StrCmp(psz1, m_rgNames[i]))
-                                {
-                                    nPidlOne = i;
-                                }
-
-                                if (0 == StrCmp(psz2, m_rgNames[i]))
-                                {
-                                    nPidlTwo = i;
-                                }
-                            }
-
-                            hr = ResultFromShort(nPidlOne - nPidlTwo);
-                            CoTaskMemFree(psz2);
-                        }
-                        CoTaskMemFree(psz1);
-                    }
-                }
-                break;
-            }
-            case 1: // Column two, Size.
-            {
-                int nSize1 = 0, nSize2 = 0;
-                hr = _GetSize(pidl1, &nSize1);
-                if (SUCCEEDED(hr))
-                {
-                    hr = _GetSize(pidl2, &nSize2);
-                    if (SUCCEEDED(hr))
-                    {
-                        hr = ResultFromShort(nSize1 - nSize2);
-                    }
-                }
-                break;
-            }
-            case 2: // Column Three, Sides.
-            {
-                int nSides1 = 0, nSides2 = 0;
-                hr = _GetSides(pidl1, &nSides1);
-                if (SUCCEEDED(hr))
-                {
-                    hr = _GetSides(pidl2, &nSides2);
-                    if (SUCCEEDED(hr))
-                    {
-                        hr = ResultFromShort(nSides1 - nSides2);
-                    }
-                }
-                break;
-            }
-            case 3: // Column four, Level.
-            {
-                int cLevel1 = 0, cLevel2 = 0;
-                hr = _GetLevel(pidl1, &cLevel1);
-                if (SUCCEEDED(hr))
-                {
-                    hr = _GetLevel(pidl2, &cLevel2);
-                    if (SUCCEEDED(hr))
-                    {
-                        hr = ResultFromShort(cLevel1 - cLevel2);
-                    }
-                }
-                break;
-            }
-            default:
-            {
-                hr = ResultFromShort(1);
-            }
+        case 0: // Name -- natural (number-aware) order.
+            cmp = StrCmpLogicalW(name1, name2);
+            break;
+        case 1: // Type -- friendly type name, tie-break by name.
+        {
+            WCHAR t1[128] = {}, t2[128] = {};
+            GetFriendlyType(name1, m1.fIsFolder, t1, ARRAYSIZE(t1));
+            GetFriendlyType(name2, m2.fIsFolder, t2, ARRAYSIZE(t2));
+            cmp = StrCmpLogicalW(t1, t2);
+            if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+            break;
         }
+        case 2: // Permissions (Linux mode string).
+        {
+            WCHAR p1[16] = {}, p2[16] = {};
+            FormatMode(m1.dwMode, m1.fIsFolder, m1.fIsSymlink, p1, ARRAYSIZE(p1));
+            FormatMode(m2.dwMode, m2.fIsFolder, m2.fIsSymlink, p2, ARRAYSIZE(p2));
+            cmp = StrCmpW(p1, p2);
+            if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+            break;
+        }
+        case 3: // Owner.
+            cmp = StrCmpLogicalW(m1.szOwner, m2.szOwner);
+            if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+            break;
+        case 4: // Group.
+            cmp = StrCmpLogicalW(m1.szGroup, m2.szGroup);
+            if (!cmp) cmp = StrCmpLogicalW(name1, name2);
+            break;
+        case 5: // Size.
+            if (m1.dwSize != m2.dwSize)
+                cmp = (m1.dwSize < m2.dwSize) ? -1 : 1;
+            else
+                cmp = StrCmpLogicalW(name1, name2);
+            break;
+        case 6: // Modified.
+            if (m1.dwMtime != m2.dwMtime)
+                cmp = (m1.dwMtime < m2.dwMtime) ? -1 : 1;
+            else
+                cmp = StrCmpLogicalW(name1, name2);
+            break;
+        default:
+            cmp = StrCmpLogicalW(name1, name2);
+            break;
+        }
+        hr = ResultFromShort(cmp);
     }
 
     if (ResultFromShort(0) == hr)
