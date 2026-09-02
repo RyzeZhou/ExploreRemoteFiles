@@ -146,6 +146,17 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
     CloseHandle(pi.hThread);CloseHandle(pi.hProcess);return code==0?0:-1;
 }
 
+// Single refresh pipeline for EVERY successful remote mutation — right-click
+// commands, background menu, drop target (Ctrl+V / drag-drop) all funnel here:
+// invalidate the metadata cache, then ask the affected view to re-enumerate.
+// P0-4 fix: clearing the cache alone never makes an existing DefView redraw;
+// SHCNE_UPDATEDIR on the folder PIDL does.
+static void AfterRemoteMutation(PIDLIST_ABSOLUTE notifyPidl)
+{
+    FtpCacheClear();
+    if (notifyPidl) SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, notifyPidl, NULL);
+}
+
 // WinSCP.com location for "script" custom commands: registry
 // (HKCU\Software\ExplorerRemoteFs\WinScpPath, set by the GUI client) -> common
 // install paths -> PATH. Supports portable/green WinSCP installs.
@@ -342,8 +353,7 @@ static void PermApplyChown(HWND hDlg, PROPMETA *pm)
         MessageBoxW(hDlg, ExplorerText(L"error.owner_group_rejected", L"SFTP 服务器拒绝了所有者/组更新。", L"Owner/group update was rejected by the SFTP server."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
     else
     {
-        FtpCacheClear();
-        if (pm->notify) SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, pm->notify, NULL);
+        AfterRemoteMutation(pm->notify);
     }
 }
 
@@ -420,8 +430,7 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
                 if(mode != pm->meta.bits || recursive){
                     WCHAR modeStr[8]; StringCchPrintf(modeStr,ARRAYSIZE(modeStr),L"%03o",mode);
                     if(RunCli(pm->site, recursive?L"chmodr":L"chmod", pm->path, modeStr, NULL)==0){
-                        FtpCacheClear();
-                        if(pm->notify) SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_IDLIST,pm->notify,NULL);
+                        AfterRemoteMutation(pm->notify);
                     } else MessageBoxW(hDlg, ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
                 }
                 PermApplyChown(hDlg,pm);
@@ -791,7 +800,7 @@ static BOOL CopyToRemoteFolder(PCWSTR site, PCWSTR sourceFolder, PCWSTR name, PC
     else StringCchPrintf(dst, ARRAYSIZE(dst), L"%s/%s", targetFolder, targetName);
     return RunCli(site, L"dup", src, dst, NULL) == 0;
 }
-static void ServerCopy(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count)
+static void ServerCopy(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count, PIDLIST_ABSOLUTE notifyPidl)
 {
     COPYCTX ctx = {}; StringCchCopy(ctx.sourceSite, ARRAYSIZE(ctx.sourceSite), site); StringCchCopy(ctx.sourceFolder, ARRAYSIZE(ctx.sourceFolder), folder); ctx.names = names; ctx.count = count;
     if (!PromptCopyTarget(hwnd, &ctx)) return;
@@ -815,9 +824,9 @@ static void ServerCopy(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int
         DeleteFileW(local);
     }
     if (!ok) MessageBoxW(hwnd, ExplorerText(L"error.copy_failed", L"部分项目复制失败。跨站点和本地复制目前仅支持文件。", L"Some items could not be copied. Cross-site and local copies currently support files only."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
-    else FtpCacheClear();
+    else AfterRemoteMutation(notifyPidl);
 }
-static void ServerMove(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count)
+static void ServerMove(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count, PIDLIST_ABSOLUTE notifyPidl)
 {
     // Move all selected items to a target directory (WinSCP "Move to").
     WCHAR dst[700]; StringCchCopy(dst,ARRAYSIZE(dst),folder && folder[0] ? folder : L"/");
@@ -835,16 +844,16 @@ static void ServerMove(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int
         if(RunCli(site,L"rename",src,target,NULL)!=0) ok=FALSE;
     }
     if(!ok) MessageBoxW(hwnd,ExplorerText(L"error.move_failed",L"移动失败。",L"Move failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-    else FtpCacheClear();
+    else AfterRemoteMutation(notifyPidl);
 }
-static void DoRename(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name)
+static void DoRename(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, PIDLIST_ABSOLUTE notifyPidl)
 {
     WCHAR newName[256]; StringCchCopy(newName,ARRAYSIZE(newName),name);
     if(!PromptText(hwnd,ExplorerText(L"dialog.rename",L"重命名",L"Rename"),newName,ARRAYSIZE(newName),newName)) return;
     if(0==StrCmp(newName,name)) return;
     WCHAR src[700],dst[700]; JoinPath(folder,name,src,ARRAYSIZE(src)); JoinPath(folder,newName,dst,ARRAYSIZE(dst));
     if(RunCli(site,L"rename",src,dst,NULL)!=0) MessageBoxW(hwnd,ExplorerText(L"error.rename_failed",L"重命名失败。",L"Rename failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-    else FtpCacheClear();
+    else AfterRemoteMutation(notifyPidl);
 }
 
 // ---- custom commands ---------------------------------------------------------
@@ -922,42 +931,52 @@ static void RunCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name,
 
 // ---- background (folder empty area) menu helpers ----------------------------
 
-static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder)
+static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
 {
     WCHAR name[256]; StringCchCopy(name, ARRAYSIZE(name), ExplorerText(L"dialog.new_folder_default", L"新建文件夹", L"New folder"));
     if (!PromptText(hwnd, ExplorerText(L"dialog.new_folder", L"新建文件夹", L"New folder"), name, ARRAYSIZE(name), name)) return;
     WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
     if (RunCli(site, L"mkdir", full, NULL, NULL) != 0)
         MessageBoxW(hwnd, ExplorerText(L"error.create_folder_failed", L"创建文件夹失败。", L"Failed to create folder."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
-    else FtpCacheClear();
+    else AfterRemoteMutation(notifyPidl);
 }
-static void PasteClipboardToFolder(HWND hwnd, PCWSTR site, PCWSTR folder)
+
+// Core upload path — the ONE implementation behind the background-menu paste,
+// the folder IDropTarget (Ctrl+V / drag-drop) and any future paste entry.
+// The caller owns hdrop's lifetime (clipboard data must not be freed here).
+static void PasteHdropToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, HDROP hdrop, PIDLIST_ABSOLUTE notifyPidl)
+{
+    UINT n = DragQueryFileW(hdrop, 0xFFFFFFFF, NULL, 0);
+    BOOL ok = TRUE;
+    for (UINT k = 0; k < n; k++)
+    {
+        WCHAR local[MAX_PATH], name[MAX_PATH];
+        if (!DragQueryFileW(hdrop, k, local, ARRAYSIZE(local))) { ok = FALSE; continue; }
+        StringCchCopy(name, MAX_PATH, PathFindFileNameW(local));
+        WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
+        if (RunCli(site, L"put", local, full, NULL) != 0) ok = FALSE;
+    }
+    AfterRemoteMutation(notifyPidl);
+    if (!ok) MessageBoxW(hwnd, ExplorerText(L"error.some_uploads_failed", L"部分文件上传失败。", L"Some files could not be uploaded."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
+}
+
+// IDataObject entry used by the folder IDropTarget (Ctrl+V / drag-drop).
+// Non-static: called from ExplorerDataProvider.cpp's CFolderDropTarget.
+void PasteDataObjectToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, IDataObject *pdo, PIDLIST_ABSOLUTE notifyPidl)
+{
+    if (!pdo) return;
+    FORMATETC fmt = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    STGMEDIUM st = {};
+    if (FAILED(pdo->GetData(&fmt, &st))) return;
+    if (st.hGlobal) PasteHdropToFolder(hwnd, site, folder, (HDROP)st.hGlobal, notifyPidl);
+    ReleaseStgMedium(&st);
+}
+
+static void PasteClipboardToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
 {
     if (!OpenClipboard(hwnd)) return;
     HANDLE h = GetClipboardData(CF_HDROP);
-    if (h)
-    {
-        DROPFILES *df = (DROPFILES*)GlobalLock(h);
-        if (df)
-        {
-            BOOL wide = df->fWide;
-            PCWSTR pw = (PCWSTR)((BYTE*)df + df->pFiles);
-            PCSTR  pa = (PCSTR)((BYTE*)df + df->pFiles);
-            BOOL ok = TRUE;
-            while (wide ? *pw : *pa)
-            {
-                WCHAR local[MAX_PATH], name[MAX_PATH];
-                if (wide) { StringCchCopy(local, MAX_PATH, pw); pw += wcslen(pw) + 1; }
-                else      { MultiByteToWideChar(CP_ACP, 0, pa, -1, local, MAX_PATH); pa += strlen(pa) + 1; }
-                StringCchCopy(name, MAX_PATH, PathFindFileNameW(local));
-                WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
-                if (RunCli(site, L"put", local, full, NULL) != 0) ok = FALSE;
-            }
-            GlobalUnlock(h);
-            FtpCacheClear();
-            if (!ok) MessageBoxW(hwnd, ExplorerText(L"error.some_uploads_failed", L"部分文件上传失败。", L"Some files could not be uploaded."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
-        }
-    }
+    if (h) PasteHdropToFolder(hwnd, site, folder, (HDROP)h, notifyPidl);
     CloseClipboard();
 }
 static void BgCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, int idx)
@@ -999,6 +1018,10 @@ public:
  HRESULT QueryContextMenu(HMENU m,UINT i,UINT first,UINT,UINT flags){
     BOOL defaultOnly = (flags&CMF_DEFAULTONLY) != 0;
     SELDATA sel; if(!CollectSelection(data,&sel)) return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
+    // Double-click probe (P0-1): log what Explorer asks for so the default-verb
+    // path can be traced if double-click still does nothing.
+    ProbeLog(L"[DBLCLK] CMenu::QueryContextMenu flags=0x%08X defaultOnly=%d site='%s' n=%d first='%s'",
+             flags,(int)defaultOnly,sel.site,sel.count,sel.count?sel.names[0]:L"");
     // Site-picker items (no site segment in the folder PIDL) get the system
     // default menu (Open/Pin/Rename/Delete/Properties) only — our WinSCP-style
     // commands operate on remote files, not on saved connections.
@@ -1035,6 +1058,7 @@ public:
     UINT id=IS_INTRESOURCE(ci->lpVerb)?LOWORD((UINT_PTR)ci->lpVerb):99;
     if(!data)return E_INVALIDARG;
     SELDATA sel; if(!CollectSelection(data,&sel))return E_FAIL;
+    ProbeLog(L"[DBLCLK] CMenu::InvokeCommand id=%u site='%s' n=%d",id,sel.site,sel.count);
     PCWSTR pnames[MAX_SEL]; for(int k=0;k<sel.count;k++) pnames[k]=sel.names[k];
     if(id>=MENU_CUSTOM_BASE){ RunCustomCommand(ci->hwnd,sel.site,sel.folder,sel.names[0],id-MENU_CUSTOM_BASE); if(sel.notify)CoTaskMemFree(sel.notify); return S_OK; }
     switch(id){
@@ -1048,9 +1072,9 @@ public:
         { std::wstring t; for(int k=0;k<sel.count;k++){ if(k)t+=L"\r\n"; WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full)); t+=full; } CopyTextToClipboard(ci->hwnd,t.c_str()); break; }
     case MENU_COPY_FULL:
         { std::wstring t; for(int k=0;k<sel.count;k++){ if(k)t+=L"\r\n"; WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full)); t+=sel.site; t+=L":"; t+=full; } CopyTextToClipboard(ci->hwnd,t.c_str()); break; }
-    case MENU_RCOPY: ServerCopy(ci->hwnd,sel.site,sel.folder,pnames,sel.count); break;
-    case MENU_RMOVE: ServerMove(ci->hwnd,sel.site,sel.folder,pnames,sel.count); break;
-    case MENU_RENAME: DoRename(ci->hwnd,sel.site,sel.folder,sel.names[0]); break;
+    case MENU_RCOPY: ServerCopy(ci->hwnd,sel.site,sel.folder,pnames,sel.count,sel.notify); break;
+    case MENU_RMOVE: ServerMove(ci->hwnd,sel.site,sel.folder,pnames,sel.count,sel.notify); break;
+    case MENU_RENAME: DoRename(ci->hwnd,sel.site,sel.folder,sel.names[0],sel.notify); break;
     case MENU_DELETE:
         if(IDYES==MessageBoxW(ci->hwnd,ExplorerText(L"confirm.delete_remote",L"要从远程服务器删除选中的项目吗？",L"Delete the selected item(s) on the remote server?"),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_YESNO|MB_ICONWARNING)){
             BOOL ok=TRUE;
@@ -1058,8 +1082,7 @@ public:
                 WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full));
                 if(RunCli(sel.site,L"delete",full,NULL,NULL)!=0) ok=FALSE;
             }
-            FtpCacheClear();
-            if(sel.notify) SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_IDLIST,sel.notify,NULL);
+            AfterRemoteMutation(sel.notify);
             if(!ok) MessageBoxW(ci->hwnd,ExplorerText(L"error.some_deletes_failed",L"部分项目删除失败。",L"Some items could not be deleted."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
         }
         break;
@@ -1185,8 +1208,7 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     WCHAR modeStr[8]; StringCchPrintf(modeStr,ARRAYSIZE(modeStr),L"%03o",mode);
                     if (RunCli(pm->site, recursive?L"chmodr":L"chmod", pm->path, modeStr, NULL)==0)
                     {
-                        FtpCacheClear();
-                        if (pm->notify) SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_IDLIST,pm->notify,NULL);
+                        AfterRemoteMutation(pm->notify);
                     }
                     else MessageBoxW(hDlg, ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
                 }
@@ -1421,8 +1443,8 @@ public:
         switch (k)
         {
         case 0: { std::wstring t = site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
-        case 1: NewFolderRemote(ci->hwnd, site, folder); break;
-        case 2: PasteClipboardToFolder(ci->hwnd, site, folder); break;
+        case 1: NewFolderRemote(ci->hwnd, site, folder, m_pidl); break;
+        case 2: PasteClipboardToFolder(ci->hwnd, site, folder, m_pidl); break;
         case 3: ShowCurrentFolderProperties(ci->hwnd, site, folder); break;
         case 4: ShowCurrentSiteInfo(ci->hwnd, site); break;
         default: BgCustomCommand(ci->hwnd, site, folder, k - 5); break;

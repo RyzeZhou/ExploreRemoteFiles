@@ -31,6 +31,11 @@
 // background context menu wrapper (defined in ContextMenu.cpp)
 HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, int level, REFIID riid, void **ppv);
 
+// CF_HDROP upload pipeline (defined in ContextMenu.cpp) — shared by the
+// background-menu paste and the folder IDropTarget so both entries behave
+// identically (single implementation per function).
+void PasteDataObjectToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, IDataObject *pdo, PIDLIST_ABSOLUTE notifyPidl);
+
 
 HRESULT CFolderViewCB_CreateInstance(REFIID riid, void **ppv);
 
@@ -988,6 +993,49 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
     return hr;
 }
 
+// Folder-background drop target (P0-3): powers Ctrl+V and drag-drop uploads.
+// It funnels into the SAME upload pipeline as the background-menu paste
+// (PasteDataObjectToFolder) — one implementation per function.
+class CFolderDropTarget : public IDropTarget
+{
+public:
+    CFolderDropTarget(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE pidl)
+        : m_cRef(1), m_site(site), m_folder(folder), m_pidl(pidl ? ILCloneFull(pidl) : NULL), m_fHdrop(false)
+    { DllAddRef(); }
+    ~CFolderDropTarget() { if (m_pidl) ILFree(m_pidl); DllRelease(); }
+
+    HRESULT QueryInterface(REFIID riid, void **ppv)
+    {
+        static const QITAB q[] = { QITABENT(CFolderDropTarget, IDropTarget), {0} };
+        return QISearch(this, q, riid, ppv);
+    }
+    ULONG AddRef() { return InterlockedIncrement(&m_cRef); }
+    ULONG Release() { long n = InterlockedDecrement(&m_cRef); if (!n) delete this; return n; }
+
+    IFACEMETHODIMP DragEnter(IDataObject *pdo, DWORD, POINTL, DWORD *pdwEffect)
+    { m_fHdrop = HasHdrop(pdo); *pdwEffect = m_fHdrop ? DROPEFFECT_COPY : DROPEFFECT_NONE; return S_OK; }
+    IFACEMETHODIMP DragOver(DWORD, POINTL, DWORD *pdwEffect)
+    { *pdwEffect = m_fHdrop ? DROPEFFECT_COPY : DROPEFFECT_NONE; return S_OK; }
+    IFACEMETHODIMP DragLeave() { return S_OK; }
+    IFACEMETHODIMP Drop(IDataObject *pdo, DWORD, POINTL, DWORD *pdwEffect)
+    {
+        PasteDataObjectToFolder(NULL, m_site.c_str(), m_folder.c_str(), pdo, m_pidl);
+        *pdwEffect = DROPEFFECT_COPY;
+        return S_OK;
+    }
+
+private:
+    static bool HasHdrop(IDataObject *pdo)
+    {
+        FORMATETC fmt = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        return pdo && pdo->QueryGetData(&fmt) == S_OK;
+    }
+    long m_cRef;
+    std::wstring m_site, m_folder;
+    PIDLIST_ABSOLUTE m_pidl;
+    bool m_fHdrop;
+};
+
 //  Called by the Shell to create the View Object and return it.
 HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **ppv)
 {
@@ -995,7 +1043,23 @@ HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **p
     ProbeLog(L"[SAMPLE] CreateViewObject riid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X level=%d", riid.Data1, riid.Data2, riid.Data3, riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3], riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7], m_nLevel);
 
     HRESULT hr = E_NOINTERFACE;
-    if (riid == IID_IShellView)
+    if (riid == IID_IDropTarget)
+    {
+        // P0-3: Ctrl+V and drag-drop paste into the current remote directory,
+        // sharing the background-menu upload pipeline. The site picker
+        // (level 0) has nothing to paste into.
+        if (m_nLevel >= 1)
+        {
+            CFolderDropTarget *pdt = new (std::nothrow) CFolderDropTarget(m_szSiteName, m_szRemotePath, m_pidl);
+            hr = pdt ? S_OK : E_OUTOFMEMORY;
+            if (SUCCEEDED(hr))
+            {
+                hr = pdt->QueryInterface(riid, ppv);
+                pdt->Release();
+            }
+        }
+    }
+    else if (riid == IID_IShellView)
     {
         SFV_CREATE csfv = { sizeof(csfv), 0 };
         hr = QueryInterface(IID_PPV_ARGS(&csfv.pshf));

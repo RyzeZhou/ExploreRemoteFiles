@@ -312,7 +312,7 @@ inline BOOL FtpDiskCacheLoad(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &it
     items.clear(); WCHAR file[MAX_PATH] = {}; if (!FtpMetadataCacheFile(site, path, file, ARRAYSIZE(file))) return FALSE;
     WIN32_FILE_ATTRIBUTE_DATA a = {}; if (!GetFileAttributesExW(file, GetFileExInfoStandard, &a)) return FALSE;
     FILETIME ft = {}; GetSystemTimeAsFileTime(&ft); ULARGE_INTEGER now = {}, written = {}; now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime; written.LowPart = a.ftLastWriteTime.dwLowDateTime; written.HighPart = a.ftLastWriteTime.dwHighDateTime;
-    if (now.QuadPart < written.QuadPart || now.QuadPart - written.QuadPart > 300000000ULL) { DeleteFileW(file); return FALSE; }
+    if (now.QuadPart < written.QuadPart || now.QuadPart - written.QuadPart > 100000000ULL) { DeleteFileW(file); return FALSE; }
     HANDLE f = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL); if (f == INVALID_HANDLE_VALUE) return FALSE;
     FtpDiskCacheHeader head = {}; DWORD got = 0; BOOL ok = ReadFile(f, &head, sizeof(head), &got, NULL) && got == sizeof(head) && head.magic == 0x45524653 && head.version == 1 && head.count <= 100000;
     if (ok && head.count) { items.resize(head.count); DWORD bytes = head.count * (DWORD)sizeof(FTPENTRY); ok = ReadFile(f, items.data(), bytes, &got, NULL) && got == bytes; }
@@ -345,7 +345,7 @@ inline int FtpCacheLookup(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxOut)
 {
     if (maxOut <= 0) return 0; PCWSTR key = (path && path[0]) ? path : L"/"; ULONGLONG now = GetTickCount64(); int got = 0;
     AcquireSRWLockShared(&FtpCacheLock());
-    for (auto &e : FtpCacheEntries()) if (0 == StrCmp(e.path, key) && 0 == StrCmp(e.site, site)) { if (now - e.tick < 30000) { got = (int)e.items.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = e.items[i]; } break; }
+    for (auto &e : FtpCacheEntries()) if (0 == StrCmp(e.path, key) && 0 == StrCmp(e.site, site)) { if (now - e.tick < 3000) { got = (int)e.items.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = e.items[i]; } break; }
     ReleaseSRWLockShared(&FtpCacheLock()); if (got) return got;
     std::vector<FTPENTRY> disk; if (!FtpDiskCacheLoad(site, key, disk)) return 0; got = (int)disk.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = disk[i]; return got;
 }
@@ -356,7 +356,7 @@ inline void FtpCacheStore(PCWSTR site, PCWSTR path, const FTPENTRY *items, int c
     AcquireSRWLockExclusive(&FtpCacheLock()); auto &v = FtpCacheEntries();
     for (auto it = v.begin(); it != v.end();) { if (0 == StrCmp(it->path, key) && 0 == StrCmp(it->site, site)) it = v.erase(it); else ++it; }
     FtpCacheEntry e = {}; StringCchCopy(e.site, ARRAYSIZE(e.site), site); StringCchCopy(e.path, ARRAYSIZE(e.path), key); e.tick = now; for (int i = 0; i < count; ++i) e.items.push_back(items[i]); v.push_back(std::move(e));
-    for (auto it = v.begin(); it != v.end();) { if (now - it->tick >= 30000) it = v.erase(it); else ++it; } while (v.size() > 32) v.erase(v.begin()); ReleaseSRWLockExclusive(&FtpCacheLock());
+    for (auto it = v.begin(); it != v.end();) { if (now - it->tick >= 3000) it = v.erase(it); else ++it; } while (v.size() > 32) v.erase(v.begin()); ReleaseSRWLockExclusive(&FtpCacheLock());
     FtpDiskCacheStore(site, key, items, count);
 }
 
@@ -453,7 +453,7 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     AcquireSRWLockShared(&FtpCacheLock());
     for (auto const &entry : FtpCacheEntries())
     {
-        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && now - entry.tick < 30000)
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && now - entry.tick < 3000)
         {
             out = entry.items;
             ReleaseSRWLockShared(&FtpCacheLock());
@@ -470,7 +470,7 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     AcquireSRWLockShared(&FtpCacheLock());
     for (auto const &entry : FtpCacheEntries())
     {
-        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && now - entry.tick < 30000)
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && now - entry.tick < 3000)
         {
             out = entry.items;
             ReleaseSRWLockShared(&FtpCacheLock());

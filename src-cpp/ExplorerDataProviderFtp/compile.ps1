@@ -2,8 +2,10 @@ param([string]$OutputPath = (Join-Path $PSScriptRoot 'ExplorerDataProviderFtp.dl
 
 $ErrorActionPreference = 'Stop'
 
-# Load the installed x64 MSVC/Windows SDK environment instead of relying on
-# a particular Visual Studio version or the old Win10 VM path.
+# Locate MSVC + Windows SDK via vswhere (any VS edition / future upgrades),
+# then set PATH/INCLUDE/LIB by direct assignment. NOTE: do NOT apply the
+# vcvars64.bat environment via a Set-Item Env: loop — in sandboxed/hybrid
+# PowerShell hosts those writes silently fail and cl.exe is never found.
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $vsInstall = $null
 if (Test-Path -LiteralPath $vswhere) {
@@ -13,21 +15,28 @@ if (Test-Path -LiteralPath $vswhere) {
 if (-not $vsInstall) {
     throw 'Visual C++ x64 build tools were not found. Install the VS Desktop C++ workload to build the shell extension.'
 }
-$vcvars = Join-Path $vsInstall 'VC\Auxiliary\Build\vcvars64.bat'
-if (-not (Test-Path -LiteralPath $vcvars)) {
-    throw "The x64 MSVC environment script was not found: $vcvars"
+
+$msvcRoot = Join-Path $vsInstall 'VC\Tools\MSVC'
+if (-not (Test-Path -LiteralPath $msvcRoot)) { throw "MSVC tools not found: $msvcRoot" }
+$msvc = Get-ChildItem -LiteralPath $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+if (-not $msvc) { throw "No MSVC toolset version under $msvcRoot" }
+
+$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
+$sdkInc = Join-Path $sdkRoot 'Include'
+$sdkVer = $null
+if (Test-Path -LiteralPath $sdkInc) {
+    $sdkVer = Get-ChildItem -LiteralPath $sdkInc -Directory | Where-Object { $_.Name -match '^10\.' } | Sort-Object Name -Descending | Select-Object -First 1
 }
-$envDump = & cmd.exe /d /s /c ('call "' + $vcvars + '" >nul && set')
-foreach ($line in $envDump) {
-    if ($line -match '^(?<name>[A-Za-z_][A-Za-z0-9_]*)=(?<value>.*)$') {
-        Set-Item -Path ("Env:{0}" -f $matches.name) -Value $matches.value
-    }
-}
-foreach ($tool in @('cl.exe', 'link.exe', 'rc.exe')) {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        throw "Required build tool was not found after loading vcvars64.bat: $tool"
-    }
-}
+if (-not $sdkVer) { throw "Windows 10 SDK not found under $sdkInc" }
+$ver = $sdkVer.Name
+
+$msvcBin = Join-Path $msvc.FullName 'bin\Hostx64\x64'
+if (-not (Test-Path -LiteralPath (Join-Path $msvcBin 'cl.exe'))) { throw "cl.exe not found: $msvcBin" }
+
+$env:PATH    = "$msvcBin;$sdkRoot\bin\$ver\x64;$env:PATH"
+$env:INCLUDE = "$($msvc.FullName)\include;$sdkRoot\Include\$ver\shared;$sdkRoot\Include\$ver\ucrt;$sdkRoot\Include\$ver\um"
+$env:LIB     = "$($msvc.FullName)\lib\x64;$sdkRoot\Lib\$ver\ucrt\x64;$sdkRoot\Lib\$ver\um\x64"
+
 Set-Location $PSScriptRoot
 Remove-Item *.obj,*.res,*.exp,*.lib,*.pdb -ErrorAction SilentlyContinue
 $cpps = @('Category.cpp','ContextMenu.cpp','Dll.cpp','ExplorerDataProvider.cpp','FVCommands.cpp','Utils.cpp')
