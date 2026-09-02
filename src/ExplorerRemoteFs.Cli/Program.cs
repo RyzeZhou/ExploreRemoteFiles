@@ -1,4 +1,4 @@
-﻿using ExplorerRemoteFs.Config;
+using ExplorerRemoteFs.Config;
 using ExplorerRemoteFs.Providers;
 
 // ExplorerRemoteFs.Cli — 冒烟测试工具：不依赖 Explorer 验证 Provider 层完整链路。
@@ -7,6 +7,10 @@ using ExplorerRemoteFs.Providers;
 //   dotnet run -- add <name> <type> <host> <user> <pass> [port]
 //   dotnet run -- test <name>             连接测试
 //   dotnet run -- show                    显示已配置连接
+
+// The native Shell extension reads the redirected pipe as UTF-8.
+Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+Console.InputEncoding = new System.Text.UTF8Encoding(false);
 
 var argv = Environment.GetCommandLineArgs().Skip(1).ToArray();
 if (argv.Length == 0) { PrintUsage(); return; }

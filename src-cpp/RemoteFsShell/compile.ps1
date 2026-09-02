@@ -8,7 +8,10 @@ $env:INCLUDE = "$msvc\include;$sdk\Include\$sdkVer\shared;$sdk\Include\$sdkVer\u
 $env:LIB = "$msvc\lib\x64;$sdk\Lib\$sdkVer\ucrt\x64;$sdk\Lib\$sdkVer\um\x64"
 
 Set-Location "D:\tools\explorer-remote-fs\src-cpp\RemoteFsShell"
-Remove-Item *.obj,*.res,*.dll,*.exp,*.lib,*.pdb -ErrorAction SilentlyContinue
+Remove-Item *.obj,*.res,*.exp,*.lib,*.pdb -ErrorAction SilentlyContinue
+# Do not remove a deployed DLL before we know it can be replaced. Explorer may
+# still have it mapped; link to a temporary output and swap only after success.
+Remove-Item RemoteFsShell.new.dll -ErrorAction SilentlyContinue
 
 $cpps = @("ContextMenu.cpp","Dll.cpp","FtpSource.cpp","PropSheet.cpp","RemoteFsShell.cpp","FVCommands.cpp","Utils.cpp")
 
@@ -35,17 +38,25 @@ foreach ($cpp in $cpps) {
 }
 "=== $okCount / $($cpps.Count) cpp compiled ==="
 
-if ($okCount -eq $cpps.Count) {
-  # 3. Link as DLL
-  $objs = $cpps | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) + ".obj" }
-  $linkArgs = @("/nologo","/DLL","/OUT:RemoteFsShell.dll","/DEF:RemoteFsShell.def","/MACHINE:X64") + $objs + @("RemoteFsShell.res","propsys.lib","user32.lib","shell32.lib","ole32.lib","oleaut32.lib","advapi32.lib","uuid.lib","comctl32.lib","wininet.lib")
-  $out = & link.exe @linkArgs 2>&1
-  $errs = $out | Where-Object { $_ -match "error|unresolved" }
-  if ($errs) {
-    "=== LINK ERRORS ==="
-    $errs | Select-Object -First 5
-  } else {
-    "=== LINK OK ==="
-    "DLL: $(Test-Path RemoteFsShell.dll), size: $((Get-Item RemoteFsShell.dll -ErrorAction SilentlyContinue).Length)"
-  }
+if ($okCount -ne $cpps.Count) {
+  exit 1
 }
+
+# 3. Link as DLL
+$objs = $cpps | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) + ".obj" }
+$linkArgs = @("/nologo","/DLL","/OUT:RemoteFsShell.new.dll","/IMPLIB:RemoteFsShell.new.lib","/DEF:RemoteFsShell.def","/MACHINE:X64") + $objs + @("RemoteFsShell.res","propsys.lib","user32.lib","shell32.lib","ole32.lib","oleaut32.lib","advapi32.lib","uuid.lib","comctl32.lib","wininet.lib","shlwapi.lib")
+& link.exe @linkArgs
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
+
+try {
+  Copy-Item RemoteFsShell.new.dll RemoteFsShell.dll -Force -ErrorAction Stop
+} catch {
+  Remove-Item RemoteFsShell.new.dll,RemoteFsShell.new.exp,RemoteFsShell.new.lib -ErrorAction SilentlyContinue
+  Write-Error "LINK succeeded, but the deployed RemoteFsShell.dll could not be replaced (it is probably in use). Stop Explorer and rerun; the deployed DLL was preserved. $($_.Exception.Message)"
+  exit 2
+}
+Remove-Item RemoteFsShell.new.dll,RemoteFsShell.new.exp,RemoteFsShell.new.lib -ErrorAction SilentlyContinue
+"=== LINK OK ==="
+"DLL: $(Test-Path RemoteFsShell.dll), size: $((Get-Item RemoteFsShell.dll).Length)"

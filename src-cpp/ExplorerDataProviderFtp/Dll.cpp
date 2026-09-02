@@ -208,7 +208,7 @@ STDAPI DllRegisterServer()
     GetModuleFileName(g_hInst, szModulePathAndName, ARRAYSIZE(szModulePathAndName));
 
     // This will setup and register the basic ClassIDs.
-    DWORD dwData = SFGAO_FOLDER | SFGAO_HASSUBFOLDER  | SFGAO_CANDELETE;
+    DWORD dwData = SFGAO_FOLDER | SFGAO_HASSUBFOLDER | SFGAO_BROWSABLE | SFGAO_CANDELETE;
     REGSTRUCT rgRegEntries[] =
     {
         HKEY_CURRENT_USER,   L"Software\\Classes\\CLSID\\%s",                  szFolderViewImplClassID, NULL,                   (LPBYTE)g_szExtTitle,       REG_SZ,
@@ -219,9 +219,6 @@ STDAPI DllRegisterServer()
         HKEY_CURRENT_USER,   L"Software\\Classes\\CLSID\\%s",                  szContextMenuClassID,    NULL,                   (LPBYTE)g_szExtTitle,       REG_SZ,
         HKEY_CURRENT_USER,   L"Software\\Classes\\CLSID\\%s\\InprocServer32",  szContextMenuClassID,    NULL,                   (LPBYTE)L"%s",              REG_SZ,
         HKEY_CURRENT_USER,   L"Software\\Classes\\CLSID\\%s\\InprocServer32",  szContextMenuClassID,    L"ThreadingModel",      (LPBYTE)L"Apartment",       REG_SZ,
-
-        // For performance, only context menu verbs that register this are considered when the user double-clicks.
-        HKEY_CURRENT_USER,   L"Software\\Classes\\CLSID\\%s\\ShellEx\\MayChangeDefaultMenu",                szContextMenuClassID, NULL,  (LPBYTE)L"",                  REG_SZ,
         // register the context menu handler under the FolderViewSampleType type.
         HKEY_CURRENT_USER,   L"Software\\Classes\\FolderViewSampleType\\shellex\\ContextMenuHandlers\\%s",  szContextMenuClassID, NULL,  (LPBYTE)szContextMenuClassID, REG_SZ,
     };

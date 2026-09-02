@@ -29,4 +29,6 @@ void DllAddRef();
 void DllRelease();
 
 
-#define MAX_OBJS    10
+// Legacy fixed storage used only for site/column helpers. Remote directory
+// enumeration is dynamic and must not be limited by this value.
+#define MAX_OBJS    256

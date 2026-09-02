@@ -31,7 +31,6 @@
 // background context menu wrapper (defined in ContextMenu.cpp)
 HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, int level, REFIID riid, void **ppv);
 
-const int g_nMaxLevel = 5;
 
 HRESULT CFolderViewCB_CreateInstance(REFIID riid, void **ppv);
 
@@ -134,7 +133,7 @@ typedef struct
 {
     int     nLevel;
     DWORD   dwMode;       // unix permission bits
-    DWORD   dwSize;       // bytes
+    ULONGLONG dwSize;    // bytes
     DWORD   dwMtime;      // unix epoch seconds
     DWORD   dwUid;        // 0 = unknown (FTP)
     DWORD   dwGid;
@@ -180,32 +179,47 @@ static BOOL RunFtpList(PCWSTR site, PCWSTR path, ITEMDATA *out, int maxItems)
 
 static int RunFtpOperation(PCWSTR site, PCWSTR verb, PCWSTR path1, PCWSTR path2)
 {
-    WCHAR cmd[1600];
+    WCHAR cmd[2400];
     HRESULT hr = path2 && path2[0]
-        ? StringCchPrintf(cmd, ARRAYSIZE(cmd), L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" %s \"%s\" \"%s\" \"%s\"", verb, site, path1, path2)
-        : StringCchPrintf(cmd, ARRAYSIZE(cmd), L"\"D:\\tools\\explorer-remote-fs\\dist\\cli\\ExplorerRemoteFs.Cli.exe\" %s \"%s\" \"%s\"", verb, site, path1);
+        ? StringCchPrintf(cmd, ARRAYSIZE(cmd), L"\"%s\" %s \"%s\" \"%s\" \"%s\"", GetCliPath(), verb, site, path1, path2)
+        : StringCchPrintf(cmd, ARRAYSIZE(cmd), L"\"%s\" %s \"%s\" \"%s\"", GetCliPath(), verb, site, path1);
     if (FAILED(hr)) return -1;
+    ProbeLog(L"[FTP] operation cmd='%s'", cmd);
     STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
     BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-    if (!ok) return -1;
-    WaitForSingleObject(pi.hProcess, 10000);
+    if (!ok)
+    {
+        ProbeLog(L"[FTP] operation CreateProcess failed err=%lu", GetLastError());
+        return -1;
+    }
+    DWORD wait = WaitForSingleObject(pi.hProcess, 30000);
+    if (wait == WAIT_TIMEOUT)
+    {
+        ProbeLog(L"[FTP] operation timed out; terminating process");
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 2000);
+    }
     DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    ProbeLog(L"[FTP-SAMPLE] op=%s path1='%s' path2='%s' exit=%u", verb, path1, path2 ? path2 : L"", code);
+    ProbeLog(L"[FTP] op=%s path1='%s' path2='%s' wait=%lu exit=%u", verb, path1, path2 ? path2 : L"", wait, code);
     return code == 0 ? 0 : -1;
 }
 static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
 {
     if (!name || !name[0]) return FALSE;
-    ITEMDATA items[MAX_OBJS] = {};
-    RunFtpList(site, path ? path : L"/", items, ARRAYSIZE(items));
-    for (int i = 0; i < ARRAYSIZE(items) && items[i].szName[0]; i++)
+    std::vector<FTPENTRY> items;
+    if (!FtpListCachedAll(site, path ? path : L"/", items)) return FALSE;
+    for (auto const &item : items)
     {
-        if (0 == StrCmp(items[i].szName, name))
-        {
-            *out = items[i];
-            return TRUE;
-        }
+        if (0 != StrCmp(item.szName, name)) continue;
+        ZeroMemory(out, sizeof(*out));
+        out->dwMode = item.dwMode; out->dwMtime = item.dwMtime; out->dwSize = item.dwSize;
+        out->dwUid = item.dwUid; out->dwGid = item.dwGid;
+        out->fIsFolder = item.fIsFolder; out->fIsSymlink = item.fIsSymlink;
+        StringCchCopy(out->szOwner, ARRAYSIZE(out->szOwner), item.szOwner);
+        StringCchCopy(out->szGroup, ARRAYSIZE(out->szGroup), item.szGroup);
+        StringCchCopy(out->szName, ARRAYSIZE(out->szName), item.szName);
+        return TRUE;
     }
     return FALSE;
 }
@@ -251,6 +265,30 @@ static void GetPidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
         p = ILNext(p);
     }
     if (!out[0]) StringCchCopy(out, cch, L"/");
+
+    // PIDLs store path components relative to the configured site root.
+    // Shell extensions must pass the actual remote path to the CLI.
+    WCHAR site[64] = {};
+    if (GetPidlSite(abs, site, ARRAYSIZE(site)))
+    {
+        const FTPSITE *s = FtpSiteFind(site);
+        if (s && s->startPath[0] && StrCmp(s->startPath, L"/") != 0)
+        {
+            if (StrCmp(out, L"/") == 0)
+            {
+                StringCchCopy(out, cch, s->startPath);
+            }
+            else
+            {
+                WCHAR relative[600] = {}, base[256] = {};
+                StringCchCopy(relative, ARRAYSIZE(relative), out);
+                StringCchCopy(base, ARRAYSIZE(base), s->startPath);
+                while (lstrlen(base) > 1 && base[lstrlen(base) - 1] == L'/')
+                    base[lstrlen(base) - 1] = L'\0';
+                StringCchPrintf(out, cch, L"%s%s", base, relative);
+            }
+        }
+    }
 }
 
 // Per-item IPropertyStore so the standard Properties dialog will open for our
@@ -291,7 +329,7 @@ public:
             if (IsEqualPropertyKey(key, PKEY_ItemType))
             {
                 pv->vt = VT_LPWSTR;
-                return SHStrDup(L"FTP connection", &pv->pwszVal);
+                return SHStrDup(ExplorerText(L"type.connection", L"FTP 连接", L"FTP connection"), &pv->pwszVal);
             }
             const FTPSITE *s = FtpSiteFind(szName);
             if (s)
@@ -318,7 +356,7 @@ public:
         if (IsEqualPropertyKey(key, PKEY_ItemType))
         {
             pv->vt = VT_LPWSTR;
-            return SHStrDup(meta.fIsFolder ? L"Folder" : L"File", &pv->pwszVal);
+            return SHStrDup(meta.fIsSymlink ? ExplorerText(L"type.symbolic_link", L"符号链接", L"Symbolic Link") : (meta.fIsFolder ? ExplorerText(L"type.folder", L"文件夹", L"Folder") : ExplorerText(L"type.file", L"文件", L"File")), &pv->pwszVal);
         }
         if (IsEqualPropertyKey(key, PKEY_Size))
         {
@@ -384,13 +422,23 @@ static void FormatMode(DWORD mode, BOOL folder, BOOL symlink, PWSTR out, UINT cc
         (mode & 0040) ? L'r' : L'-', (mode & 0020) ? L'w' : L'-', (mode & 0010) ? L'x' : L'-',
         (mode & 0004) ? L'r' : L'-', (mode & 0002) ? L'w' : L'-', (mode & 0001) ? L'x' : L'-');
 }
-static void FormatSize(DWORD size, BOOL folder, PWSTR out, UINT cch)
+static void FormatExactBytes(ULONGLONG value, PWSTR out, UINT cch)
+{
+    WCHAR raw[32] = {}; StringCchPrintf(raw, ARRAYSIZE(raw), L"%llu", value);
+    UINT digits = lstrlenW(raw), first = digits % 3; if (!first) first = 3;
+    std::wstring text(raw, first);
+    for (UINT i = first; i < digits; i += 3) { text += L','; text.append(raw + i, 3); }
+    StringCchCopyW(out, cch, text.c_str());
+}
+static void FormatSize(ULONGLONG size, BOOL folder, PWSTR out, UINT cch)
 {
     if (folder) { StringCchCopy(out, cch, L"-"); return; }
-    if (size < 1024) StringCchPrintf(out, cch, L"%u B", size);
-    else if (size < 1024*1024) StringCchPrintf(out, cch, L"%.1f KB", size / 1024.0);
-    else if (size < 1024*1024*1024) StringCchPrintf(out, cch, L"%.1f MB", size / (1024.0*1024.0));
-    else StringCchPrintf(out, cch, L"%.2f GB", size / (1024.0*1024.0*1024.0));
+    if (size < 1024) { StringCchPrintf(out, cch, L"%llu B", size); return; }
+    static const WCHAR *units[] = { L"KB", L"MB", L"GB", L"TB", L"PB" };
+    double shown = (double)size / 1024.0; int unit = 0;
+    while (shown >= 1024.0 && unit < 4) { shown /= 1024.0; ++unit; }
+    WCHAR exact[40] = {}; FormatExactBytes(size, exact, ARRAYSIZE(exact));
+    StringCchPrintf(out, cch, L"%.1f %s (%s B)", shown, units[unit], exact);
 }
 static void FormatMtime(DWORD mtime, PWSTR out, UINT cch)
 {
@@ -428,7 +476,7 @@ private:
     DWORD m_grfFlags;
     int m_nItem;
     int m_nLevel;
-    ITEMDATA m_aData[MAX_OBJS];
+    std::vector<ITEMDATA> m_aData;
     WCHAR m_szPath[512];
     WCHAR m_szSite[64];
 
@@ -585,13 +633,13 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
         return hr;
     }
 
-    ITEMDATA items[MAX_OBJS] = {};
-    RunFtpList(m_szSiteName, m_szRemotePath, items, ARRAYSIZE(items));
-    for (int i = 0; i < ARRAYSIZE(items) && items[i].szName[0]; i++)
+    std::vector<FTPENTRY> items;
+    if (!FtpListCachedAll(m_szSiteName, m_szRemotePath, items)) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    for (auto const &item : items)
     {
-        if (0 != StrCmp(items[i].szName, component)) continue;
+        if (0 != StrCmp(item.szName, component)) continue;
         PIDLIST_RELATIVE current = NULL;
-        hr = CreateChildID(component, m_nLevel + 1, 1, 3, items[i].fIsFolder, &current);
+        hr = CreateChildID(component, m_nLevel + 1, 1, 3, item.fIsFolder, &current);
         if (FAILED(hr)) return hr;
         if (next && *next)
         {
@@ -618,28 +666,21 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
 //  interface can then be used to enumerate the folder's contents.
 HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnumIDList **ppenumIDList)
 {
-    ProbeLog(L"[SAMPLE] EnumObjects level=%d", m_nLevel);
-    HRESULT hr;
-    if (m_nLevel >= g_nMaxLevel)
+    if (!ppenumIDList) return E_POINTER;
+    *ppenumIDList = NULL;
+    ProbeLog(L"[ENUM] level=%d site='%s' path='%s' flags=0x%X", m_nLevel, m_szSiteName, m_szRemotePath, grfFlags);
+
+    CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
+    HRESULT hr = penum ? S_OK : E_OUTOFMEMORY;
+    if (SUCCEEDED(hr))
     {
-        *ppenumIDList = NULL;
-        hr = S_FALSE; // S_FALSE is allowed with NULL out param to indicate no contents.
-    }
-    else
-    {
-        CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
-        hr = penum ? S_OK : E_OUTOFMEMORY;
+        hr = penum->Initialize();
         if (SUCCEEDED(hr))
         {
-            hr = penum->Initialize();
-            if (SUCCEEDED(hr))
-            {
-                hr = penum->QueryInterface(IID_PPV_ARGS(ppenumIDList));
-            }
-            penum->Release();
+            hr = penum->QueryInterface(IID_PPV_ARGS(ppenumIDList));
         }
+        penum->Release();
     }
-
     return hr;
 }
 
@@ -1014,42 +1055,30 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
 {
     // If SFGAO_FILESYSTEM is returned, GetDisplayNameOf(SHGDN_FORPARSING) on that item MUST
     // return a filesystem path.
-    HRESULT hr = E_INVALIDARG;
-    if (1 == cidl)
+    if (!rgfInOut || !apidl || cidl == 0) return E_INVALIDARG;
+
+    DWORD requested = *rgfInOut;
+    DWORD common = requested;
+    for (UINT i = 0; i < cidl; i++)
     {
-        int nLevel = 0;
-        hr = _GetLevel(apidl[0], &nLevel);
-        if (SUCCEEDED(hr))
-        {
-            BOOL fIsFolder = FALSE;
-            hr = _GetFolderness(apidl[0], &fIsFolder);
-            if (SUCCEEDED(hr))
-            {
-                DWORD dwAttribs = SFGAO_CANRENAME | SFGAO_CANDELETE | SFGAO_HASPROPSHEET;
-                if (fIsFolder)
-                {
-                    dwAttribs |= SFGAO_FOLDER;
-                }
-                if (nLevel < g_nMaxLevel)
-                {
-                    dwAttribs |= SFGAO_HASSUBFOLDER;
-                }
-                // Dotfiles are mapped to SFGAO_HIDDEN so Explorer renders them
-                // with the familiar half-transparent icon AND filters them via
-                // its own "hidden items" toggle (verified live: toggling the
-                // Ribbon View checkbox instantly shows/hides them, no F5).
-                // Enumeration itself never filters dotfiles — hiding is fully
-                // delegated to Explorer's hidden-item filtering.
-                WCHAR szName[MAX_PATH] = {};
-                if (SUCCEEDED(_GetName(apidl[0], szName, ARRAYSIZE(szName))) && szName[0] == L'.')
-                {
-                    dwAttribs |= SFGAO_HIDDEN;
-                }
-                *rgfInOut &= dwAttribs;
-            }
-        }
+        BOOL fIsFolder = FALSE;
+        HRESULT hr = _GetFolderness(apidl[i], &fIsFolder);
+        if (FAILED(hr)) return hr;
+
+        DWORD attrs = SFGAO_CANRENAME | SFGAO_CANDELETE | SFGAO_HASPROPSHEET;
+        if (fIsFolder) attrs |= SFGAO_FOLDER | SFGAO_HASSUBFOLDER | SFGAO_BROWSABLE;
+
+        // Unix dotfiles are semantic metadata. Explorer owns both the visibility
+        // toggle and the translucent icon through SFGAO_HIDDEN.
+        WCHAR name[MAX_PATH] = {};
+        hr = _GetName(apidl[i], name, ARRAYSIZE(name));
+        if (FAILED(hr)) return hr;
+        if (name[0] == L'.') attrs |= SFGAO_HIDDEN;
+        common &= attrs;
     }
-    return hr;
+    *rgfInOut = common;
+    ProbeLog(L"[ATTR] cidl=%u requested=0x%X returned=0x%X", cidl, requested, common);
+    return S_OK;
 }
 
 //  Retrieves an OLE interface that can be used to carry out
@@ -1120,8 +1149,10 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
         if (cidl >= 1)
         {
             WCHAR site[64] = {}, folder[512] = {}, name[MAX_PATH] = {};
-            GetPidlSite(m_pidl, site, ARRAYSIZE(site));
-            GetPidlPath(m_pidl, folder, ARRAYSIZE(folder));
+            // The folder object already knows the full remote path. The PIDL
+            // only contains the path components relative to StartPath.
+            StringCchCopy(site, ARRAYSIZE(site), m_szSiteName);
+            StringCchCopy(folder, ARRAYSIZE(folder), m_szRemotePath[0] ? m_szRemotePath : L"/");
             // Level 0 (site picker): the item is a saved connection — the
             // folder PIDL has no site segment; build the store from the site
             // name alone (GetValue branches on empty szSite).
@@ -1189,7 +1220,8 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
             // (used for both the address bar and FORPARSING, keeping input/output symmetric).
             WCHAR site[64] = {}, path[600] = {};
             BOOL hasSite = GetPidlSite(m_pidl, site, ARRAYSIZE(site));
-            GetPidlPath(m_pidl, path, ARRAYSIZE(path));
+            // The folder object carries the full path including StartPath.
+            StringCchCopy(path, ARRAYSIZE(path), m_szRemotePath[0] ? m_szRemotePath : L"/");
             BOOL siteFromPidl = FALSE;   // child PIDL IS the site root itself
             if (!hasSite)
             {
@@ -1200,7 +1232,8 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
                 {
                     StringCchCopy(site, ARRAYSIZE(site), childSite);
                     hasSite = TRUE;
-                    StringCchCopy(path, ARRAYSIZE(path), L"/");
+                    const FTPSITE *s = FtpSiteFind(site);
+                    StringCchCopy(path, ARRAYSIZE(path), (s && s->startPath[0]) ? s->startPath : L"/");
                     siteFromPidl = TRUE;
                 }
             }
@@ -1270,7 +1303,7 @@ HRESULT CFolderViewImplFolder::SetNameOf(HWND hwnd, PCUITEMID_CHILD pidl,
     }
     if (RunFtpOperation(m_szSiteName, L"rename", oldPath, newPath) != 0)
     {
-        MessageBoxW(hwnd, L"Rename failed.", L"Remote", MB_OK | MB_ICONERROR);
+        MessageBoxW(hwnd, ExplorerText(L"error.rename_failed", L"重命名失败。", L"Rename failed."), ExplorerText(L"dialog.remote", L"远程", L"Remote"), MB_OK | MB_ICONERROR);
         return E_FAIL;
     }
     BOOL folder = FALSE; int size = 0;
@@ -1329,7 +1362,7 @@ static BOOL GetFriendlyType(PCWSTR name, BOOL fIsFolder, PWSTR out, UINT cch)
             StringCchCopy(out, cch, sfi.szTypeName);
             return TRUE;
         }
-        StringCchCopy(out, cch, L"Folder");
+        StringCchCopy(out, cch, ExplorerText(L"type.folder", L"文件夹", L"Folder"));
         return TRUE;
     }
 
@@ -1344,7 +1377,7 @@ static BOOL GetFriendlyType(PCWSTR name, BOOL fIsFolder, PWSTR out, UINT cch)
             StringCchCopy(out, cch, sfi.szTypeName);
             return TRUE;
         }
-        StringCchCopy(out, cch, L"File");
+        StringCchCopy(out, cch, ExplorerText(L"type.file", L"文件", L"File"));
         return TRUE;
     }
 
@@ -1362,7 +1395,7 @@ static BOOL GetFriendlyType(PCWSTR name, BOOL fIsFolder, PWSTR out, UINT cch)
     DWORD cchBuf = ARRAYSIZE(buf);
     HRESULT hr = AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_FRIENDLYDOCNAME, dot, NULL, buf, &cchBuf);
     if (FAILED(hr) || !buf[0])
-        StringCchPrintf(buf, ARRAYSIZE(buf), L"%s file", dot + 1);   // unknown extension
+        StringCchPrintf(buf, ARRAYSIZE(buf), ExplorerText(L"type.extension_file", L"%s 文件", L"%s file"), dot + 1);   // unknown extension
 
     int slot = (s_n < 32) ? s_n++ : 0;
     StringCchCopyN(s_cache[slot].ext, ARRAYSIZE(s_cache[slot].ext), dot, ARRAYSIZE(s_cache[slot].ext) - 1);
@@ -1541,27 +1574,27 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
             {
             case 0:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Name");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.name",L"名称",L"Name"));
                 break;
             case 1:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Host");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.host",L"主机",L"Host"));
                 break;
             case 2:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Protocol");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.protocol",L"协议",L"Protocol"));
                 break;
             case 3:
                 pDetails->fmt = LVCFMT_RIGHT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Port");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.port",L"端口",L"Port"));
                 break;
             case 4:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"User");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.user",L"用户",L"User"));
                 break;
             case 5:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Start Path");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.start_path",L"起始路径",L"Start Path"));
                 break;
             default:
                 hr = E_FAIL;
@@ -1574,39 +1607,39 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
             {
             case 0:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Name");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.name",L"名称",L"Name"));
                 break;
             case 1:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Type");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.type",L"类型",L"Type"));
                 break;
             case 2:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Permissions");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.permissions",L"权限",L"Permissions"));
                 break;
             case 3:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Owner");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.owner",L"所有者",L"Owner"));
                 break;
             case 4:
                 pDetails->fmt = LVCFMT_RIGHT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"UID");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.uid",L"UID",L"UID"));
                 break;
             case 5:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Group");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.group",L"组",L"Group"));
                 break;
             case 6:
                 pDetails->fmt = LVCFMT_RIGHT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"GID");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.gid",L"GID",L"GID"));
                 break;
             case 7:
                 pDetails->fmt = LVCFMT_RIGHT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Size");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.size",L"大小",L"Size"));
                 break;
             case 8:
                 pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), L"Modified");
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.modified",L"修改日期",L"Modified"));
                 break;
             default:
                 // GetDetailsOf is called with increasing column indices until failure.
@@ -1716,7 +1749,7 @@ PCFVITEMID CFolderViewImplFolder::_IsValid(PCUIDLIST_RELATIVE pidl)
     if (pidl)
     {
         pidmine = (PCFVITEMID)pidl;
-        if (!(pidmine->cb && MYOBJID == pidmine->MyObjID && pidmine->nLevel <= g_nMaxLevel))
+        if (!(pidmine->cb && MYOBJID == pidmine->MyObjID))
         {
             pidmine = NULL;
         }
@@ -1918,25 +1951,46 @@ static void SortItems(ITEMDATA *a, int maxItems)
 
 HRESULT CFolderViewImplEnumIDList::Initialize()
 {
-    ZeroMemory(m_aData, sizeof(m_aData));
+    m_aData.clear();
     if (m_nLevel == 1)
     {
         // Enumerating children of level 0 (the site picker): list configured sites.
         FTPSITE sites[MAX_OBJS] = {};
         int n = FtpSitesGet(sites, ARRAYSIZE(sites));
-        for (int i = 0; i < n && i < ARRAYSIZE(m_aData); i++)
+        m_aData.reserve(n);
+        for (int i = 0; i < n; i++)
         {
-            ITEMDATA &item = m_aData[i];
+            ITEMDATA item = {};
             item.nLevel = 1;
             item.fIsFolder = TRUE;
             item.fIsSymlink = FALSE;
             StringCchCopy(item.szName, ARRAYSIZE(item.szName), sites[i].name);
+            m_aData.push_back(item);
         }
-        SortItems(m_aData, ARRAYSIZE(m_aData));
-        return S_OK;
     }
-    RunFtpList(m_szSite, m_szPath, m_aData, ARRAYSIZE(m_aData));
-    SortItems(m_aData, ARRAYSIZE(m_aData));
+    else
+    {
+        std::vector<FTPENTRY> entries;
+        if (!FtpListCachedAll(m_szSite, m_szPath, entries)) return E_FAIL;
+        m_aData.reserve(entries.size());
+        for (auto const &entry : entries)
+        {
+            ITEMDATA item = {};
+            item.nLevel = m_nLevel;
+            item.dwMode = entry.dwMode;
+            item.dwMtime = entry.dwMtime;
+            item.dwSize = entry.dwSize;
+            item.dwUid = entry.dwUid;
+            item.dwGid = entry.dwGid;
+            item.fIsFolder = entry.fIsFolder;
+            item.fIsSymlink = entry.fIsSymlink;
+            StringCchCopy(item.szOwner, ARRAYSIZE(item.szOwner), entry.szOwner);
+            StringCchCopy(item.szGroup, ARRAYSIZE(item.szGroup), entry.szGroup);
+            StringCchCopy(item.szName, ARRAYSIZE(item.szName), entry.szName);
+            m_aData.push_back(item);
+        }
+    }
+    SortItems(m_aData.data(), (int)m_aData.size());
     return S_OK;
 }
 
@@ -1951,13 +2005,12 @@ HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG 
     if (SUCCEEDED(hr))
     {
         ULONG i = 0;
-        while (SUCCEEDED(hr) && i < celt && m_nItem < ARRAYSIZE(m_aData) && m_aData[m_nItem].szName[0])
+        while (SUCCEEDED(hr) && i < celt && m_nItem < (int)m_aData.size())
         {
             ProbeLog(L"[ENUM] item='%s' folder=%d flags=0x%X", m_aData[m_nItem].szName, m_aData[m_nItem].fIsFolder, m_grfFlags);
             BOOL fSkip = FALSE;
-            // NOTE: dotfiles are ALWAYS shown — matches WSL \\wsl$ behavior
-            // (no hidden-file concept); avoids fighting Explorer's own hidden
-            // filtering and the Advanced\Hidden toggle.
+            // Dotfiles remain in the enumeration. Explorer filters them after
+            // GetAttributesOf reports SFGAO_HIDDEN for the individual item.
             if (!fSkip)
             {
                 if (m_aData[m_nItem].fIsFolder)

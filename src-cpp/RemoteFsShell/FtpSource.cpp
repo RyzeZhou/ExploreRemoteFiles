@@ -79,9 +79,11 @@ const wchar_t *GetLastEnumPath()
 {
     AcquireSRWLockExclusive(&g_pathLock);
     const wchar_t *psz = L"";
-    // TTL 5 s: long enough for a right-click right after navigating,
-    // short enough to avoid acting on a stale folder from another window.
-    if (g_lastDeepTick && (GetTickCount64() - g_lastDeepTick) < 5000)
+    // Keep the most recently enumerated deep folder for the lifetime of this
+    // Explorer process. Context-menu IDataObject/CIDA parents are truncated at
+    // the connection root even minutes after navigation, so a short TTL makes
+    // otherwise valid deep operations silently target '/'.
+    if (g_lastDeepTick)
     {
         psz = g_lastDeepPath;
     }
@@ -93,7 +95,7 @@ PCIDLIST_ABSOLUTE GetLastEnumPidl()
 {
     AcquireSRWLockExclusive(&g_pathLock);
     PCIDLIST_ABSOLUTE p = NULL;
-    if (g_lastDeepPidl && g_lastDeepTick && (GetTickCount64() - g_lastDeepTick) < 5000)
+    if (g_lastDeepPidl && g_lastDeepTick)
     {
         p = ILCloneFull(g_lastDeepPidl);
     }
@@ -276,7 +278,19 @@ static int FsOpCommon(const wchar_t *op, const wchar_t *arg1, const wchar_t *arg
     }
     DebugLog(L"[FS] FsOpCommon output='%.300s'", out.c_str());
     // The bridge writes "FAIL:" to stderr on errors.
-    return out.find("FAIL") != std::string::npos ? -1 : 0;
+    if (out.find("FAIL") != std::string::npos)
+    {
+        return -1;
+    }
+
+    // Any successful mutation can make one or more cached directory listings
+    // stale (rename may affect two parents).  Clear the small 3-second cache so
+    // Explorer's immediate refresh observes the real FTP state.
+    AcquireSRWLockExclusive(&g_cacheLock);
+    g_cache.clear();
+    ReleaseSRWLockExclusive(&g_cacheLock);
+    DebugLog(L"[FS] FsOpCommon cache invalidated after '%s'", op);
+    return 0;
 }
 
 int FsOpDelete(const wchar_t *path)

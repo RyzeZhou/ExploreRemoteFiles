@@ -74,6 +74,11 @@ explorer-remote-fs/
 
 ## 当前开发方向（2026-08-24）
 
+当前状态快照：
+
+- [基本功能开发进度（2026-08-30）](./docs/CURRENT_PROGRESS_2026-08-30.md)
+- [已知问题与后续研究（2026-08-30）](./docs/KNOWN_ISSUES_2026-08-30.md)
+
 深层导航控制实验已经完成。项目 Shell 主线从累计改造的 RemoteFsShell 切换为：
 
 > **Microsoft ExplorerDataProvider 导航内核 + 紧凑身份 PIDL + PIDL 外部的远程元数据/操作层。**

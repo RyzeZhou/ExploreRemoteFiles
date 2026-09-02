@@ -1,5 +1,4 @@
 using System.Collections.ObjectModel;
-using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using RemoteFsClient.Services;
@@ -15,13 +14,30 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         SiteList.ItemsSource = _sites;
+        ApplyLanguage();
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        foreach (var s in SiteStore.Load()) _sites.Add(s);
+        if (_sites.Count == 0)
+            foreach (var s in SiteStore.Load()) _sites.Add(s);
         if (_sites.Count > 0) SiteList.SelectedIndex = 0;
-        StatusText.Text = $"配置文件：{SiteStore.FilePathForDisplay}";
+        StatusText.Text = $"{Ui.T("Ready")} · {SiteStore.FilePathForDisplay}";
+    }
+
+    internal void ApplyLanguage()
+    {
+        Title = Ui.T("AppTitle");
+        NewButton.Content = Ui.T("New"); EditButton.Content = Ui.T("Edit"); DeleteButton.Content = Ui.T("Delete");
+        TestButton.Content = Ui.T("Test"); SettingsButton.Content = Ui.T("Settings");
+        DetailsTab.Header = Ui.T("SiteDetails"); SiteSettingsTab.Header = Ui.T("SiteSettings");
+        NameLabel.Text = Ui.T("Name"); ProtocolLabel.Text = Ui.T("Protocol"); HostPortLabel.Text = Ui.T("HostPort");
+        UsernameLabel.Text = Ui.T("Username"); StartPathLabel.Text = Ui.T("StartPath"); PasswordLabel.Text = Ui.T("Password");
+        WinScpSiteLabel.Text = Ui.T("WinScpSite"); TestResultGroup.Header = Ui.T("TestResult");
+        SiteSettingsHelpText.Text = Ui.T("SiteSettingsHelp"); FtpEncodingLabel.Text = Ui.T("FtpEncoding");
+        PrivateKeyLabel.Text = Ui.IsEnglish ? "Private key" : "私钥文件";
+        EditSiteSettingsButton.Content = Ui.T("EditSiteSettings");
+        ShowDetails();
     }
 
     private void OnSiteSelected(object sender, SelectionChangedEventArgs e)
@@ -36,7 +52,7 @@ public partial class MainWindow : Window
         if (s == null)
         {
             DName.Text = DType.Text = DHost.Text = DUser.Text = DPath.Text = "";
-            DPwd.Text = ""; DShared.Text = "";
+            DPwd.Text = DShared.Text = DFtpEncoding.Text = DPrivateKey.Text = "";
             return;
         }
         DName.Text = s.Name;
@@ -44,8 +60,10 @@ public partial class MainWindow : Window
         DHost.Text = $"{s.Host}:{s.EffectivePort}";
         DUser.Text = s.Username;
         DPath.Text = s.StartPath;
-        DPwd.Text = CredentialStore.Exists(s.Name) ? "已保存（Windows 凭据管理器）" : "未保存";
-        DShared.Text = RegistryShared(s.Name) ? "是（与 WinSCP 同名站点）" : "否";
+        DPwd.Text = CredentialStore.Exists(s.Name) ? Ui.T("PasswordSaved") : Ui.T("PasswordMissing");
+        DShared.Text = RegistryShared(s.Name) ? Ui.T("SharedYes") : Ui.T("SharedNo");
+        DFtpEncoding.Text = s.Type is "ftp" or "ftps" ? (s.FtpUseUtf8 ? Ui.T("ForceUtf8") : (Ui.IsEnglish ? "Server default" : "服务器默认编码")) : "—";
+        DPrivateKey.Text = string.IsNullOrWhiteSpace(s.PrivateKeyPath) ? "—" : s.PrivateKeyPath;
     }
 
     private static bool RegistryShared(string name)
@@ -64,61 +82,42 @@ public partial class MainWindow : Window
 
     private void OnEdit(object sender, RoutedEventArgs e)
     {
-        if (_selected == null) { StatusText.Text = "请先选择站点"; return; }
+        if (_selected == null) { StatusText.Text = Ui.T("SelectSite"); return; }
         OpenEditor(Clone(_selected), isNew: false);
     }
 
     private void OnDelete(object sender, RoutedEventArgs e)
     {
         if (_selected == null) return;
-        if (MessageBox.Show($"删除站点「{_selected.Name}」？（凭据管理器中的密码一并删除）",
-                "确认", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+        if (MessageBox.Show(string.Format(Ui.T("DeletePrompt"), _selected.Name), Ui.T("Confirm"),
+                MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
         try { CredentialStore.Delete(_selected.Name); } catch { }
         _sites.Remove(_selected);
         SiteStore.Save(_sites);
         _selected = null;
         ShowDetails();
-        StatusText.Text = "已删除";
+        StatusText.Text = Ui.T("Deleted");
     }
 
-    /// <summary>WinSCP 设置：指定 WinSCP.com 路径（支持绿色版/便携版），存入注册表。</summary>
-    private void OnWinScpSettings(object sender, RoutedEventArgs e)
+    private void OnSettings(object sender, RoutedEventArgs e)
     {
-        var current = ConnectionTester.FindWinScp();
-        var dlg = new Microsoft.Win32.OpenFileDialog
-        {
-            Title = "选择 WinSCP.com（绿色版请选解压目录里的 WinSCP.com）",
-            Filter = "WinSCP 命令行程序|WinSCP.com|所有文件|*.*",
-            FileName = current ?? "WinSCP.com",
-            CheckFileExists = true,
-        };
-        if (dlg.ShowDialog() == true)
-        {
-            try
-            {
-                Microsoft.Win32.Registry.CurrentUser
-                    .CreateSubKey(@"Software\ExplorerRemoteFs")?
-                    .SetValue("WinScpPath", dlg.FileName);
-                StatusText.Text = $"WinSCP.com 已设置: {dlg.FileName}";
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"保存失败: {ex.Message}", "WinSCP 设置", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
-        }
+        var dlg = new AppSettingsWindow { Owner = this };
+        if (dlg.ShowDialog() != true) return;
+        Ui.SetLanguage(dlg.Settings.ServiceLanguage);
+        ApplyLanguage();
+        (System.Windows.Application.Current as App)?.RefreshLocalizedShell();
+        StatusText.Text = Ui.T("SettingsSaved");
     }
 
     private async void OnTest(object sender, RoutedEventArgs e)
     {
-        if (_selected == null) { StatusText.Text = "请先选择站点"; return; }
-        TestOutput.Text = "正在测试连接…";
-        StatusText.Text = $"测试中：{_selected.Name}";
+        if (_selected == null) { StatusText.Text = Ui.T("SelectSite"); return; }
+        TestOutput.Text = Ui.T("Testing");
+        StatusText.Text = $"{Ui.T("Testing")} {_selected.Name}";
         var result = await ConnectionTester.TestAsync(_selected);
         TestOutput.Text = result.Message;
-        StatusText.Text = result.Ok ? "连接成功" : "连接失败";
+        StatusText.Text = result.Ok ? Ui.T("TestSuccess") : Ui.T("TestFailed");
     }
-
-    // ---- editor -----------------------------------------------------------
 
     private void OpenEditor(Models.SiteInfo draft, bool isNew)
     {
@@ -127,11 +126,9 @@ public partial class MainWindow : Window
 
         try
         {
-            // 密码：明文只在内存，写入凭据管理器（DPAPI）
             if (dlg.EnteredPassword != null)
                 CredentialStore.Write(draft.Name, draft.Username, dlg.EnteredPassword);
 
-            // 改名时迁移凭据
             string? oldName = isNew ? null : _selected?.Name;
             if (oldName != null && oldName != draft.Name && CredentialStore.Exists(oldName))
             {
@@ -154,11 +151,12 @@ public partial class MainWindow : Window
 
             SiteStore.Save(_sites);
             ShowDetails();
-            StatusText.Text = "已保存";
+            StatusText.Text = Ui.T("Saved");
         }
         catch (Exception ex)
         {
-            MessageBox.Show("保存失败：" + ex.Message, "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show((Ui.IsEnglish ? "Save failed: " : "保存失败：") + ex.Message,
+                Ui.IsEnglish ? "Error" : "错误", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -166,12 +164,12 @@ public partial class MainWindow : Window
     {
         to.Name = from.Name; to.Type = from.Type; to.Host = from.Host;
         to.Port = from.Port; to.Username = from.Username; to.PrivateKeyPath = from.PrivateKeyPath;
-        to.StartPath = from.StartPath;
+        to.StartPath = from.StartPath; to.FtpUseUtf8 = from.FtpUseUtf8;
     }
 
     private static Models.SiteInfo Clone(Models.SiteInfo s) => new()
     { Name = s.Name, Type = s.Type, Host = s.Host, Port = s.Port, Username = s.Username,
-      Password = s.Password, PrivateKeyPath = s.PrivateKeyPath, StartPath = s.StartPath };
+      Password = s.Password, PrivateKeyPath = s.PrivateKeyPath, StartPath = s.StartPath, FtpUseUtf8 = s.FtpUseUtf8 };
 
     private string SuggestName()
     {

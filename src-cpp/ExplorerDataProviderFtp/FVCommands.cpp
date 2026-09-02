@@ -1,9 +1,27 @@
 #include "fvcommands.h"
 #include "utils.h"
+#include "FtpMeta.h"
 #include <new>  // std::nothrow
 
 extern HINSTANCE g_hInst;
 
+static PCWSTR ExplorerCommandText(UINT id)
+{
+    switch (id)
+    {
+    case IDS_DISPLAY:     return ExplorerText(L"command.display", L"显示", L"Display");
+    case IDS_SETTINGS:    return ExplorerText(L"command.settings", L"设置", L"Settings");
+    case IDS_SETTING1:    return ExplorerText(L"command.setting1", L"设置 1", L"Setting 1");
+    case IDS_SETTING2:    return ExplorerText(L"command.setting2", L"设置 2", L"Setting 2");
+    case IDS_SETTING3:    return ExplorerText(L"command.setting3", L"设置 3", L"Setting 3");
+    case IDS_DISPLAY_TT:  return ExplorerText(L"command.display_tooltip", L"显示项目。", L"Display the item.");
+    case IDS_SETTINGS_TT: return ExplorerText(L"command.settings_tooltip", L"修改设置。", L"Modify settings.");
+    case IDS_SETTING1_TT: return ExplorerText(L"command.setting1_tooltip", L"修改设置 1。", L"Modify setting 1.");
+    case IDS_SETTING2_TT: return ExplorerText(L"command.setting2_tooltip", L"修改设置 2。", L"Modify setting 2.");
+    case IDS_SETTING3_TT: return ExplorerText(L"command.setting3_tooltip", L"修改设置 3。", L"Modify setting 3.");
+    default: return L"";
+    }
+}
 // Sub Commands for Settings
 const FVCOMMANDITEM CFolderViewCommandProvider::c_FVTaskSettings[] =
 {
@@ -41,35 +59,23 @@ HRESULT CFolderViewCommandProvider::s_OnDisplay(IShellItemArray *psiItemArray, I
 
 HRESULT CFolderViewCommandProvider::s_OnSetting1(IShellItemArray * /* psiItemArray */, IUnknown * /* pv */)
 {
-    WCHAR sz[100];
-    HRESULT hr = LoadString(g_hInst, IDS_SETTING1, sz, ARRAYSIZE(sz)) ? S_OK : E_FAIL;
-    if (SUCCEEDED(hr))
-    {
-        MessageBox(NULL, sz, sz, MB_OK);
-    }
-    return hr;
+    PCWSTR text = ExplorerCommandText(IDS_SETTING1);
+    MessageBoxW(NULL, text, text, MB_OK);
+    return S_OK;
 }
 
 HRESULT CFolderViewCommandProvider::s_OnSetting2(IShellItemArray * /* psiItemArray */, IUnknown * /* pv */)
 {
-    WCHAR sz[100];
-    HRESULT hr = LoadString(g_hInst, IDS_SETTING2, sz, ARRAYSIZE(sz)) ? S_OK : E_FAIL;
-    if (SUCCEEDED(hr))
-    {
-        MessageBox(NULL, sz, sz, MB_OK);
-    }
-    return hr;
+    PCWSTR text = ExplorerCommandText(IDS_SETTING2);
+    MessageBoxW(NULL, text, text, MB_OK);
+    return S_OK;
 }
 
 HRESULT CFolderViewCommandProvider::s_OnSetting3(IShellItemArray * /* psiItemArray */, IUnknown * /* pv */)
 {
-    WCHAR sz[100];
-    HRESULT hr = LoadString(g_hInst, IDS_SETTING3, sz, ARRAYSIZE(sz)) ? S_OK : E_FAIL;
-    if (SUCCEEDED(hr))
-    {
-        MessageBox(NULL, sz, sz, MB_OK);
-    }
-    return hr;
+    PCWSTR text = ExplorerCommandText(IDS_SETTING3);
+    MessageBoxW(NULL, text, text, MB_OK);
+    return S_OK;
 }
 
 HRESULT CFolderViewCommandEnumerator::_CreateCommandFromCommandItem(FVCOMMANDITEM *pfvci, IExplorerCommand **ppExplorerCommand)
@@ -136,12 +142,8 @@ IFACEMETHODIMP CFolderViewCommand::GetTitle(IShellItemArray * /* psiItemArray */
     HRESULT hr = E_FAIL;
     if (_pfvci)
     {
-        WCHAR sz[100];
-        hr = LoadString(g_hInst, _pfvci->dwTitleID, sz, ARRAYSIZE(sz)) ? S_OK : E_FAIL;
-        if (SUCCEEDED(hr))
-        {
-            hr = SHStrDup(sz, ppszName);
-        }
+        PCWSTR text = ExplorerCommandText(_pfvci->dwTitleID);
+        hr = text[0] ? SHStrDup(text, ppszName) : E_FAIL;
     }
     return hr;
 }
@@ -152,12 +154,8 @@ IFACEMETHODIMP CFolderViewCommand::GetToolTip(IShellItemArray * /* psiItemArray 
     HRESULT hr = E_FAIL;
     if (_pfvci)
     {
-        WCHAR sz[100];
-        hr = LoadString(g_hInst, _pfvci->dwToolTipID, sz, ARRAYSIZE(sz)) ? S_OK : E_FAIL;
-        if (SUCCEEDED(hr))
-        {
-            hr = SHStrDup(sz, ppszInfotip);
-        }
+        PCWSTR text = ExplorerCommandText(_pfvci->dwToolTipID);
+        hr = text[0] ? SHStrDup(text, ppszInfotip) : E_FAIL;
     }
     return hr;
 }

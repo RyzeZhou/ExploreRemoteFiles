@@ -610,9 +610,12 @@ HRESULT CFolderViewImplContextMenu::QueryContextMenu(HMENU hmenu, UINT indexMenu
     InsertMenuW(hmenu, indexMenu++, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
     InsertMenuW(hmenu, indexMenu++, MF_BYPOSITION, idCmd + MENUVERB_PROPERTIES, L"Properties");
 
-    DebugLog(L"[CM] QueryContextMenu inserted Delete=%u Rename=%u Properties=%u -> return %u verbs",
-             idCmd + MENUVERB_DELETE, idCmd + MENUVERB_RENAME, idCmd + MENUVERB_PROPERTIES, cVerbs + 3);
-    return MAKE_HRESULT(SEVERITY_SUCCESS, 0, (USHORT)(cVerbs + 3));
+    // Command offsets 0, 1 and 3 consume four IDs: offset 2 is intentionally
+    // reserved for New Folder. Returning only three lets the next handler reuse
+    // our Properties ID, so clicking Properties invokes an unrelated command.
+    DebugLog(L"[CM] QueryContextMenu inserted Delete=%u Rename=%u Properties=%u -> reserve %u ids",
+             idCmd + MENUVERB_DELETE, idCmd + MENUVERB_RENAME, idCmd + MENUVERB_PROPERTIES, cVerbs + 4);
+    return MAKE_HRESULT(SEVERITY_SUCCESS, 0, (USHORT)(cVerbs + 4));
 }
 
 HRESULT CFolderViewImplContextMenu::InvokeCommand(LPCMINVOKECOMMANDINFO pici)
@@ -730,12 +733,52 @@ HRESULT CFolderViewImplContextMenu::InvokeCommand(LPCMINVOKECOMMANDINFO pici)
         StringCchCopy(szFolderPath, ARRAYSIZE(szFolderPath), L"/");
     }
 
+    // Explorer's ContextMenuHandlers path is not location-neutral for a
+    // non-filesystem NSE: after a modal handler returns it may rebuild the
+    // current view from the truncated CIDA parent and fall back to the
+    // connection root.  Preserve the actual deep-folder PIDL while the
+    // command is running and browse back to it after the handler completes.
+    // This also covers Properties, which performs no change notification.
+    // The process-global fallback belongs only to children enumerated inside a
+    // deep directory. Root items have nLevel 1; restoring the last deep PIDL
+    // after their Properties dialog would incorrectly navigate into /www.
+    PCIDLIST_ABSOLUTE pidlStay = (pItem && pItem->nLevel >= 2) ? GetLastEnumPidl() : NULL;
+    auto RestoreCurrentFolder = [&]()
+    {
+        if (!pidlStay)
+        {
+            DebugLog(L"[CM] RestoreCurrentFolder: no deep-folder PIDL cached");
+            return;
+        }
+        if (!_punkSite)
+        {
+            DebugLog(L"[CM] RestoreCurrentFolder: no site");
+            return;
+        }
+        IServiceProvider *psp = NULL;
+        HRESULT hrRestore = _punkSite->QueryInterface(IID_PPV_ARGS(&psp));
+        if (SUCCEEDED(hrRestore))
+        {
+            static const GUID SID_STopLevelBrowser = { 0x4C96BE40, 0x915C, 0x11CF, { 0x99, 0xD3, 0x00, 0xAA, 0x00, 0x4A, 0xE8, 0x37 } };
+            IShellBrowser *psb = NULL;
+            hrRestore = psp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&psb));
+            if (SUCCEEDED(hrRestore) && psb)
+            {
+                hrRestore = psb->BrowseObject(pidlStay, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+                DebugLog(L"[CM] RestoreCurrentFolder BrowseObject pidl=%p hr=0x%08X", pidlStay, hrRestore);
+                psb->Release();
+            }
+            psp->Release();
+        }
+    };
+
     if (uOffset == MENUVERB_DELETE)
     {
         DebugLog(L"[CM] InvokeCommand DELETE (offset=%u)", uOffset);
         if (FAILED(hrSel) || !pItem)
         {
             DebugLog(L"[CM] DELETE: hrSel=0x%08X pItem=%p -> E_INVALIDARG", hrSel, pItem);
+            CoTaskMemFree((LPVOID)pidlStay);
             return E_INVALIDARG;
         }
         JoinRemotePath(szFolderPath, pItem->szName, szFullPath, ARRAYSIZE(szFullPath));
@@ -767,6 +810,8 @@ HRESULT CFolderViewImplContextMenu::InvokeCommand(LPCMINVOKECOMMANDINFO pici)
                 MessageBoxW(pici->hwnd ? pici->hwnd : _hwnd, L"Delete failed.", L"RemoteFS", MB_OK | MB_ICONERROR);
             }
         }
+        RestoreCurrentFolder();
+        CoTaskMemFree((LPVOID)pidlStay);
         return S_OK;
     }
 
@@ -776,6 +821,7 @@ HRESULT CFolderViewImplContextMenu::InvokeCommand(LPCMINVOKECOMMANDINFO pici)
         if (FAILED(hrSel) || !pItem)
         {
             DebugLog(L"[CM] RENAME: hrSel=0x%08X pItem=%p -> E_INVALIDARG", hrSel, pItem);
+            CoTaskMemFree((LPVOID)pidlStay);
             return E_INVALIDARG;
         }
         JoinRemotePath(szFolderPath, pItem->szName, szFullPath, ARRAYSIZE(szFullPath));
@@ -809,6 +855,8 @@ HRESULT CFolderViewImplContextMenu::InvokeCommand(LPCMINVOKECOMMANDINFO pici)
                 MessageBoxW(pici->hwnd ? pici->hwnd : _hwnd, L"Rename failed.", L"RemoteFS", MB_OK | MB_ICONERROR);
             }
         }
+        RestoreCurrentFolder();
+        CoTaskMemFree((LPVOID)pidlStay);
         return S_OK;
     }
 
@@ -822,9 +870,12 @@ HRESULT CFolderViewImplContextMenu::InvokeCommand(LPCMINVOKECOMMANDINFO pici)
             DebugLog(L"[CM] PermBox DialogBoxParamW ret=%lld (1=ok,-1=fail)", (long long)ret);
             hrSel = (ret == -1) ? E_FAIL : S_OK;
         }
+        RestoreCurrentFolder();
+        CoTaskMemFree((LPVOID)pidlStay);
         return hrSel;
     }
 
+    CoTaskMemFree((LPVOID)pidlStay);
     DebugLog(L"[CM] InvokeCommand unmatched idCmd=%u offset=0x%X -> E_INVALIDARG", (UINT)idCmd, uOffset);
 
     // MENUVERB_OPEN removed: folder open is native BindToObject navigation,

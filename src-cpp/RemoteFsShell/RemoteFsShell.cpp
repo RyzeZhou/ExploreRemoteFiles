@@ -23,7 +23,7 @@
 #include "ContextMenu.h"
 #include "FtpSource.h"
 
-const int g_nMaxLevel = 3;   // level 0 = connections, 1 = root, 2 = dir contents
+const int g_nMaxLevel = 10;  // connection plus up to nine remote directory levels
 
 HRESULT CFolderViewCB_CreateInstance(REFIID riid, void **ppv);
 HRESULT CFolderViewImplContextMenu_CreateInstance(REFIID riid, void **ppv);
@@ -36,20 +36,58 @@ HRESULT CFolderViewImplContextMenu_CreateInstance(REFIID riid, void **ppv);
 static const ITEMDATA c_rgConnections[] =
 {
     { 0, 0755, 0, 0, TRUE, FALSE, L"ftpuser", L"ftp", L"local-ftp" },
+    { 0, 0755, 0, 0, TRUE, FALSE, L"control", L"control", L"static-control" },
 };
 
-// Enumerate items for a folder level. Level 0 returns the connection list;
-// levels >= 1 list the real FTP directory at pszPath.
+static int CopyStaticItems(const ITEMDATA *items, int count, ITEMDATA *out, int maxItems)
+{
+    int n = min(count, maxItems);
+    for (int i = 0; i < n; i++) out[i] = items[i];
+    return n;
+}
+
+// Controlled in-memory hierarchy. It uses the exact same PIDL, BindToObject,
+// IShellView and persistence implementation as local-ftp, but never invokes
+// the FTP bridge or its cache.
+static int GetStaticItems(PCWSTR pszPath, ITEMDATA *out, int maxItems)
+{
+    static const ITEMDATA root[] =
+    {
+        { 0, 0755, 0, 0, TRUE, FALSE, L"control", L"control", L"alpha" },
+        { 0, 0755, 0, 0, TRUE, FALSE, L"control", L"control", L"beta" },
+        { 0, 0644, 32, 0, FALSE, FALSE, L"control", L"control", L"root-file.txt" },
+    };
+    static const ITEMDATA alpha[] =
+    {
+        { 0, 0755, 0, 0, TRUE, FALSE, L"control", L"control", L"nested" },
+        { 0, 0644, 32, 0, FALSE, FALSE, L"control", L"control", L"inside-alpha.txt" },
+    };
+    static const ITEMDATA nested[] =
+    {
+        { 0, 0644, 32, 0, FALSE, FALSE, L"control", L"control", L"deep-static.txt" },
+    };
+    static const ITEMDATA beta[] =
+    {
+        { 0, 0644, 32, 0, FALSE, FALSE, L"control", L"control", L"inside-beta.txt" },
+    };
+    if (0 == StrCmp(pszPath, L"@static")) return CopyStaticItems(root, ARRAYSIZE(root), out, maxItems);
+    if (0 == StrCmp(pszPath, L"@static/alpha")) return CopyStaticItems(alpha, ARRAYSIZE(alpha), out, maxItems);
+    if (0 == StrCmp(pszPath, L"@static/alpha/nested")) return CopyStaticItems(nested, ARRAYSIZE(nested), out, maxItems);
+    if (0 == StrCmp(pszPath, L"@static/beta")) return CopyStaticItems(beta, ARRAYSIZE(beta), out, maxItems);
+    return 0;
+}
+
+// Enumerate items for a folder level. Level 0 returns connections; @static
+// paths use controlled memory data; all other levels use the real FTP bridge.
 static int GetLevelItems(int nLevel, PCWSTR pszPath, ITEMDATA *out, int maxItems)
 {
     if (nLevel == 0)
     {
-        int n = min((int)ARRAYSIZE(c_rgConnections), maxItems);
-        for (int i = 0; i < n; i++)
-        {
-            out[i] = c_rgConnections[i];
-        }
-        return n;
+        return CopyStaticItems(c_rgConnections, ARRAYSIZE(c_rgConnections), out, maxItems);
+    }
+    if (pszPath && 0 == StrCmpN(pszPath, L"@static", 7))
+    {
+        return GetStaticItems(pszPath, out, maxItems);
     }
     return FtpListDirectory(pszPath, out, maxItems);
 }
@@ -85,8 +123,7 @@ static void RemotePathFromPidl(PCIDLIST_ABSOLUTE pidlAbs, PWSTR szOut, UINT cch)
 // The shell folder implementation
 // ---------------------------------------------------------------------------
 class CFolderViewImplFolder : public IShellFolder2,
-                              public IPersistFolder2,
-                              public IPersistIDList
+                              public IPersistFolder2
 {
 public:
     CFolderViewImplFolder(UINT nLevel, PCWSTR pszRemotePath);
@@ -127,11 +164,6 @@ public:
 
     // IPersistFolder2
     IFACEMETHODIMP GetCurFolder(PIDLIST_ABSOLUTE *ppidl);
-
-    // IPersistIDList (View location persistence: SetIDList/GetIDList share
-    // the same m_pidl as Initialize/GetCurFolder).
-    IFACEMETHODIMP SetIDList(PCIDLIST_ABSOLUTE pidl);
-    IFACEMETHODIMP GetIDList(PIDLIST_ABSOLUTE *ppidl);
 
     // IDList constructor public for the enumerator object
     HRESULT CreateChildID(PCWSTR pszName, int nLevel, DWORD dwMode, DWORD dwSize, DWORD dwMtime,
@@ -279,8 +311,6 @@ HRESULT CFolderViewImplFolder::QueryInterface(REFIID riid, void **ppv)
     }
     else if (riid == IID_IPersist)
     {
-        // Explicit path: both IPersistFolder2 and IPersistIDList derive from
-        // IPersist, so pick one unambiguous route.
         *ppv = static_cast<IPersist *>(static_cast<IPersistFolder2 *>(this));
     }
     else if (riid == IID_IPersistFolder)
@@ -290,11 +320,6 @@ HRESULT CFolderViewImplFolder::QueryInterface(REFIID riid, void **ppv)
     else if (riid == IID_IPersistFolder2)
     {
         *ppv = static_cast<IPersistFolder2 *>(this);
-    }
-    else if (riid == IID_IPersistIDList)
-    {
-        *ppv = static_cast<IPersistIDList *>(this);
-        DebugLog(L"[SF] QI(IPersistIDList) -> OK (probe)");
     }
     else
     {
@@ -392,9 +417,9 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
     return hr;
 }
 
-HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnumIDList **ppenumIDList)
+HRESULT CFolderViewImplFolder::EnumObjects(HWND hwnd, DWORD grfFlags, IEnumIDList **ppenumIDList)
 {
-    DebugLog(L"[SF] EnumObjects level=%d flags=0x%X", m_nLevel, grfFlags);
+    DebugLog(L"[SF] EnumObjects level=%d flags=0x%X hwnd=%p", m_nLevel, grfFlags, hwnd);
     HRESULT hr;
     if (m_nLevel >= g_nMaxLevel)
     {
@@ -403,7 +428,9 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
     }
     else
     {
-        CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel, m_szRemotePath, this);
+        // Match Microsoft's ExplorerDataProvider contract: each enumerated
+        // child carries its own level, one greater than the parent folder.
+        CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szRemotePath, this);
         hr = penum ? S_OK : E_OUTOFMEMORY;
         if (SUCCEEDED(hr))
         {
@@ -427,64 +454,58 @@ HRESULT CFolderViewImplFolder::BindToObject(PCUIDLIST_RELATIVE pidl,
     HRESULT hr = _ValidatePidl(pidl);
     if (SUCCEEDED(hr))
     {
-        int nLevel = 0;
-        hr = _GetLevel(pidl, &nLevel);
+        WCHAR szName[256];
+        hr = _GetName(pidl, szName, ARRAYSIZE(szName));
         if (SUCCEEDED(hr))
         {
-            // Remote path of the child folder.
-            WCHAR szName[256];
-            hr = _GetName(pidl, szName, ARRAYSIZE(szName));
+            WCHAR szChildPath[512];
+            if (m_szRemotePath[0] == 0)
+            {
+                StringCchCopy(szChildPath, ARRAYSIZE(szChildPath),
+                              0 == StrCmp(szName, L"static-control") ? L"@static" : L"/");
+            }
+            else if (m_szRemotePath[0] == L'/' && m_szRemotePath[1] == 0)
+            {
+                StringCchPrintf(szChildPath, ARRAYSIZE(szChildPath), L"/%s", szName);
+            }
+            else if (0 == StrCmpN(m_szRemotePath, L"@static", 7))
+            {
+                StringCchPrintf(szChildPath, ARRAYSIZE(szChildPath), L"%s/%s", m_szRemotePath, szName);
+            }
+            else
+            {
+                StringCchPrintf(szChildPath, ARRAYSIZE(szChildPath), L"%s/%s", m_szRemotePath, szName);
+            }
+            DebugLog(L"[SF] BindToObject sample-aligned folderLevel=%d name='%s' childPath='%s' m_pidl=%p",
+                     m_nLevel, szName, szChildPath, m_pidl);
+
+            // Match Microsoft's sample exactly: child folder depth follows the
+            // parent object, never metadata recovered from a child PIDL.
+            CFolderViewImplFolder *pFolder = new (std::nothrow) CFolderViewImplFolder(m_nLevel + 1, szChildPath);
+            hr = pFolder ? S_OK : E_OUTOFMEMORY;
             if (SUCCEEDED(hr))
             {
-                WCHAR szChildPath[512];
-                if (m_szRemotePath[0] == 0)
-                {
-                    // Binding a connection (level-0 root): the connection
-                    // itself maps to the remote root "/".
-                    StringCchCopy(szChildPath, ARRAYSIZE(szChildPath), L"/");
-                }
-                else if (m_szRemotePath[0] == L'/' && m_szRemotePath[1] == 0)
-                {
-                    // Binding a child of the connection root: "/" + name.
-                    StringCchPrintf(szChildPath, ARRAYSIZE(szChildPath), L"/%s", szName);
-                }
-                else
-                {
-                    StringCchPrintf(szChildPath, ARRAYSIZE(szChildPath), L"%s/%s", m_szRemotePath, szName);
-                }
-                DebugLog(L"[SF] BindToObject level=%d name='%s' childPath='%s' m_pidl=%p", m_nLevel, szName, szChildPath, m_pidl);
-
-                CFolderViewImplFolder* pFolder = new (std::nothrow) CFolderViewImplFolder(nLevel + 1, szChildPath);
-                hr = pFolder ? S_OK : E_OUTOFMEMORY;
+                PITEMID_CHILD pidlFirst = ILCloneFirst(pidl);
+                hr = pidlFirst ? S_OK : E_OUTOFMEMORY;
                 if (SUCCEEDED(hr))
                 {
-                    PITEMID_CHILD pidlFirst = ILCloneFirst(pidl);
-                    hr = pidlFirst ? S_OK : E_OUTOFMEMORY;
+                    PIDLIST_ABSOLUTE pidlBind = ILCombine(m_pidl, pidlFirst);
+                    hr = pidlBind ? S_OK : E_OUTOFMEMORY;
                     if (SUCCEEDED(hr))
                     {
-                        PIDLIST_ABSOLUTE pidlBind = ILCombine(m_pidl, pidlFirst);
-                        hr = pidlBind ? S_OK : E_OUTOFMEMORY;
+                        hr = pFolder->Initialize(pidlBind);
                         if (SUCCEEDED(hr))
                         {
-                            hr = pFolder->Initialize(pidlBind);
-                            if (SUCCEEDED(hr))
-                            {
-                                PCUIDLIST_RELATIVE pidlNext = ILNext(pidl);
-                                if (ILIsEmpty(pidlNext))
-                                {
-                                    hr = pFolder->QueryInterface(riid, ppv);
-                                }
-                                else
-                                {
-                                    hr = pFolder->BindToObject(pidlNext, pbc, riid, ppv);
-                                }
-                            }
-                            CoTaskMemFree(pidlBind);
+                            PCUIDLIST_RELATIVE pidlNext = ILNext(pidl);
+                            hr = ILIsEmpty(pidlNext)
+                                ? pFolder->QueryInterface(riid, ppv)
+                                : pFolder->BindToObject(pidlNext, pbc, riid, ppv);
                         }
-                        ILFree(pidlFirst);
+                        CoTaskMemFree(pidlBind);
                     }
-                    pFolder->Release();
+                    ILFree(pidlFirst);
                 }
+                pFolder->Release();
             }
         }
     }
@@ -748,18 +769,12 @@ HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **p
     }
     else if (riid == IID_ICategoryProvider)
     {
-        // Minimal ICategoryProvider (no grouping).  Microsoft's sample
-        // supports this interface; explorer QI's it during view creation
-        // (measured: A39EE748-... 11 requests) and E_NOINTERFACE makes it
-        // fall back, which is suspected of breaking deep-folder view state.
-        CFolderViewImplCategoryProvider *pCat = new (std::nothrow) CFolderViewImplCategoryProvider();
-        hr = pCat ? S_OK : E_OUTOFMEMORY;
-        if (SUCCEEDED(hr))
-        {
-            hr = pCat->QueryInterface(riid, ppv);
-            pCat->Release();
-        }
-        DebugLog(L"[SF]   CreateViewObject(ICategoryProvider) hr=0x%08X", hr);
+        // Control variable: the Microsoft sample's provider is tightly coupled
+        // to its own columns/categories. Our placeholder advertises support but
+        // cannot create any category, so fail explicitly instead of returning
+        // a semantically incomplete object.
+        hr = E_NOINTERFACE;
+        DebugLog(L"[SF]   CreateViewObject(ICategoryProvider control) hr=0x%08X", hr);
     }
     else if (riid == IID_IContextMenu)
     {
@@ -836,9 +851,9 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
 
     if (riid == IID_IContextMenu)
     {
-        // 直返默认菜单：包装自定义菜单会让 explorer 放弃原生 BindToObject
-        // 导航（多次实测确认）。右键 Properties 通过标准 ContextMenuHandlers
-        // 注册实现（explorer 构建默认菜单时调用 handler 追加项，不碰导航路径）。
+        // Return Explorer's default menu directly. Wrapping it makes Explorer
+        // call BindToObject without committing a deep-folder view on Win10.
+        // Custom verbs are appended by the registered ContextMenuHandlers class.
         DEFCONTEXTMENU const dcm = { hwnd, NULL, m_pidl, static_cast<IShellFolder2 *>(this),
                                cidl, apidl, NULL, 0, NULL };
         hr = SHCreateDefaultContextMenu(&dcm, riid, ppv);
@@ -1309,47 +1324,6 @@ HRESULT CFolderViewImplFolder::GetCurFolder(PIDLIST_ABSOLUTE *ppidl)
     return hr;
 }
 
-// IPersistIDList methods: View location persistence.  Explorer's shell view
-// obtains/stores the folder's PIDL through SetIDList/GetIDList (falling back
-// to SFVM_THISIDLIST only when these fail).  Share the SAME m_pidl as
-// Initialize/GetCurFolder so the view's notion of "current location" matches
-// the folder object's identity.
-HRESULT CFolderViewImplFolder::SetIDList(PCIDLIST_ABSOLUTE pidl)
-{
-    CoTaskMemFree(m_pidl);
-    m_pidl = pidl ? ILCloneFull(pidl) : NULL;
-    DebugLog(L"[SF] SetIDList(IPersistIDList) pidl=%p level=%d -> m_pidl=%p", pidl, m_nLevel, m_pidl);
-    if (m_pidl)
-    {
-        UINT i = 0;
-        PCUIDLIST_RELATIVE p = (PCUIDLIST_RELATIVE)m_pidl;
-        while (p && p->mkid.cb && i < 4)
-        {
-            PCFVITEMID item = (PCFVITEMID)p;
-            WCHAR szName[48] = {};
-            for (UINT j = 0; j < 47 && item->szName[j]; j++) { szName[j] = item->szName[j]; }
-            DebugLog(L"[SF]   SetIDList seg%u cb=%u MyObjID=0x%04X nLevel=%u name='%s'",
-                     i, p->mkid.cb, item->MyObjID, item->nLevel, szName);
-            p = ILNext(p);
-            i++;
-        }
-    }
-    return m_pidl ? S_OK : E_FAIL;
-}
-
-HRESULT CFolderViewImplFolder::GetIDList(PIDLIST_ABSOLUTE *ppidl)
-{
-    *ppidl = NULL;
-    HRESULT hr = m_pidl ? S_OK : E_FAIL;
-    if (SUCCEEDED(hr))
-    {
-        *ppidl = ILCloneFull(m_pidl);
-        hr = *ppidl ? S_OK : E_OUTOFMEMORY;
-    }
-    DebugLog(L"[SF] GetIDList(IPersistIDList) hr=0x%08X m_pidl=%p level=%d path='%s'", hr, m_pidl, m_nLevel, m_szRemotePath);
-    return hr;
-}
-
 // Item idlists passed to folder methods are guaranteed to have accessible memory as specified
 // by the cbSize in the itemid.  However they may be loaded from a persisted form (for example
 // shortcuts on disk) where they could be corrupted.  It is the shell folder's responsibility
@@ -1625,11 +1599,13 @@ ULONG CFolderViewImplEnumIDList::Release()
 HRESULT CFolderViewImplEnumIDList::Initialize()
 {
     ZeroMemory(m_aData, sizeof(m_aData));
-    int n = GetLevelItems(m_nLevel, m_szPath, m_aData, MAX_OBJS);
+    // m_nLevel is the level encoded into child PIDLs. The listed directory is
+    // therefore the parent at m_nLevel - 1.
+    int n = GetLevelItems(m_nLevel - 1, m_szPath, m_aData, MAX_OBJS);
     // Record this directory (path + full PIDL) so the context menu handler
     // can recover the current folder even though explorer hands it a
     // truncated PIDL.
-    RememberEnumPath(m_nLevel, m_szPath, m_pFolder->GetPidl());
+    RememberEnumPath(m_nLevel - 1, m_szPath, m_pFolder->GetPidl());
     return (n >= 0) ? S_OK : S_OK;  // n<0 = connection error -> empty listing
 }
 
@@ -1715,71 +1691,30 @@ class CFolderViewCB : public IShellFolderViewCB,
 {
 public:
     CFolderViewCB() : _cRef(1) { }
-
-    // IUnknown
     IFACEMETHODIMP QueryInterface(REFIID riid, void **ppv)
     {
-        static const QITAB qit[] =
-        {
-            QITABENT(CFolderViewCB, IShellFolderViewCB),
-            QITABENT(CFolderViewCB, IFolderViewSettings),
-            { 0 },
-        };
+        static const QITAB qit[] = { QITABENT(CFolderViewCB, IShellFolderViewCB), QITABENT(CFolderViewCB, IFolderViewSettings), { 0 } };
         return QISearch(this, qit, riid, ppv);
     }
-
     IFACEMETHODIMP_(ULONG) AddRef() { return InterlockedIncrement(&_cRef); }
-    IFACEMETHODIMP_(ULONG) Release()
+    IFACEMETHODIMP_(ULONG) Release() { long c = InterlockedDecrement(&_cRef); if (!c) delete this; return c; }
+    IFACEMETHODIMP MessageSFVCB(UINT, WPARAM, LPARAM) { return E_NOTIMPL; }
+    IFACEMETHODIMP GetColumnPropertyList(REFIID, void **ppv) { *ppv = NULL; return E_NOTIMPL; }
+    IFACEMETHODIMP GetGroupByProperty(PROPERTYKEY *, BOOL *) { return E_NOTIMPL; }
+    IFACEMETHODIMP GetViewMode(FOLDERLOGICALVIEWMODE *) { return E_NOTIMPL; }
+    IFACEMETHODIMP GetIconSize(UINT *) { return E_NOTIMPL; }
+    IFACEMETHODIMP GetFolderFlags(FOLDERFLAGS *pfolderMask, FOLDERFLAGS *pfolderFlags)
     {
-        long cRef = InterlockedDecrement(&_cRef);
-        if (0 == cRef)
-        {
-            delete this;
-        }
-        return cRef;
+        if (pfolderMask) *pfolderMask = FWF_USESEARCHFOLDER;
+        if (pfolderFlags) *pfolderFlags = FWF_USESEARCHFOLDER;
+        return S_OK;
     }
-
-    // IShellFolderViewCB
-    IFACEMETHODIMP MessageSFVCB(UINT /* uMsg */, WPARAM /* wParam */, LPARAM /* lParam */)
-        { return E_NOTIMPL; }
-
-    // IFolderViewSettings
-    IFACEMETHODIMP GetColumnPropertyList(REFIID /* riid */, void **ppv)
-        { *ppv = NULL; return E_NOTIMPL; }
-    IFACEMETHODIMP GetGroupByProperty(PROPERTYKEY * /* pkey */, BOOL * /* pfGroupAscending */)
-        { return E_NOTIMPL; }
-    IFACEMETHODIMP GetViewMode(FOLDERLOGICALVIEWMODE * /* plvm */)
-        { return E_NOTIMPL; }
-    IFACEMETHODIMP GetIconSize(UINT * /* puIconSize */)
-        { return E_NOTIMPL; }
-
-    IFACEMETHODIMP GetFolderFlags(FOLDERFLAGS *pfolderMask, FOLDERFLAGS *pfolderFlags);
-
-    IFACEMETHODIMP GetSortColumns(SORTCOLUMN * /* rgSortColumns */, UINT /* cColumnsIn */, UINT * /* pcColumnsOut */)
-        { return E_NOTIMPL; }
-    IFACEMETHODIMP GetGroupSubsetCount(UINT * /* pcVisibleRows */)
-        { return E_NOTIMPL; }
-
+    IFACEMETHODIMP GetSortColumns(SORTCOLUMN *, UINT, UINT *) { return E_NOTIMPL; }
+    IFACEMETHODIMP GetGroupSubsetCount(UINT *) { return E_NOTIMPL; }
 private:
-    ~CFolderViewCB() { };
+    ~CFolderViewCB() { }
     long _cRef;
 };
-
-// IFolderViewSettings
-IFACEMETHODIMP CFolderViewCB::GetFolderFlags(FOLDERFLAGS *pfolderMask, FOLDERFLAGS *pfolderFlags)
-{
-    if (pfolderMask)
-    {
-        *pfolderMask = FWF_USESEARCHFOLDER;
-    }
-
-    if (pfolderFlags)
-    {
-        *pfolderFlags = FWF_USESEARCHFOLDER;
-    }
-
-    return S_OK;
-}
 
 HRESULT CFolderViewCB_CreateInstance(REFIID riid, void **ppv)
 {

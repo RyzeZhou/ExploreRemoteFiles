@@ -49,3 +49,36 @@
 #define IDD_PERMPAGE                     4002
 
 #define IDD_SITEPAGE                     4003
+#define IDD_SITEBOX                      4004
+#define IDD_COPYBOX                      4007
+
+#define IDC_COPY_SOURCE_LABEL             4101
+#define IDC_COPY_SOURCE                   4102
+#define IDC_COPY_ORIGINAL                 4103
+#define IDC_COPY_SAME_SITE                4104
+#define IDC_COPY_OTHER_SITE               4105
+#define IDC_COPY_LOCAL                    4106
+#define IDC_COPY_SITE_LABEL               4107
+#define IDC_COPY_SITE                     4108
+#define IDC_COPY_PATH_LABEL               4109
+#define IDC_COPY_PATH                     4110
+#define IDC_COPY_BROWSE                   4111
+#define IDC_COPY_DESTINATION              4112
+#define IDC_PROP_NAME                    3030
+#define IDC_PROP_TYPE                    3031
+#define IDC_PROP_PERMISSIONS             3032
+#define IDC_PROP_OWNER                   3033
+#define IDC_PROP_GROUP                   3034
+#define IDC_PROP_SIZE                    3035
+#define IDC_PROP_MODIFIED                3036
+#define IDC_PROP_PERMISSION_GROUP        3037
+#define IDC_PROP_OWNER_ROLE              3038
+#define IDC_PROP_GROUP_ROLE              3039
+#define IDC_PROP_OTHERS_ROLE             3040
+#define IDC_PROP_OCTAL_LABEL             3041
+#define IDC_SITE_NAME_LABEL              4011
+#define IDC_SITE_HOST_LABEL              4012
+#define IDC_SITE_PROTOCOL_LABEL          4013
+#define IDC_SITE_PORT_LABEL              4014
+#define IDC_SITE_USER_LABEL              4015
+#define IDC_SITE_START_PATH_LABEL        4016

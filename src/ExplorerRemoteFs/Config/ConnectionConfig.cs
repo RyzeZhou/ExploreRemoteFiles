@@ -29,5 +29,8 @@ public sealed class ConnectionConfig
     /// <summary>浏览起点（默认 "/"）。</summary>
     public string StartPath { get; set; } = "/";
 
+    /// <summary>FTP/FTPS 文件名编码：默认强制 UTF-8；关闭后由服务器自动协商。</summary>
+    public bool FtpUseUtf8 { get; set; } = true;
+
     public int EffectivePort => Port ?? (Type.StartsWith("sftp", StringComparison.OrdinalIgnoreCase) ? 22 : 21);
 }

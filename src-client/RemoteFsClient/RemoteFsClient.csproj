@@ -4,9 +4,13 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RemoteFsClient</AssemblyName>
     <RootNamespace>RemoteFsClient</RootNamespace>
     <Version>0.1.0</Version>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ExplorerRemoteFs\ExplorerRemoteFs.csproj" />
+  </ItemGroup>
 </Project>

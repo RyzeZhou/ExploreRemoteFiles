@@ -12,7 +12,12 @@ $ctx='{CB8F539D-3B97-4473-9E07-C8248C53248E}'
 $props='{5DD84779-FEF1-46A3-8FCF-9F1A9603BB8F}'
 $hk='HKCU:\Software\Classes'
 
+$explorerWasRunning = $null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue)
+try {
+
 Write-Host "==> Removing ExplorerRemoteFs registration..."
+Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 800
 
 # context menu + property sheet handlers
 Remove-Item "$hk\RemoteFsMicrosoftCoreType" -Recurse -Force -ErrorAction SilentlyContinue
@@ -20,7 +25,7 @@ Remove-Item "$hk\RemoteFsMicrosoftCoreType" -Recurse -Force -ErrorAction Silentl
 Remove-Item "$hk\CLSID\$folder" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$hk\CLSID\$ctx"    -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$hk\CLSID\$props"  -Recurse -Force -ErrorAction SilentlyContinue
-# Desktop junction + hidden desktop icon
+# Clean up only this extension's legacy desktop keys from older installs.
 Remove-Item "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\$folder" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel" -Name $folder -ErrorAction SilentlyContinue
 # config key (CliPath)
@@ -40,8 +45,12 @@ if ($RemoveConfig) {
 }
 
 Write-Host "==> Restarting Explorer..."
-Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 800
-Start-Process explorer.exe
-Start-Sleep -Seconds 1
 Write-Host "DONE. FTP entry removed from the navigation pane."
+
+}
+finally {
+    if ($explorerWasRunning) {
+        Start-Process explorer.exe
+        Start-Sleep -Seconds 1
+    }
+}

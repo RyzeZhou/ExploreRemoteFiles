@@ -45,8 +45,11 @@ public sealed class FtpFileSystem : IRemoteFileSystem
             // 握手会失败。显式设为 None 走明文。
             _client.Config.EncryptionMode = FtpEncryptionMode.None;
         }
+        // Many Unix FTP servers store Chinese names as UTF-8 but do not advertise
+        // UTF8 in FEAT. The site setting deliberately overrides auto-detection.
+        if (_config.FtpUseUtf8) _client.Encoding = System.Text.Encoding.UTF8;
         _client.Connect();
-        Utils.ShellLog.Write($"FTP connected: {DisplayName}");
+        Utils.ShellLog.Write($"FTP connected: {DisplayName}; encoding={_client.Encoding.WebName}");
     }
 
     public IReadOnlyList<RemoteEntry> List(string path)

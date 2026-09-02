@@ -52,6 +52,7 @@ ExplorerRemoteFs — FTP/SFTP 资源管理器集成（NSE）
 - FTP 协议无数字 uid/gid（UID/GID 列空）；chown 仅 SFTP 支持。
 - 跨用户 chown 受 Linux 权限限制（需 root，WinSCP 同样）。
 - 远程文件属性走右键"Remote properties"（Ribbon 内置属性按钮已重定向到同款页）。
+- Win11：第三方右键项在“显示更多选项”中；删除使用“Delete from server”，属性使用“Remote properties”。
 
 开发/日志
 --------
@@ -65,3 +66,17 @@ WinSCP 绿色版（便携版）支持
   2) 常见安装路径（Program Files）；
   3) PATH。
 - 找不到时提示信息会说明如何指定，不再只报"请先安装"。
+
+Win11: installation only pins the navigation pane; it does not modify Desktop\NameSpace or system desktop-icon settings.
+
+Explorer 扩展翻译（额外语言）
+----------------------------
+- 简体中文（zh-CN）和英语（en-US）内置在 DLL 中，YAML 不会覆盖这两种语言。
+- 安装后，模板位于 %APPDATA%\ExplorerRemoteFs\explorer-translations.yaml；同目录的 explorer-translations.example.yaml 提供完整的中英对照；升级不会覆盖已编辑文件。
+- 要添加语言，在 YAML 中增加语言代码段，例如：
+    ja-JP:
+      column.name: "名前"
+      menu.open: "開く"
+      property.permissions: "アクセス許可"
+  保存后在服务程序“设置 -> Explorer 扩展显示语言”选择 ja-JP，并重启 Explorer。
+- YAML 未提供的键会回退到英语；文件顶部注释列出了当前全部可翻译键。

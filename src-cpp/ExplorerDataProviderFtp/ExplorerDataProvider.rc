@@ -64,7 +64,7 @@ STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Rename"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Name:", IDC_STATIC, 8, 10, 40, 10
+    LTEXT           "Name:", 3030, 8, 10, 40, 10
     EDITTEXT        3101, 52, 8, 164, 14, ES_AUTOHSCROLL
     DEFPUSHBUTTON   "OK", IDOK, 62, 38, 48, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 118, 38, 48, 14
@@ -75,38 +75,38 @@ STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Remote Permissions"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Name:", IDC_STATIC, 12, 12, 44, 10
-    LTEXT           "", 3001, 60, 12, 170, 10
-    LTEXT           "Type:", IDC_STATIC, 12, 28, 44, 10
-    LTEXT           "", 3002, 60, 28, 170, 10
-    LTEXT           "Permissions:", IDC_STATIC, 12, 44, 60, 10
-    LTEXT           "", 3003, 80, 44, 150, 10
-    LTEXT           "Owner:", IDC_STATIC, 12, 60, 44, 10
-    LTEXT           "", 3004, 60, 60, 170, 10
-    LTEXT           "Group:", IDC_STATIC, 12, 76, 44, 10
-    LTEXT           "", 3005, 60, 76, 170, 10
-    LTEXT           "Size:", IDC_STATIC, 12, 92, 44, 10
-    LTEXT           "", 3006, 60, 92, 170, 10
-    LTEXT           "Modified:", IDC_STATIC, 12, 108, 48, 10
-    LTEXT           "", 3007, 64, 108, 166, 10
-    LTEXT           "New owner (UID):", IDC_STATIC, 12, 124, 72, 10
+    LTEXT           "Name:", 3030, 12, 12, 44, 10
+    EDITTEXT        3001, 60, 12, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Type:", 3031, 12, 28, 44, 10
+    EDITTEXT        3002, 60, 28, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Permissions:", 3032, 12, 44, 60, 10
+    EDITTEXT        3003, 80, 44, 150, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Owner:", 3033, 12, 60, 44, 10
+    EDITTEXT        3004, 60, 60, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Group:", 3034, 12, 76, 44, 10
+    EDITTEXT        3005, 60, 76, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Size:", 3035, 12, 92, 44, 10
+    EDITTEXT        3006, 60, 92, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Modified:", 3036, 12, 108, 48, 10
+    EDITTEXT        3007, 64, 108, 166, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "New owner (UID):", 3026, 12, 124, 72, 10
     EDITTEXT        3024, 88, 122, 142, 14, ES_AUTOHSCROLL
-    LTEXT           "New group (GID):", IDC_STATIC, 12, 140, 72, 10
+    LTEXT           "New group (GID):", 3027, 12, 140, 72, 10
     EDITTEXT        3025, 88, 138, 142, 14, ES_AUTOHSCROLL
-    GROUPBOX        "Permissions", IDC_STATIC, 12, 158, 218, 56
-    LTEXT           "Owner", IDC_STATIC, 22, 172, 40, 10
+    GROUPBOX        "Permissions", 3037, 12, 158, 218, 56
+    LTEXT           "Owner", 3038, 22, 172, 40, 10
     AUTOCHECKBOX    "Read", 3011, 72, 172, 42, 10
     AUTOCHECKBOX    "Write", 3012, 118, 172, 42, 10
     AUTOCHECKBOX    "Exec", 3013, 164, 172, 42, 10
-    LTEXT           "Group", IDC_STATIC, 22, 188, 40, 10
+    LTEXT           "Group", 3039, 22, 188, 40, 10
     AUTOCHECKBOX    "Read", 3014, 72, 188, 42, 10
     AUTOCHECKBOX    "Write", 3015, 118, 188, 42, 10
     AUTOCHECKBOX    "Exec", 3016, 164, 188, 42, 10
-    LTEXT           "Others", IDC_STATIC, 22, 204, 40, 10
+    LTEXT           "Others", 3040, 22, 204, 40, 10
     AUTOCHECKBOX    "Read", 3017, 72, 204, 42, 10
     AUTOCHECKBOX    "Write", 3018, 118, 204, 42, 10
     AUTOCHECKBOX    "Exec", 3019, 164, 204, 42, 10
-    LTEXT           "Octal:", IDC_STATIC, 12, 223, 36, 10
+    LTEXT           "Octal:", 3041, 12, 223, 36, 10
     EDITTEXT        3022, 52, 221, 44, 14, ES_AUTOHSCROLL
     AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 222, 122, 10
     DEFPUSHBUTTON   "OK", IDOK, 82, 244, 56, 14
@@ -121,38 +121,38 @@ STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD | WS_DISABLED | WS_CAPTION
 CAPTION "Permissions"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Name:", IDC_STATIC, 12, 12, 44, 10
-    LTEXT           "", 3001, 60, 12, 170, 10
-    LTEXT           "Type:", IDC_STATIC, 12, 28, 44, 10
-    LTEXT           "", 3002, 60, 28, 170, 10
-    LTEXT           "Permissions:", IDC_STATIC, 12, 44, 60, 10
-    LTEXT           "", 3003, 80, 44, 150, 10
-    LTEXT           "Owner:", IDC_STATIC, 12, 60, 44, 10
-    LTEXT           "", 3004, 60, 60, 170, 10
-    LTEXT           "Group:", IDC_STATIC, 12, 76, 44, 10
-    LTEXT           "", 3005, 60, 76, 170, 10
-    LTEXT           "Size:", IDC_STATIC, 12, 92, 44, 10
-    LTEXT           "", 3006, 60, 92, 170, 10
-    LTEXT           "Modified:", IDC_STATIC, 12, 108, 48, 10
-    LTEXT           "", 3007, 64, 108, 166, 10
-    LTEXT           "New owner (UID):", IDC_STATIC, 12, 124, 72, 10
+    LTEXT           "Name:", 3030, 12, 12, 44, 10
+    EDITTEXT        3001, 60, 12, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Type:", 3031, 12, 28, 44, 10
+    EDITTEXT        3002, 60, 28, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Permissions:", 3032, 12, 44, 60, 10
+    EDITTEXT        3003, 80, 44, 150, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Owner:", 3033, 12, 60, 44, 10
+    EDITTEXT        3004, 60, 60, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Group:", 3034, 12, 76, 44, 10
+    EDITTEXT        3005, 60, 76, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Size:", 3035, 12, 92, 44, 10
+    EDITTEXT        3006, 60, 92, 170, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "Modified:", 3036, 12, 108, 48, 10
+    EDITTEXT        3007, 64, 108, 166, 12, ES_AUTOHSCROLL | ES_READONLY
+    LTEXT           "New owner (UID):", 3026, 12, 124, 72, 10
     EDITTEXT        3024, 88, 122, 142, 14, ES_AUTOHSCROLL
-    LTEXT           "New group (GID):", IDC_STATIC, 12, 140, 72, 10
+    LTEXT           "New group (GID):", 3027, 12, 140, 72, 10
     EDITTEXT        3025, 88, 138, 142, 14, ES_AUTOHSCROLL
-    GROUPBOX        "Permissions", IDC_STATIC, 12, 158, 218, 56
-    LTEXT           "Owner", IDC_STATIC, 22, 172, 40, 10
+    GROUPBOX        "Permissions", 3037, 12, 158, 218, 56
+    LTEXT           "Owner", 3038, 22, 172, 40, 10
     AUTOCHECKBOX    "Read", 3011, 72, 172, 42, 10
     AUTOCHECKBOX    "Write", 3012, 118, 172, 42, 10
     AUTOCHECKBOX    "Exec", 3013, 164, 172, 42, 10
-    LTEXT           "Group", IDC_STATIC, 22, 188, 40, 10
+    LTEXT           "Group", 3039, 22, 188, 40, 10
     AUTOCHECKBOX    "Read", 3014, 72, 188, 42, 10
     AUTOCHECKBOX    "Write", 3015, 118, 188, 42, 10
     AUTOCHECKBOX    "Exec", 3016, 164, 188, 42, 10
-    LTEXT           "Others", IDC_STATIC, 22, 204, 40, 10
+    LTEXT           "Others", 3040, 22, 204, 40, 10
     AUTOCHECKBOX    "Read", 3017, 72, 204, 42, 10
     AUTOCHECKBOX    "Write", 3018, 118, 204, 42, 10
     AUTOCHECKBOX    "Exec", 3019, 164, 204, 42, 10
-    LTEXT           "Octal:", IDC_STATIC, 12, 223, 36, 10
+    LTEXT           "Octal:", 3041, 12, 223, 36, 10
     EDITTEXT        3022, 52, 221, 44, 14, ES_AUTOHSCROLL
     AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 222, 122, 10
 END
@@ -163,16 +163,59 @@ STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD | WS_DISABLED | WS_CAPTION
 CAPTION "Connection"
 FONT 8, "MS Shell Dlg"
 BEGIN
-    LTEXT           "Name:", IDC_STATIC, 8, 8, 48, 10
+    LTEXT           "Name:", 4011, 8, 8, 48, 10
     LTEXT           "", 4001, 62, 8, 150, 10
-    LTEXT           "Host:", IDC_STATIC, 8, 24, 48, 10
+    LTEXT           "Host:", 4012, 8, 24, 48, 10
     LTEXT           "", 4002, 62, 24, 150, 10
-    LTEXT           "Protocol:", IDC_STATIC, 8, 40, 48, 10
+    LTEXT           "Protocol:", 4013, 8, 40, 48, 10
     LTEXT           "", 4003, 62, 40, 150, 10
-    LTEXT           "Port:", IDC_STATIC, 8, 56, 48, 10
+    LTEXT           "Port:", 4014, 8, 56, 48, 10
     LTEXT           "", 4004, 62, 56, 150, 10
-    LTEXT           "User:", IDC_STATIC, 8, 72, 48, 10
+    LTEXT           "User:", 4015, 8, 72, 48, 10
     LTEXT           "", 4005, 62, 72, 150, 10
-    LTEXT           "Start path:", IDC_STATIC, 8, 88, 48, 10
+    LTEXT           "Start path:", 4016, 8, 88, 48, 10
     LTEXT           "", 4006, 62, 88, 150, 10
+END
+// Non-modal view used by the background-menu "Current site information" command.
+// Its fields deliberately match IDD_SITEPAGE, which is the site root Properties page.
+IDD_SITEBOX DIALOGEX 0, 0, 220, 130
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Connection"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Name:", 4011, 8, 8, 48, 10
+    LTEXT           "", 4001, 62, 8, 150, 10
+    LTEXT           "Host:", 4012, 8, 24, 48, 10
+    LTEXT           "", 4002, 62, 24, 150, 10
+    LTEXT           "Protocol:", 4013, 8, 40, 48, 10
+    LTEXT           "", 4003, 62, 40, 150, 10
+    LTEXT           "Port:", 4014, 8, 56, 48, 10
+    LTEXT           "", 4004, 62, 56, 150, 10
+    LTEXT           "User:", 4015, 8, 72, 48, 10
+    LTEXT           "", 4005, 62, 72, 150, 10
+    LTEXT           "Start path:", 4016, 8, 88, 48, 10
+    LTEXT           "", 4006, 62, 88, 150, 10
+    DEFPUSHBUTTON   "Close", IDCANCEL, 164, 108, 48, 14
+END
+// Copy target picker. It distinguishes the source remote path from the target kind
+// so the same verb can grow from local duplication into cross-site and local copies.
+IDD_COPYBOX DIALOGEX 0, 0, 312, 196
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Copy to"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Source remote path:", 4101, 12, 12, 82, 10
+    EDITTEXT        4102, 12, 25, 288, 14, ES_AUTOHSCROLL | ES_READONLY
+    GROUPBOX        "Destination", 4112, 12, 47, 288, 112
+    AUTORADIOBUTTON "Create a copy in the original folder", 4103, 22, 61, 266, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "Same site", 4104, 22, 79, 80, 10
+    AUTORADIOBUTTON "Other site", 4105, 22, 97, 80, 10
+    AUTORADIOBUTTON "Local folder", 4106, 22, 115, 80, 10
+    LTEXT           "Target site:", 4107, 104, 97, 58, 10
+    COMBOBOX        4108, 164, 95, 124, 72, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Target path:", 4109, 104, 117, 58, 10
+    EDITTEXT        4110, 164, 115, 94, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", 4111, 262, 115, 26, 14
+    DEFPUSHBUTTON   "OK", IDOK, 188, 170, 52, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 248, 170, 52, 14
 END

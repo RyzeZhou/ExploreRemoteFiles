@@ -15,6 +15,9 @@ public sealed class SiteInfo
     public string? Password { get; set; }               // 兼容旧字段；恒为 null
     public string? PrivateKeyPath { get; set; }
     public string StartPath { get; set; } = "/";
+    public bool FtpUseUtf8 { get; set; } = true;
 
     public int EffectivePort => Port ?? (Type.StartsWith("sftp", StringComparison.OrdinalIgnoreCase) ? 22 : 21);
+
+    public override string ToString() => Name;
 }

@@ -20,6 +20,7 @@ public partial class SiteEditWindow : Window
         _draft = draft;
         _isNew = isNew;
         _originalName = draft.Name;
+        ApplyLanguage();
 
         TbName.Text = draft.Name;
         CbType.SelectedItem = CbType.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string?)i.Content == draft.Type);
@@ -27,17 +28,37 @@ public partial class SiteEditWindow : Window
         TbPort.Text = draft.Port?.ToString() ?? "";
         TbUser.Text = draft.Username;
         TbPath.Text = draft.StartPath;
+        CbFtpUtf8.IsChecked = draft.FtpUseUtf8;
+        UpdateFtpEncodingVisibility();
         PwdHint.Text = CredentialStore.Exists(draft.Name)
-            ? "已保存密码（Windows 凭据管理器）。留空表示不修改。"
-            : "密码将存入 Windows 凭据管理器（DPAPI），不会写入 JSON。";
+            ? (Ui.IsEnglish ? "Password is saved in Windows Credential Manager. Leave blank to keep it." : "已保存密码（Windows 凭据管理器）。留空表示不修改。")
+            : (Ui.IsEnglish ? "The password is stored in Windows Credential Manager, not JSON." : "密码将存入 Windows 凭据管理器（DPAPI），不会写入 JSON。");
     }
 
+    private void ApplyLanguage()
+    {
+        Title = Ui.IsEnglish ? "Edit site" : "编辑站点";
+        NameLabel.Text = Ui.T("Name"); ProtocolLabel.Text = Ui.T("Protocol"); HostLabel.Text = Ui.IsEnglish ? "Host" : "主机";
+        PortLabel.Text = Ui.IsEnglish ? "Port (optional)" : "端口（可空）"; UserLabel.Text = Ui.T("Username");
+        PathLabel.Text = Ui.T("StartPath"); LblFtpUtf8.Text = Ui.T("FtpEncoding"); CbFtpUtf8.Content = Ui.T("ForceUtf8");
+        PasswordLabel.Text = Ui.T("Password"); SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");
+    }
+    private void OnTypeChanged(object sender, SelectionChangedEventArgs e)
+        => UpdateFtpEncodingVisibility();
+
+    private void UpdateFtpEncodingVisibility()
+    {
+        var type = (CbType.SelectedItem as ComboBoxItem)?.Content as string ?? "sftp";
+        var visible = type is "ftp" or "ftps" ? Visibility.Visible : Visibility.Collapsed;
+        LblFtpUtf8.Visibility = visible;
+        CbFtpUtf8.Visibility = visible;
+    }
     private void OnSave(object sender, RoutedEventArgs e)
     {
         string name = TbName.Text.Trim();
-        if (name.Length == 0) { MessageBox.Show("名称不能为空"); return; }
+        if (name.Length == 0) { MessageBox.Show(Ui.IsEnglish ? "Name is required." : "名称不能为空"); return; }
         if (name.Contains(':') || name.Contains('/') || name.Contains('\\'))
-        { MessageBox.Show("名称不能包含 : / \\ 等字符"); return; }
+        { MessageBox.Show(Ui.IsEnglish ? "Name cannot contain : / \\ characters." : "名称不能包含 : / \\ 等字符"); return; }
 
         if (!int.TryParse(TbPort.Text.Trim(), out int port) || port <= 0) port = 0;
 
@@ -47,6 +68,7 @@ public partial class SiteEditWindow : Window
         _draft.Port = port > 0 ? port : null;
         _draft.Username = TbUser.Text;
         _draft.StartPath = string.IsNullOrWhiteSpace(TbPath.Text) ? "/" : TbPath.Text.Trim();
+        _draft.FtpUseUtf8 = CbFtpUtf8.IsChecked != false;
 
         var pwd = PbPassword.Password;
         EnteredPassword = pwd.Length > 0 ? pwd : null;

@@ -1,10 +1,10 @@
 /**************************************************************************
-    RemoteFsShell - real FTP data source (WinINet).
-    Phase 2-A: enumerates a real FTP server via WinINet and parses the
-    Unix-style LIST output so we get mode / owner / group / size / mtime.
+    RemoteFsShell - real FTP/SFTP data source bridge.
+    Phase 2-A: launches ExplorerRemoteFs.Cli for Provider-backed directory
+    listings and file operations.  The shell process performs no network I/O.
 
-    Configuration is hardcoded for the local test server in Phase 2-A;
-    Phase 2-B (IPC) will replace this with the C# Provider for SFTP/FTP.
+    The bridge path and connection name are hardcoded for the local test
+    server; Phase 2-B will replace per-call spawn with a persistent service.
 **************************************************************************/
 #pragma once
 

@@ -1,5 +1,6 @@
 $ErrorActionPreference='Stop'
-$dll='D:\tools\explorer-remote-fs\src-cpp\ExplorerDataProviderFtp\ExplorerDataProviderFtp.dll'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$dll = Join-Path $root 'src-cpp\ExplorerDataProviderFtp\ExplorerDataProviderFtp.dll'
 $folder='{C816CE0E-728C-4FC9-98E5-D0B35B384597}'
 $ctx='{CB8F539D-3B97-4473-9E07-C8248C53248E}'
 $display='FTP'
