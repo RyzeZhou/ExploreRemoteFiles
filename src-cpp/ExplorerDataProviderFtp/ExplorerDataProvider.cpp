@@ -1373,8 +1373,10 @@ HRESULT CFolderViewImplFolder::SetNameOf(HWND hwnd, PCUITEMID_CHILD pidl,
     BOOL folder = FALSE; int size = 0;
     _GetFolderness(pidl, &folder); _GetSize(pidl, &size);
     if (ppidlOut) hr = CreateChildID(pszName, m_nLevel + 1, size > 0 ? size : 1, 3, folder, ppidlOut);
+    // Rollback (2026-09-02): no synchronous SHChangeNotify here — it made the
+    // shell re-enumerate on the UI thread and froze Explorer. Cache is cleared;
+    // a manual refresh (F5) picks up the new listing.
     FtpCacheClear();
-    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, m_pidl, NULL);
     return SUCCEEDED(hr) ? S_OK : hr;
 }
 

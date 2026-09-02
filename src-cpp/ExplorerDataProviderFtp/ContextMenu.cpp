@@ -148,28 +148,20 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
 
 // Single refresh pipeline for EVERY successful remote mutation — right-click
 // commands, background menu, drop target (Ctrl+V / drag-drop) all funnel here:
-// invalidate the metadata cache, then ask the affected view to re-enumerate.
-// P0-4 fix: clearing the cache alone never makes an existing DefView redraw;
-// SHCNE_UPDATEDIR on the folder PIDL does.
-// Post-mutation refresh runs on the Explorer UI thread (menu InvokeCommand).
-// SHChangeNotify(SHCNE_UPDATEDIR) can make the shell synchronously poke every
-// view, which re-enumerates the directory on our own data path — a stall there
-// would freeze Explorer. Fire the notification on a background thread instead;
-// the pidl is cloned so the UI thread can release its copy immediately.
-static DWORD WINAPI NotifyUpdateThread(LPVOID p)
-{
-    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)p, NULL);
-    ILFree((PIDLIST_ABSOLUTE)p);
-    return 0;
-}
+// invalidate the metadata cache (local + resident bridge) so the NEXT
+// enumeration (manual refresh / F5 / re-entering the folder) fetches fresh
+// data from the server.
+//
+// NOTE (2026-09-02 rollback): the automatic SHChangeNotify(SHCNE_UPDATEDIR)
+// that used to follow mutations made the shell synchronously re-enumerate the
+// directory and froze Explorer (delete / new-folder deadlocks). Auto-refresh
+// is deferred until that path is understood; manual refresh is the contract
+// for now. notifyPidl is retained in the signature for call-site stability
+// but is not used.
 static void AfterRemoteMutation(PIDLIST_ABSOLUTE notifyPidl)
 {
+    (void)notifyPidl;
     FtpCacheClear();
-    if (notifyPidl)
-    {
-        HANDLE h = CreateThread(NULL, 0, NotifyUpdateThread, ILCloneFull(notifyPidl), 0, NULL);
-        if (h) CloseHandle(h);
-    }
 }
 
 // WinSCP.com location for "script" custom commands: registry
