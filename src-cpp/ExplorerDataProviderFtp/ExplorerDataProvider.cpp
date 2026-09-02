@@ -695,7 +695,7 @@ HRESULT CFolderViewImplFolder::BindToObject(PCUIDLIST_RELATIVE pidl,
                                             IBindCtx *pbc, REFIID riid, void **ppv)
 {
     *ppv = NULL;
-    ProbeLog(L"[FTP-SAMPLE] BindToObject level=%d path='%s'", m_nLevel, m_szRemotePath);
+    // (hot-path probe removed 2026-09-02: fired per navigation, log IO froze Explorer)
     HRESULT hr = _ValidatePidl(pidl);
     if (SUCCEEDED(hr))
     {
@@ -1141,7 +1141,6 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
         common &= attrs;
     }
     *rgfInOut = common;
-    ProbeLog(L"[ATTR] cidl=%u requested=0x%X returned=0x%X", cidl, requested, common);
     return S_OK;
 }
 
