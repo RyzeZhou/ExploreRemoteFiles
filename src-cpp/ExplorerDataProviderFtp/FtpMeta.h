@@ -257,12 +257,18 @@ inline BOOL FtpBridgeList(PCWSTR site, PCWSTR path, std::string &text)
 // ("*" = all). Best effort: if the service is not running this is a no-op and
 // the caller simply falls back to spawning the CLI, which has no cache of its
 // own. Called from FtpCacheClear so every post-mutation refresh sees fresh data.
+//
+// IMPORTANT: the bridge handler always reads THREE request lines (operation,
+// site, path) before dispatching, so a third (empty) line must be sent — a
+// two-line request deadlocks (server waits for line 3, client waits for "OK").
 inline void FtpBridgeClearCache(PCWSTR site)
 {
     const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
     HANDLE pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (pipe == INVALID_HANDLE_VALUE) return;
-    if (FtpBridgeWriteLine(pipe, L"CACHE-CLEAR") && FtpBridgeWriteLine(pipe, (site && site[0]) ? site : L"*"))
+    if (FtpBridgeWriteLine(pipe, L"CACHE-CLEAR") &&
+        FtpBridgeWriteLine(pipe, (site && site[0]) ? site : L"*") &&
+        FtpBridgeWriteLine(pipe, L""))                       // required 3rd line
     {
         char buf[64]; DWORD got = 0;
         ReadFile(pipe, buf, sizeof(buf), &got, NULL);   // consume "OK"

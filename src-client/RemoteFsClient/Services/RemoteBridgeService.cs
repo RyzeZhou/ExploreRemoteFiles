@@ -48,20 +48,23 @@ public sealed class RemoteBridgeService : IDisposable
         using var reader = new StreamReader(stream, new UTF8Encoding(false), false, 4096, leaveOpen: true);
         await using var writer = new StreamWriter(stream, new UTF8Encoding(false), 4096, leaveOpen: true) { AutoFlush = true };
         string? operation = await reader.ReadLineAsync(token);
-        string? siteName = await reader.ReadLineAsync(token);
-        string? path = await reader.ReadLineAsync(token);
 
         // CACHE-CLEAR: the Explorer extension invalidates its own metadata
         // cache after a successful remote mutation and asks the bridge to drop
         // the matching listing cache too — otherwise a refresh right after an
         // operation would still serve the stale listing from here.
+        // Read only the site line (the 2-line form is the canonical one); do
+        // NOT wait for a 3rd line here — that would deadlock with the old DLL.
         if (string.Equals(operation, "CACHE-CLEAR", StringComparison.Ordinal))
         {
-            ClearListingCache(siteName);
+            string? site = await reader.ReadLineAsync(token);
+            ClearListingCache(site);
             await writer.WriteLineAsync("OK");
             return;
         }
 
+        string? siteName = await reader.ReadLineAsync(token);
+        string? path = await reader.ReadLineAsync(token);
         if (!string.Equals(operation, "LIST", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(siteName))
         {
             await writer.WriteLineAsync("FAIL: invalid bridge request");
