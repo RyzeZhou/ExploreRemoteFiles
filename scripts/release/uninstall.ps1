@@ -16,6 +16,10 @@ $explorerWasRunning = $null -ne (Get-Process -Name explorer -ErrorAction Silentl
 try {
 
 Write-Host "==> Removing ExplorerRemoteFs registration..."
+# Terminate the resident tray service first so its files are not locked
+# when the install dir is removed below.
+Stop-Process -Name RemoteFsClient -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
 Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
 

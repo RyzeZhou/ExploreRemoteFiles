@@ -9,6 +9,10 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $explorerWasRunning = $null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue)
 try {
+# The resident tray service keeps the CLI/GUI exes locked (named-pipe bridge
+# host); terminate it FIRST or file copies below fail with access denied.
+Stop-Process -Name RemoteFsClient -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
 Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
 
