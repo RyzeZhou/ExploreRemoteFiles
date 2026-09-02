@@ -254,25 +254,23 @@ inline BOOL FtpBridgeList(PCWSTR site, PCWSTR path, std::string &text)
 }
 
 // Tell the resident bridge service to drop its listing cache for one site
-// ("*" = all). Best effort: if the service is not running this is a no-op and
-// the caller simply falls back to spawning the CLI, which has no cache of its
-// own. Called from FtpCacheClear so every post-mutation refresh sees fresh data.
+// ("*" = all). Best effort and FIRE-AND-FORGET: if the service is not running
+// this is a no-op, and no reply is ever awaited — the bridge LIST cache TTL is
+// only 1s anyway, so a missed clear self-heals on the next refresh.
 //
-// IMPORTANT: the bridge handler always reads THREE request lines (operation,
-// site, path) before dispatching, so a third (empty) line must be sent — a
-// two-line request deadlocks (server waits for line 3, client waits for "OK").
+// This routine runs on the Explorer UI thread (menu commands). It MUST never
+// block on a server reply: any unexpected server-side stall would freeze
+// Explorer. Write the three request lines and close; the server consumes them
+// from its own instance and drops the cache entries.
 inline void FtpBridgeClearCache(PCWSTR site)
 {
     const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
     HANDLE pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (pipe == INVALID_HANDLE_VALUE) return;
-    if (FtpBridgeWriteLine(pipe, L"CACHE-CLEAR") &&
-        FtpBridgeWriteLine(pipe, (site && site[0]) ? site : L"*") &&
-        FtpBridgeWriteLine(pipe, L""))                       // required 3rd line
-    {
-        char buf[64]; DWORD got = 0;
-        ReadFile(pipe, buf, sizeof(buf), &got, NULL);   // consume "OK"
-    }
+    BOOL ok = FtpBridgeWriteLine(pipe, L"CACHE-CLEAR") &&
+              FtpBridgeWriteLine(pipe, (site && site[0]) ? site : L"*") &&
+              FtpBridgeWriteLine(pipe, L"");   // 3rd line: the server's reader expects three lines
+    ProbeLog(L"[BRIDGE] cache-clear site='%s' sent=%d", site ? site : L"*", ok);
     CloseHandle(pipe);
 }
 typedef struct
