@@ -50,6 +50,18 @@ public sealed class RemoteBridgeService : IDisposable
         string? operation = await reader.ReadLineAsync(token);
         string? siteName = await reader.ReadLineAsync(token);
         string? path = await reader.ReadLineAsync(token);
+
+        // CACHE-CLEAR: the Explorer extension invalidates its own metadata
+        // cache after a successful remote mutation and asks the bridge to drop
+        // the matching listing cache too — otherwise a refresh right after an
+        // operation would still serve the stale listing from here.
+        if (string.Equals(operation, "CACHE-CLEAR", StringComparison.Ordinal))
+        {
+            ClearListingCache(siteName);
+            await writer.WriteLineAsync("OK");
+            return;
+        }
+
         if (!string.Equals(operation, "LIST", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(siteName))
         {
             await writer.WriteLineAsync("FAIL: invalid bridge request");
@@ -69,9 +81,26 @@ public sealed class RemoteBridgeService : IDisposable
         }
     }
 
+    private void ClearListingCache(string? siteName)
+    {
+        lock (_listingCacheGate)
+        {
+            if (string.IsNullOrWhiteSpace(siteName) || siteName == "*")
+            {
+                _listingCache.Clear();
+                return;
+            }
+            var prefix = siteName.ToUpperInvariant() + "\0";
+            foreach (var key in _listingCache.Keys.Where(k => k.StartsWith(prefix, StringComparison.Ordinal)).ToArray())
+                _listingCache.Remove(key);
+        }
+    }
+
     // Explorer can ask for the same uncached directory concurrently while it
     // binds the target and prepares the new view. Share one backend list call
     // and keep the completed text briefly, so those requests finish together.
+    // TTL is short (1s): the extension owns correctness of refreshes; this
+    // cache exists only to coalesce concurrent binds of the SAME directory.
     private Task<string> GetListingAsync(string siteName, string remotePath)
     {
         var key = siteName.ToUpperInvariant() + "\0" + remotePath;
@@ -82,7 +111,7 @@ public sealed class RemoteBridgeService : IDisposable
                 return existing.Response;
 
             var task = BuildListingAsync(siteName, remotePath);
-            _listingCache[key] = new CachedListing(now.AddSeconds(30), task);
+            _listingCache[key] = new CachedListing(now.AddSeconds(1), task);
             foreach (var expired in _listingCache.Where(p => p.Value.ExpiresAt <= now).Select(p => p.Key).ToArray())
                 _listingCache.Remove(expired);
             return task;

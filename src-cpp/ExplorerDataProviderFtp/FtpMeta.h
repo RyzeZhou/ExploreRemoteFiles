@@ -252,6 +252,23 @@ inline BOOL FtpBridgeList(PCWSTR site, PCWSTR path, std::string &text)
     ProbeLog(L"[BRIDGE] site='%s' path='%s' sent=%d complete=%d bytes=%u elapsed=%llu", site, path ? path : L"/", sent, complete, (UINT)text.size(), GetTickCount64() - started);
     return sent && complete;
 }
+
+// Tell the resident bridge service to drop its listing cache for one site
+// ("*" = all). Best effort: if the service is not running this is a no-op and
+// the caller simply falls back to spawning the CLI, which has no cache of its
+// own. Called from FtpCacheClear so every post-mutation refresh sees fresh data.
+inline void FtpBridgeClearCache(PCWSTR site)
+{
+    const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
+    HANDLE pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (pipe == INVALID_HANDLE_VALUE) return;
+    if (FtpBridgeWriteLine(pipe, L"CACHE-CLEAR") && FtpBridgeWriteLine(pipe, (site && site[0]) ? site : L"*"))
+    {
+        char buf[64]; DWORD got = 0;
+        ReadFile(pipe, buf, sizeof(buf), &got, NULL);   // consume "OK"
+    }
+    CloseHandle(pipe);
+}
 typedef struct
 {
     DWORD   dwMode;
@@ -338,6 +355,9 @@ inline void FtpCacheClear()
 {
     AcquireSRWLockExclusive(&FtpCacheLock()); FtpCacheEntries().clear(); ReleaseSRWLockExclusive(&FtpCacheLock());
     FtpDiskCacheClear();
+    // The resident bridge service keeps its own listing cache; drop it too or
+    // the next enumeration after a mutation would still be served stale data.
+    FtpBridgeClearCache(L"*");
 }
 
 // Returns count of cached entries for site+path (0 = miss/expired).
