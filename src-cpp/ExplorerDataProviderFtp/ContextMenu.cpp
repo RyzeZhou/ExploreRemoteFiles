@@ -151,10 +151,25 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
 // invalidate the metadata cache, then ask the affected view to re-enumerate.
 // P0-4 fix: clearing the cache alone never makes an existing DefView redraw;
 // SHCNE_UPDATEDIR on the folder PIDL does.
+// Post-mutation refresh runs on the Explorer UI thread (menu InvokeCommand).
+// SHChangeNotify(SHCNE_UPDATEDIR) can make the shell synchronously poke every
+// view, which re-enumerates the directory on our own data path — a stall there
+// would freeze Explorer. Fire the notification on a background thread instead;
+// the pidl is cloned so the UI thread can release its copy immediately.
+static DWORD WINAPI NotifyUpdateThread(LPVOID p)
+{
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)p, NULL);
+    ILFree((PIDLIST_ABSOLUTE)p);
+    return 0;
+}
 static void AfterRemoteMutation(PIDLIST_ABSOLUTE notifyPidl)
 {
     FtpCacheClear();
-    if (notifyPidl) SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, notifyPidl, NULL);
+    if (notifyPidl)
+    {
+        HANDLE h = CreateThread(NULL, 0, NotifyUpdateThread, ILCloneFull(notifyPidl), 0, NULL);
+        if (h) CloseHandle(h);
+    }
 }
 
 // WinSCP.com location for "script" custom commands: registry
