@@ -95,6 +95,14 @@ Set-ItemProperty "$hk\CLSID\$props\InprocServer32" -Name ThreadingModel -Value '
 New-Item -Path "$hk\RemoteFsMicrosoftCoreType\shellex\PropertySheetHandlers\$props" -Force | Out-Null
 Set-ItemProperty "$hk\RemoteFsMicrosoftCoreType\shellex\PropertySheetHandlers\$props" -Name '(default)' -Value $props
 
+# --- shell\open verb: native double-click / Enter / top-bar Open ---
+# The shell resolves the default verb on our item type via IQueryAssociations;
+# without a verb, double-clicking a remote file does nothing. The command
+# receives the FORPARSING name ("<site>:/<path>") as %1.
+$openCmd = '"' + (Join-Path $InstallDir 'cli\ExplorerRemoteFs.Cli.exe') + '" open "%1"'
+New-Item -Path "$hk\RemoteFsMicrosoftCoreType\shell\open\command" -Force | Out-Null
+Set-ItemProperty "$hk\RemoteFsMicrosoftCoreType\shell\open\command" -Name '(default)' -Value $openCmd
+
 
 
 # Start the per-user resident control center and its reusable Provider connection pool.

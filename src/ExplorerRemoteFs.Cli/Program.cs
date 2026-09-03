@@ -53,6 +53,9 @@ switch (argv[0].ToLowerInvariant())
     case "get":
         CmdGet(argv);
         break;
+    case "open":
+        CmdOpen(argv);
+        break;
     case "dup":
         CmdDup(argv);
         break;
@@ -331,6 +334,48 @@ static void CmdGet(string[] args)
         var fs = ProviderFactory.Get(conn);
         fs.Download(args[2], args[3]);
         Console.WriteLine($"GET: {args[2]} -> {args[3]}");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+static void CmdOpen(string[] args)
+{
+    // Invoked by the shell's registered "open" verb on our remote items:
+    //   ExplorerRemoteFs.Cli.exe open "WSL:/home/zhou/doc.txt"
+    // (spec is the FORPARSING display name, i.e. site: + remote path).
+    // Downloads the file to a temp cache and opens it with the default
+    // association — this powers double-click / Enter / the top "Open" bar
+    // button, which resolve the default verb through IQueryAssociations.
+    if (args.Length < 2) { PrintUsage(); return; }
+    string spec = args[1];
+    int colon = spec.IndexOf(':');
+    if (colon <= 0)
+    {
+        Console.Error.WriteLine($"FAIL: cannot parse remote spec '{spec}' (expected site:/path)");
+        Environment.Exit(2);
+        return;
+    }
+    var conn = Find(spec[..colon]);
+    string remotePath = spec[(colon + 1)..];
+    if (remotePath.Length == 0) remotePath = "/";
+    try
+    {
+        string name = remotePath;
+        int slash = name.LastIndexOf('/');
+        if (slash >= 0) name = name[(slash + 1)..];
+        string local = Path.Combine(Path.GetTempPath(),
+            "rfs-open-" + Guid.NewGuid().ToString("N").Substring(0, 6) + "-" + name);
+        try { if (File.Exists(local)) File.Delete(local); } catch { }
+        var fs = ProviderFactory.Get(conn);
+        fs.Download(remotePath, local);
+        var psi = new System.Diagnostics.ProcessStartInfo(local) { UseShellExecute = true };
+        System.Diagnostics.Process.Start(psi);
+        Console.WriteLine($"OPEN: {remotePath} -> {local}");
     }
     catch (Exception ex)
     {
