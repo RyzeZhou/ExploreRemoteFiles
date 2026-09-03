@@ -212,22 +212,25 @@ static int RunFtpOperation(PCWSTR site, PCWSTR verb, PCWSTR path1, PCWSTR path2)
 static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
 {
     if (!name || !name[0]) return FALSE;
-    ProbeLog(L"[META] GetItemMeta site='%s' path='%s' name='%s'", site ? site : L"", path ? path : L"", name);
-    std::vector<FTPENTRY> items;
-    if (!FtpListCachedAll(site, path ? path : L"/", items)) return FALSE;
-    for (auto const &item : items)
+    PCWSTR full = (path && path[0]) ? path : L"/";
+    FTPENTRY found;
+    // Fast path: lock-shared single-item lookup, NO full-listing copy. This
+    // runs per rendered item (icon + each Details cell), so O(n) copy per
+    // query would make large directories unusable (2026-09-04).
+    if (!FtpCacheFindOne(site, full, name, &found))
     {
-        if (0 != StrCmp(item.szName, name)) continue;
-        ZeroMemory(out, sizeof(*out));
-        out->dwMode = item.dwMode; out->dwMtime = item.dwMtime; out->dwSize = item.dwSize;
-        out->dwUid = item.dwUid; out->dwGid = item.dwGid;
-        out->fIsFolder = item.fIsFolder; out->fIsSymlink = item.fIsSymlink;
-        StringCchCopy(out->szOwner, ARRAYSIZE(out->szOwner), item.szOwner);
-        StringCchCopy(out->szGroup, ARRAYSIZE(out->szGroup), item.szGroup);
-        StringCchCopy(out->szName, ARRAYSIZE(out->szName), item.szName);
-        return TRUE;
+        std::vector<FTPENTRY> items;
+        if (!FtpListCachedAll(site, full, items)) return FALSE;   // disk/network fill
+        if (!FtpCacheFindOne(site, full, name, &found)) return FALSE;
     }
-    return FALSE;
+    ZeroMemory(out, sizeof(*out));
+    out->dwMode = found.dwMode; out->dwMtime = found.dwMtime; out->dwSize = found.dwSize;
+    out->dwUid = found.dwUid; out->dwGid = found.dwGid;
+    out->fIsFolder = found.fIsFolder; out->fIsSymlink = found.fIsSymlink;
+    StringCchCopy(out->szOwner, ARRAYSIZE(out->szOwner), found.szOwner);
+    StringCchCopy(out->szGroup, ARRAYSIZE(out->szGroup), found.szGroup);
+    StringCchCopy(out->szName, ARRAYSIZE(out->szName), found.szName);
+    return TRUE;
 }
 // ---- server-style addressing helpers (used by GetDisplayNameOf and
 // GetUIObjectOf's IPropertyStore branch, so defined before both) ------------

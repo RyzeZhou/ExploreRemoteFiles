@@ -499,6 +499,34 @@ inline void FtpCachePatchRename(PCWSTR site, PCWSTR folder, PCWSTR oldName, PCWS
     ReleaseSRWLockExclusive(&FtpCacheLock());
 }
 
+// Single-item lookup from the in-memory cache WITHOUT copying the whole
+// listing. Large-directory performance: Explorer queries metadata for every
+// item (icon, each Details cell, properties), so copying the full vector per
+// query would be O(n) per query -> O(n^2) rendering. Returns TRUE on a hit;
+// FALSE when the directory is not cached (caller populates then retries).
+inline BOOL FtpCacheFindOne(PCWSTR site, PCWSTR folder, PCWSTR name, FTPENTRY *out)
+{
+    if (!site || !site[0] || !name || !name[0] || !out) return FALSE;
+    PCWSTR key = (folder && folder[0]) ? folder : L"/";
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockShared(&FtpCacheLock());
+    for (auto const &e : FtpCacheEntries())
+        if (0 == StrCmp(e.site, site) && 0 == StrCmp(e.path, key))
+        {
+            if (now - e.tick < 3000)
+                for (auto const &it : e.items)
+                    if (0 == StrCmp(it.szName, name))
+                    {
+                        *out = it;
+                        ReleaseSRWLockShared(&FtpCacheLock());
+                        return TRUE;
+                    }
+            break;
+        }
+    ReleaseSRWLockShared(&FtpCacheLock());
+    return FALSE;
+}
+
 // Immediate view notify (background). The patched cache entry already exists,
 // so the re-enumeration shows the change at once (no network involved).
 inline void FtpNotifyUpdateDir(PIDLIST_ABSOLUTE notifyPidl)
