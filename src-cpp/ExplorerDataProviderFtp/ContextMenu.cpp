@@ -161,7 +161,9 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
 static void AfterRemoteMutation(PIDLIST_ABSOLUTE notifyPidl)
 {
     (void)notifyPidl;
+    ProbeLog(L"[MUT] AfterRemoteMutation enter (UI thread)");
     FtpCacheClear();
+    ProbeLog(L"[MUT] AfterRemoteMutation cache cleared, returning");
 }
 
 // WinSCP.com location for "script" custom commands: registry
@@ -1089,7 +1091,9 @@ public:
                 WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full));
                 if(RunCli(sel.site,L"delete",full,NULL,NULL)!=0) ok=FALSE;
             }
+            ProbeLog(L"[MUT] delete loop done, ok=%d -> AfterRemoteMutation", ok);
             AfterRemoteMutation(sel.notify);
+            ProbeLog(L"[MUT] delete case: mutation done, about to return");
             if(!ok) MessageBoxW(ci->hwnd,ExplorerText(L"error.some_deletes_failed",L"部分项目删除失败。",L"Some items could not be deleted."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
         }
         break;
@@ -1118,6 +1122,7 @@ public:
     return E_NOTIMPL;
  }
  HRESULT Initialize(PCIDLIST_ABSOLUTE pidlFolder,IDataObject*d,HKEY){
+    ProbeLog(L"[MENU] CMenu::Initialize pidlFolder=%p data=%p", pidlFolder, d);
     if(data)data->Release();data=d;if(data)data->AddRef();
     if(m_pidlFolder)ILFree(m_pidlFolder);
     m_pidlFolder=pidlFolder?ILCloneFull(pidlFolder):NULL;

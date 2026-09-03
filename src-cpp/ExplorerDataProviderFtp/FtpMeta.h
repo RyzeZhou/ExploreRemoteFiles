@@ -243,8 +243,26 @@ inline BOOL FtpBridgeList(PCWSTR site, PCWSTR path, std::string &text)
                 FtpBridgeWriteLine(pipe, (path && path[0]) ? path : L"/");
     if (sent)
     {
+        // Bounded read: a synchronous ReadFile here has NO timeout, so a stalled
+        // server would hang the enumerating thread forever (Explorer freeze seen
+        // after mutations). Poll with PeekNamedPipe and give up after 8s; the
+        // caller then falls back to the CLI path, which has its own timeout.
         char buf[4096]; DWORD got = 0;
-        while (ReadFile(pipe, buf, sizeof(buf), &got, NULL) && got) text.append(buf, got);
+        const ULONGLONG deadline = GetTickCount64() + 8000;
+        while (GetTickCount64() < deadline)
+        {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) break;   // server closed
+            if (avail > 0)
+            {
+                if (!ReadFile(pipe, buf, sizeof(buf), &got, NULL) || got == 0) break;
+                text.append(buf, got);
+                if (text.find("BRIDGE-END") != std::string::npos ||
+                    text.rfind("FAIL:", 0) == 0) break;
+            }
+            else Sleep(25);
+        }
+        ProbeLog(L"[BRIDGE] read done sent=%d bytes=%u (deadline)", sent, (UINT)text.size());
     }
     CloseHandle(pipe);
     BOOL complete = text.find("BRIDGE-END\r\n") != std::string::npos ||
@@ -357,11 +375,17 @@ inline void FtpDiskCacheClear()
 }
 inline void FtpCacheClear()
 {
+    ProbeLog(L"[CACHE] clear: mem lock enter");
     AcquireSRWLockExclusive(&FtpCacheLock()); FtpCacheEntries().clear(); ReleaseSRWLockExclusive(&FtpCacheLock());
+    ProbeLog(L"[CACHE] clear: mem done");
     FtpDiskCacheClear();
-    // The resident bridge service keeps its own listing cache; drop it too or
-    // the next enumeration after a mutation would still be served stale data.
-    FtpBridgeClearCache(L"*");
+    ProbeLog(L"[CACHE] clear: disk done");
+    // NOTE (2026-09-03): FtpBridgeClearCache() was REMOVED from this path. A
+    // synchronous pipe call here proved to be the Explorer freeze: when the
+    // resident bridge is busy/stalled, CreateFile/WriteFile on the named pipe
+    // blocks the UI thread forever (seen in logs: 'disk done' logged, 'bridge
+    // done' never). The bridge LIST cache TTL is only 1s, so a missed clear
+    // self-heals on the next refresh; freshness is not worth a hang.
 }
 
 // Returns count of cached entries for site+path (0 = miss/expired).

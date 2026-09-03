@@ -212,6 +212,7 @@ static int RunFtpOperation(PCWSTR site, PCWSTR verb, PCWSTR path1, PCWSTR path2)
 static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
 {
     if (!name || !name[0]) return FALSE;
+    ProbeLog(L"[META] GetItemMeta site='%s' path='%s' name='%s'", site ? site : L"", path ? path : L"", name);
     std::vector<FTPENTRY> items;
     if (!FtpListCachedAll(site, path ? path : L"/", items)) return FALSE;
     for (auto const &item : items)
@@ -1158,11 +1159,13 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
 
     if (riid == IID_IContextMenu)
     {
-        // The default context menu will call back for IQueryAssociations to determine the
-        // file associations with which to populate the menu.
+        // Probe (2026-09-02 freeze hunt): does the hang sit inside
+        // SHCreateDefaultContextMenu or after it?
+        ProbeLog(L"[MENU] GetUIObjectOf IContextMenu cidl=%u level=%d enter", cidl, m_nLevel);
         DEFCONTEXTMENU const dcm = { hwnd, NULL, m_pidl, static_cast<IShellFolder2 *>(this),
                                cidl, apidl, NULL, 0, NULL };
         hr = SHCreateDefaultContextMenu(&dcm, riid, ppv);
+        ProbeLog(L"[MENU] GetUIObjectOf IContextMenu exit hr=0x%08X", hr);
     }
     else if (riid == IID_IExtractIconW)
     {
@@ -1268,6 +1271,7 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
 //  Retrieves the display name for the specified file object or subfolder.
 HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shgdnFlags, STRRET *pName)
 {
+    ProbeLog(L"[NAME] GetDisplayNameOf flags=0x%X", shgdnFlags);
     HRESULT hr = S_OK;
     if (shgdnFlags & SHGDN_FORPARSING)
     {
@@ -2064,6 +2068,7 @@ HRESULT CFolderViewImplEnumIDList::Initialize()
 // by the number of items retrieved.
 HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG *pceltFetched)
 {
+    ProbeLog(L"[ENUM] Next celt=%u", celt);
     ULONG celtFetched = 0;
 
     HRESULT hr = (pceltFetched || celt <= 1) ? S_OK : E_INVALIDARG;
