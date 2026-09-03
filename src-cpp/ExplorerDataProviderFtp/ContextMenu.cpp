@@ -151,19 +151,25 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
 // UI thread only queues work (never touches cache/network/pipe); the worker
 // prefetches the fresh listing into the cache and only then notifies the view,
 // so the re-enumeration can never land on an empty cache (WinSCP-style).
-static void AfterRemoteMutation(PIDLIST_ABSOLUTE notifyPidl)
+//
+// site+folder are the FULL remote path of the VIEWED directory, passed in
+// explicitly by the caller (it already has them) — NEVER re-derived from the
+// PIDL here, because PIDL paths lack the site StartPath and a prefetch would
+// then LIST a non-existent path (see 53e6639 / 9aa5535 regression chain).
+static void AfterRemoteMutation(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
 {
     if (!notifyPidl) { FtpCacheClear(); return; }
-    WCHAR site[64] = {}, folder[512] = {};
-    PidlSite(notifyPidl, site, ARRAYSIZE(site));
-    PidlPath(notifyPidl, folder, ARRAYSIZE(folder));
-    // PidlPath yields the path WITHOUT the site's StartPath (the pidl subtree
-    // begins after the site root), while enumerations/listings use the FULL
-    // path (StartPath + relative). Without this the prefetch LISTed a
-    // non-existent path, got FAIL, cached nothing, and the view went empty.
-    ApplySiteStartPath(site, folder, ARRAYSIZE(folder));
-    ProbeLog(L"[MUT] AfterRemoteMutation queue site='%s' path='%s'", site, folder);
+    ProbeLog(L"[MUT] AfterRemoteMutation queue site='%s' path='%s'", site ? site : L"", folder ? folder : L"/");
     FtpRefreshDirBackground(site, folder, notifyPidl);
+}
+
+// View directory for a property-page mutation = parent of the mutated path.
+static void PathParent(PCWSTR full, PWSTR out, UINT cch)
+{
+    StringCchCopy(out, cch, (full && full[0]) ? full : L"/");
+    WCHAR *slash = wcsrchr(out, L'/');
+    if (slash && slash != out) *slash = 0;
+    else if (slash == out) out[1] = 0;
 }
 
 // WinSCP.com location for "script" custom commands: registry
@@ -362,7 +368,8 @@ static void PermApplyChown(HWND hDlg, PROPMETA *pm)
         MessageBoxW(hDlg, ExplorerText(L"error.owner_group_rejected", L"SFTP 服务器拒绝了所有者/组更新。", L"Owner/group update was rejected by the SFTP server."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
     else
     {
-        AfterRemoteMutation(pm->notify);
+        WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
+        AfterRemoteMutation(pm->site, parentDir, pm->notify);
     }
 }
 
@@ -439,7 +446,8 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
                 if(mode != pm->meta.bits || recursive){
                     WCHAR modeStr[8]; StringCchPrintf(modeStr,ARRAYSIZE(modeStr),L"%03o",mode);
                     if(RunCli(pm->site, recursive?L"chmodr":L"chmod", pm->path, modeStr, NULL)==0){
-                        AfterRemoteMutation(pm->notify);
+                        WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
+                        AfterRemoteMutation(pm->site, parentDir, pm->notify);
                     } else MessageBoxW(hDlg, ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
                 }
                 PermApplyChown(hDlg,pm);
@@ -833,7 +841,7 @@ static void ServerCopy(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int
         DeleteFileW(local);
     }
     if (!ok) MessageBoxW(hwnd, ExplorerText(L"error.copy_failed", L"部分项目复制失败。跨站点和本地复制目前仅支持文件。", L"Some items could not be copied. Cross-site and local copies currently support files only."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
-    else AfterRemoteMutation(notifyPidl);
+    else AfterRemoteMutation(site, folder, notifyPidl);
 }
 static void ServerMove(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count, PIDLIST_ABSOLUTE notifyPidl)
 {
@@ -853,7 +861,7 @@ static void ServerMove(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int
         if(RunCli(site,L"rename",src,target,NULL)!=0) ok=FALSE;
     }
     if(!ok) MessageBoxW(hwnd,ExplorerText(L"error.move_failed",L"移动失败。",L"Move failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-    else AfterRemoteMutation(notifyPidl);
+    else AfterRemoteMutation(site, folder, notifyPidl);
 }
 static void DoRename(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, PIDLIST_ABSOLUTE notifyPidl)
 {
@@ -862,7 +870,7 @@ static void DoRename(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, PIDLIST
     if(0==StrCmp(newName,name)) return;
     WCHAR src[700],dst[700]; JoinPath(folder,name,src,ARRAYSIZE(src)); JoinPath(folder,newName,dst,ARRAYSIZE(dst));
     if(RunCli(site,L"rename",src,dst,NULL)!=0) MessageBoxW(hwnd,ExplorerText(L"error.rename_failed",L"重命名失败。",L"Rename failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-    else AfterRemoteMutation(notifyPidl);
+    else AfterRemoteMutation(site, folder, notifyPidl);
 }
 
 // ---- custom commands ---------------------------------------------------------
@@ -947,7 +955,7 @@ static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOL
     WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
     if (RunCli(site, L"mkdir", full, NULL, NULL) != 0)
         MessageBoxW(hwnd, ExplorerText(L"error.create_folder_failed", L"创建文件夹失败。", L"Failed to create folder."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
-    else AfterRemoteMutation(notifyPidl);
+    else AfterRemoteMutation(site, folder, notifyPidl);
 }
 
 // Core upload path — the ONE implementation behind the background-menu paste,
@@ -965,7 +973,7 @@ static void PasteHdropToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, HDROP hdro
         WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
         if (RunCli(site, L"put", local, full, NULL) != 0) ok = FALSE;
     }
-    AfterRemoteMutation(notifyPidl);
+    AfterRemoteMutation(site, folder, notifyPidl);
     if (!ok) MessageBoxW(hwnd, ExplorerText(L"error.some_uploads_failed", L"部分文件上传失败。", L"Some files could not be uploaded."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
 }
 
@@ -1092,7 +1100,7 @@ public:
                 if(RunCli(sel.site,L"delete",full,NULL,NULL)!=0) ok=FALSE;
             }
             ProbeLog(L"[MUT] delete loop done, ok=%d -> AfterRemoteMutation", ok);
-            AfterRemoteMutation(sel.notify);
+            AfterRemoteMutation(sel.site, sel.folder, sel.notify);
             ProbeLog(L"[MUT] delete case: mutation done, about to return");
             if(!ok) MessageBoxW(ci->hwnd,ExplorerText(L"error.some_deletes_failed",L"部分项目删除失败。",L"Some items could not be deleted."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
         }
@@ -1220,7 +1228,8 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     WCHAR modeStr[8]; StringCchPrintf(modeStr,ARRAYSIZE(modeStr),L"%03o",mode);
                     if (RunCli(pm->site, recursive?L"chmodr":L"chmod", pm->path, modeStr, NULL)==0)
                     {
-                        AfterRemoteMutation(pm->notify);
+                        WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
+                        AfterRemoteMutation(pm->site, parentDir, pm->notify);
                     }
                     else MessageBoxW(hDlg, ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
                 }
