@@ -388,24 +388,52 @@ inline void FtpCacheClear()
     // self-heals on the next refresh; freshness is not worth a hang.
 }
 
-// Ask the shell to re-enumerate a folder whose contents changed (auto-refresh
-// after a successful mutation). Runs OFF the caller's thread: SHChangeNotify
-// can make the shell synchronously poke every view, and our own data path may
-// be re-entered there. The pidl is cloned; the UI thread never blocks here.
-inline void FtpNotifyUpdateDir(PIDLIST_ABSOLUTE notifyPidl)
+// Post-mutation refresh, WinSCP-style (2026-09-03): PREFETCH the fresh listing
+// into the metadata cache on a worker thread FIRST, then ask the shell to
+// re-enumerate. A "clear cache then notify" ordering lets the view re-enumerate
+// into an empty cache and can show an empty listing; prefetching guarantees the
+// re-enumeration hits a ready cache and always shows the new state.
+// Runs entirely off the caller's thread (cache clear + network fetch + notify).
+inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out);   // fwd (defined below)
+struct FtpRefreshCtx
 {
-    if (!notifyPidl) return;
-    struct Runner
+    WCHAR site[64];
+    WCHAR folder[600];
+    PIDLIST_ABSOLUTE pidl;
+};
+static DWORD WINAPI FtpRefreshThreadProc(LPVOID p)
+{
+    FtpRefreshCtx *c = static_cast<FtpRefreshCtx *>(p);
+    FtpCacheClear();
+    if (c->site[0] && c->folder[0])
     {
-        static DWORD WINAPI Run(LPVOID p)
-        {
-            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)p, NULL);
-            ILFree((PIDLIST_ABSOLUTE)p);
-            return 0;
-        }
-    };
-    HANDLE h = CreateThread(NULL, 0, Runner::Run, ILCloneFull(notifyPidl), 0, NULL);
+        std::vector<FTPENTRY> warm;
+        FtpListCachedAll(c->site, c->folder, warm);   // real fetch -> fills the cache
+        ProbeLog(L"[MUT] prefetch site='%s' path='%s' n=%u", c->site, c->folder, (UINT)warm.size());
+    }
+    if (c->pidl)
+    {
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)c->pidl, NULL);
+        ILFree(c->pidl);
+    }
+    delete c;
+    return 0;
+}
+inline void FtpRefreshDirBackground(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
+{
+    FtpRefreshCtx *c = new (std::nothrow) FtpRefreshCtx{};
+    if (!c) { FtpCacheClear(); return; }
+    StringCchCopy(c->site, ARRAYSIZE(c->site), site ? site : L"");
+    StringCchCopy(c->folder, ARRAYSIZE(c->folder), (folder && folder[0]) ? folder : L"/");
+    c->pidl = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    HANDLE h = CreateThread(NULL, 0, FtpRefreshThreadProc, c, 0, NULL);
     if (h) CloseHandle(h);
+    else
+    {
+        if (c->pidl) ILFree(c->pidl);
+        delete c;
+        FtpCacheClear();
+    }
 }
 
 // Returns count of cached entries for site+path (0 = miss/expired).

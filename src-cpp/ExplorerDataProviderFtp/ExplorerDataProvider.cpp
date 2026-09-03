@@ -1385,11 +1385,9 @@ HRESULT CFolderViewImplFolder::SetNameOf(HWND hwnd, PCUITEMID_CHILD pidl,
     BOOL folder = FALSE; int size = 0;
     _GetFolderness(pidl, &folder); _GetSize(pidl, &size);
     if (ppidlOut) hr = CreateChildID(pszName, m_nLevel + 1, size > 0 ? size : 1, 3, folder, ppidlOut);
-    FtpCacheClear();
-    // Auto-refresh via the background notifier (safe: FtpCacheClear no longer
-    // touches the bridge synchronously; the notification itself runs off the
-    // UI thread).
-    FtpNotifyUpdateDir(m_pidl);
+    // WinSCP-style refresh: worker prefetches the renamed directory into the
+    // cache, then notifies the view — the re-enumeration hits a ready cache.
+    FtpRefreshDirBackground(m_szSiteName, m_szRemotePath, m_pidl);
     return SUCCEEDED(hr) ? S_OK : hr;
 }
 
