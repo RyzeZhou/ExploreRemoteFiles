@@ -157,6 +157,11 @@ static void AfterRemoteMutation(PIDLIST_ABSOLUTE notifyPidl)
     WCHAR site[64] = {}, folder[512] = {};
     PidlSite(notifyPidl, site, ARRAYSIZE(site));
     PidlPath(notifyPidl, folder, ARRAYSIZE(folder));
+    // PidlPath yields the path WITHOUT the site's StartPath (the pidl subtree
+    // begins after the site root), while enumerations/listings use the FULL
+    // path (StartPath + relative). Without this the prefetch LISTed a
+    // non-existent path, got FAIL, cached nothing, and the view went empty.
+    ApplySiteStartPath(site, folder, ARRAYSIZE(folder));
     ProbeLog(L"[MUT] AfterRemoteMutation queue site='%s' path='%s'", site, folder);
     FtpRefreshDirBackground(site, folder, notifyPidl);
 }
