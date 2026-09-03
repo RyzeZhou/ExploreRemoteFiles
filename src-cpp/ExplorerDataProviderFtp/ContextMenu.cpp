@@ -163,6 +163,17 @@ static void AfterRemoteMutation(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE not
     FtpRefreshDirBackground(site, folder, notifyPidl);
 }
 
+// Fast optimistic path for high-frequency mutations (new folder / paste /
+// delete / rename): the caller already patched the cache via FtpCachePatch*;
+// notify the view immediately (it hits the patched entry — no network) and
+// quietly prefetch the real listing in the background to correct metadata.
+static void RefreshLocalFast(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE pidl)
+{
+    ProbeLog(L"[MUT] optimistic refresh site='%s' path='%s'", site ? site : L"", folder ? folder : L"/");
+    FtpNotifyUpdateDir(pidl);
+    FtpPrefetchQuiet(site, folder);
+}
+
 // View directory for a property-page mutation = parent of the mutated path.
 static void PathParent(PCWSTR full, PWSTR out, UINT cch)
 {
@@ -870,7 +881,11 @@ static void DoRename(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, PIDLIST
     if(0==StrCmp(newName,name)) return;
     WCHAR src[700],dst[700]; JoinPath(folder,name,src,ARRAYSIZE(src)); JoinPath(folder,newName,dst,ARRAYSIZE(dst));
     if(RunCli(site,L"rename",src,dst,NULL)!=0) MessageBoxW(hwnd,ExplorerText(L"error.rename_failed",L"重命名失败。",L"Rename failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-    else AfterRemoteMutation(site, folder, notifyPidl);
+    else
+    {
+        FtpCachePatchRename(site, folder, name, newName);   // optimistic
+        RefreshLocalFast(site, folder, notifyPidl);
+    }
 }
 
 // ---- custom commands ---------------------------------------------------------
@@ -955,7 +970,11 @@ static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOL
     WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
     if (RunCli(site, L"mkdir", full, NULL, NULL) != 0)
         MessageBoxW(hwnd, ExplorerText(L"error.create_folder_failed", L"创建文件夹失败。", L"Failed to create folder."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
-    else AfterRemoteMutation(site, folder, notifyPidl);
+    else
+    {
+        FtpCachePatchAdd(site, folder, name, TRUE, 0);   // optimistic: show instantly
+        RefreshLocalFast(site, folder, notifyPidl);
+    }
 }
 
 // Core upload path — the ONE implementation behind the background-menu paste,
@@ -972,8 +991,16 @@ static void PasteHdropToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, HDROP hdro
         StringCchCopy(name, MAX_PATH, PathFindFileNameW(local));
         WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
         if (RunCli(site, L"put", local, full, NULL) != 0) ok = FALSE;
+        else
+        {
+            ULONGLONG sz = 0;
+            WIN32_FILE_ATTRIBUTE_DATA fa = {};
+            if (GetFileAttributesExW(local, GetFileExInfoStandard, &fa))
+                sz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            FtpCachePatchAdd(site, folder, name, FALSE, sz);   // optimistic
+        }
     }
-    AfterRemoteMutation(site, folder, notifyPidl);
+    RefreshLocalFast(site, folder, notifyPidl);
     if (!ok) MessageBoxW(hwnd, ExplorerText(L"error.some_uploads_failed", L"部分文件上传失败。", L"Some files could not be uploaded."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
 }
 
@@ -1098,9 +1125,10 @@ public:
             for(int k=0;k<sel.count;k++){
                 WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full));
                 if(RunCli(sel.site,L"delete",full,NULL,NULL)!=0) ok=FALSE;
+                else FtpCachePatchRemove(sel.site, sel.folder, sel.names[k]);   // optimistic
             }
-            ProbeLog(L"[MUT] delete loop done, ok=%d -> AfterRemoteMutation", ok);
-            AfterRemoteMutation(sel.site, sel.folder, sel.notify);
+            ProbeLog(L"[MUT] delete loop done, ok=%d", ok);
+            RefreshLocalFast(sel.site, sel.folder, sel.notify);
             ProbeLog(L"[MUT] delete case: mutation done, about to return");
             if(!ok) MessageBoxW(ci->hwnd,ExplorerText(L"error.some_deletes_failed",L"部分项目删除失败。",L"Some items could not be deleted."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
         }

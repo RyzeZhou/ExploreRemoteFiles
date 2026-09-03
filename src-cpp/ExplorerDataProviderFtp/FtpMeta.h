@@ -11,6 +11,7 @@
 #include <wctype.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include "ProbeLog.h"
 
 // Display language for strings created directly by the Explorer extension.
@@ -434,6 +435,113 @@ inline void FtpRefreshDirBackground(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE
         delete c;
         FtpCacheClear();
     }
+}
+
+// ---- optimistic in-memory patch of the cached listing (fast refresh) --------
+// FTP answers a successful MKD/DELE/RNFR/STOR with success only (no metadata
+// for the new item), but "success" is enough to patch the VIEWED directory's
+// cache entry in place (remove/add/rename an item) so the immediate notify
+// shows the change with zero network latency. A quiet background prefetch
+// (FtpPrefetchQuiet) then REPLACES the cache with the real listing (accurate
+// metadata) for later enumerations — FtpCacheStore already replaces the key.
+inline void FtpCachePatchRemove(PCWSTR site, PCWSTR folder, PCWSTR name)
+{
+    if (!site || !site[0] || !folder || !name) return;
+    AcquireSRWLockExclusive(&FtpCacheLock());
+    for (auto &e : FtpCacheEntries())
+        if (0 == StrCmp(e.site, site) && 0 == StrCmp(e.path, folder))
+        {
+            e.tick = GetTickCount64();
+            e.items.erase(std::remove_if(e.items.begin(), e.items.end(),
+                [&](FTPENTRY const &it) { return 0 == StrCmp(it.szName, name); }), e.items.end());
+            break;
+        }
+    ReleaseSRWLockExclusive(&FtpCacheLock());
+}
+inline void FtpCachePatchAdd(PCWSTR site, PCWSTR folder, PCWSTR name, BOOL isFolder, ULONGLONG size)
+{
+    if (!site || !site[0] || !folder || !name) return;
+    AcquireSRWLockExclusive(&FtpCacheLock());
+    for (auto &e : FtpCacheEntries())
+        if (0 == StrCmp(e.site, site) && 0 == StrCmp(e.path, folder))
+        {
+            bool exists = false;
+            for (auto &it : e.items) if (0 == StrCmp(it.szName, name)) { exists = true; break; }
+            if (!exists)
+            {
+                e.tick = GetTickCount64();
+                FTPENTRY it = {};
+                it.fIsFolder = isFolder;
+                it.fIsSymlink = FALSE;
+                it.dwSize = size;
+                it.dwMtime = (DWORD)(GetTickCount64() / 1000);   // crude; corrected by quiet prefetch
+                it.dwMode = isFolder ? 0x1FF : 0x1A4;             // 0777 / 0644 guess
+                it.dwUid = it.dwGid = 0xFFFFFFFF;
+                StringCchCopy(it.szName, ARRAYSIZE(it.szName), name);
+                e.items.push_back(it);
+            }
+            break;
+        }
+    ReleaseSRWLockExclusive(&FtpCacheLock());
+}
+inline void FtpCachePatchRename(PCWSTR site, PCWSTR folder, PCWSTR oldName, PCWSTR newName)
+{
+    if (!site || !site[0] || !folder || !oldName || !newName) return;
+    AcquireSRWLockExclusive(&FtpCacheLock());
+    for (auto &e : FtpCacheEntries())
+        if (0 == StrCmp(e.site, site) && 0 == StrCmp(e.path, folder))
+        {
+            e.tick = GetTickCount64();
+            for (auto &it : e.items)
+                if (0 == StrCmp(it.szName, oldName)) { StringCchCopy(it.szName, ARRAYSIZE(it.szName), newName); break; }
+            break;
+        }
+    ReleaseSRWLockExclusive(&FtpCacheLock());
+}
+
+// Immediate view notify (background). The patched cache entry already exists,
+// so the re-enumeration shows the change at once (no network involved).
+inline void FtpNotifyUpdateDir(PIDLIST_ABSOLUTE notifyPidl)
+{
+    if (!notifyPidl) return;
+    struct Runner
+    {
+        static DWORD WINAPI Run(LPVOID p)
+        {
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)p, NULL);
+            ILFree((PIDLIST_ABSOLUTE)p);
+            return 0;
+        }
+    };
+    HANDLE h = CreateThread(NULL, 0, Runner::Run, ILCloneFull(notifyPidl), 0, NULL);
+    if (h) CloseHandle(h);
+}
+
+// Quiet background prefetch: replace the patched cache with the real listing
+// (accurate metadata) WITHOUT notifying. Runs entirely off the caller's thread.
+struct FtpPrefetchCtx
+{
+    WCHAR site[64];
+    WCHAR folder[600];
+};
+static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
+{
+    FtpPrefetchCtx *c = static_cast<FtpPrefetchCtx *>(p);
+    std::vector<FTPENTRY> warm;
+    FtpListCachedAll(c->site, c->folder, warm);
+    ProbeLog(L"[MUT] quiet prefetch site='%s' path='%s' n=%u", c->site, c->folder, (UINT)warm.size());
+    delete c;
+    return 0;
+}
+inline void FtpPrefetchQuiet(PCWSTR site, PCWSTR folder)
+{
+    FtpPrefetchCtx *c = new (std::nothrow) FtpPrefetchCtx{};
+    if (!c) return;
+    StringCchCopy(c->site, ARRAYSIZE(c->site), site ? site : L"");
+    StringCchCopy(c->folder, ARRAYSIZE(c->folder), (folder && folder[0]) ? folder : L"/");
+    HANDLE h = CreateThread(NULL, 0, FtpPrefetchThreadProc, c, 0, NULL);
+    if (h) CloseHandle(h);
+    else delete c;
 }
 
 // Returns count of cached entries for site+path (0 = miss/expired).

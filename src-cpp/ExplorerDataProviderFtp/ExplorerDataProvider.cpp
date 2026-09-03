@@ -1385,9 +1385,12 @@ HRESULT CFolderViewImplFolder::SetNameOf(HWND hwnd, PCUITEMID_CHILD pidl,
     BOOL folder = FALSE; int size = 0;
     _GetFolderness(pidl, &folder); _GetSize(pidl, &size);
     if (ppidlOut) hr = CreateChildID(pszName, m_nLevel + 1, size > 0 ? size : 1, 3, folder, ppidlOut);
-    // WinSCP-style refresh: worker prefetches the renamed directory into the
-    // cache, then notifies the view — the re-enumeration hits a ready cache.
-    FtpRefreshDirBackground(m_szSiteName, m_szRemotePath, m_pidl);
+    // Optimistic fast path: patch the rename into the cache (no network),
+    // notify immediately so the view shows the new name at once, then quietly
+    // prefetch the real listing to correct metadata in the background.
+    FtpCachePatchRename(m_szSiteName, m_szRemotePath, oldName, pszName);
+    FtpNotifyUpdateDir(m_pidl);
+    FtpPrefetchQuiet(m_szSiteName, m_szRemotePath);
     return SUCCEEDED(hr) ? S_OK : hr;
 }
 
