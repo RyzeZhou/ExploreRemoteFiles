@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <share.h>
 
 inline void ProbeLog(const wchar_t *fmt, ...)
 {
@@ -31,7 +32,8 @@ inline void ProbeLog(const wchar_t *fmt, ...)
     EnterCriticalSection(&s_lock);
     if (!s_f)
     {
-        _wfopen_s(&s_f, L"C:\\temp\\remotefs-debug.log", L"a");
+        // _SH_DENYNO: keep the log readable by other processes (diagnostics).
+        s_f = _wfsopen(L"C:\\temp\\remotefs-debug.log", L"a", _SH_DENYNO);
     }
     if (s_f)
     {
@@ -39,7 +41,7 @@ inline void ProbeLog(const wchar_t *fmt, ...)
         if (_ftelli64(s_f) > 4LL * 1024 * 1024)
         {
             fclose(s_f);
-            _wfopen_s(&s_f, L"C:\\temp\\remotefs-debug.log", L"w");
+            s_f = _wfsopen(L"C:\\temp\\remotefs-debug.log", L"w", _SH_DENYNO);
         }
         if (s_f)
         {

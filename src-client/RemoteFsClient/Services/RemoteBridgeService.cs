@@ -16,10 +16,9 @@ public sealed class RemoteBridgeService : IDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _providerGate = new(1, 1);
     private readonly object _listingCacheGate = new();
-    private readonly Dictionary<string, CachedListing> _listingCache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Task<string>> _listingCache = new(StringComparer.Ordinal);
     private Task? _listener;
 
-    private sealed record CachedListing(DateTimeOffset ExpiresAt, Task<string> Response);
 
     public void Start() => _listener ??= Task.WhenAll(
         Enumerable.Range(0, 4).Select(_ => Task.Run(() => ListenAsync(_stop.Token))));
@@ -99,24 +98,30 @@ public sealed class RemoteBridgeService : IDisposable
         }
     }
 
-    // Explorer can ask for the same uncached directory concurrently while it
+    // Explorer can ask for the same uncached directory CONCURRENTLY while it
     // binds the target and prepares the new view. Share one backend list call
-    // and keep the completed text briefly, so those requests finish together.
-    // TTL is short (1s): the extension owns correctness of refreshes; this
-    // cache exists only to coalesce concurrent binds of the SAME directory.
+    // for IN-FLIGHT requests only; a COMPLETED entry is removed immediately so
+    // no stale listing can ever be served after a mutation (2026-09-03: the
+    // former 1s completed-entry cache made post-mutation auto-refresh show an
+    // empty/stale listing — the bridge served the pre-mutation listing).
     private Task<string> GetListingAsync(string siteName, string remotePath)
     {
         var key = siteName.ToUpperInvariant() + "\0" + remotePath;
         lock (_listingCacheGate)
         {
-            var now = DateTimeOffset.UtcNow;
-            if (_listingCache.TryGetValue(key, out var existing) && existing.ExpiresAt > now)
-                return existing.Response;
+            if (_listingCache.TryGetValue(key, out var existing))
+                return existing;   // still in flight -> coalesce concurrent binds
 
             var task = BuildListingAsync(siteName, remotePath);
-            _listingCache[key] = new CachedListing(now.AddSeconds(1), task);
-            foreach (var expired in _listingCache.Where(p => p.Value.ExpiresAt <= now).Select(p => p.Key).ToArray())
-                _listingCache.Remove(expired);
+            _listingCache[key] = task;
+            _ = task.ContinueWith(t =>
+            {
+                lock (_listingCacheGate)
+                {
+                    if (_listingCache.TryGetValue(key, out var cur) && ReferenceEquals(cur, task))
+                        _listingCache.Remove(key);   // completed -> drop; next request re-fetches
+                }
+            }, TaskScheduler.Default);
             return task;
         }
     }
