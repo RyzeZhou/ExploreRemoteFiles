@@ -9,8 +9,11 @@ using ExplorerRemoteFs.Providers;
 //   dotnet run -- show                    显示已配置连接
 
 // The native Shell extension reads the redirected pipe as UTF-8.
-Console.OutputEncoding = new System.Text.UTF8Encoding(false);
-Console.InputEncoding = new System.Text.UTF8Encoding(false);
+// Guarded: as a WinExe (no console, launched by the shell open verb) the
+// setters throw 'invalid handle'; .NET already defaults to UTF-8 when stdout
+// is redirected, so a failure here is harmless.
+try { Console.OutputEncoding = new System.Text.UTF8Encoding(false); } catch { }
+try { Console.InputEncoding = new System.Text.UTF8Encoding(false); } catch { }
 
 var argv = Environment.GetCommandLineArgs().Skip(1).ToArray();
 if (argv.Length == 0) { PrintUsage(); return; }
