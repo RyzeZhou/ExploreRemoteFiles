@@ -25,6 +25,7 @@ Start-Sleep -Milliseconds 800
 
 # context menu + property sheet handlers
 Remove-Item "$hk\RemoteFsMicrosoftCoreType" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item "$hk\RemoteFsFileType" -Recurse -Force -ErrorAction SilentlyContinue
 # CLSIDs
 Remove-Item "$hk\CLSID\$folder" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$hk\CLSID\$ctx"    -Recurse -Force -ErrorAction SilentlyContinue

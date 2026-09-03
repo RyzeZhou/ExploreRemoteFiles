@@ -1240,8 +1240,17 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
         hr = _GetFolderness(apidl[0], &fIsFolder);
         if (SUCCEEDED(hr))
         {
-            // the type of the item can be determined here.  we default to "FolderViewSampleType", which has
-            // a context menu registered for it.
+            // LEVEL/ROLE-SEPARATED semantics (2026-09-03):
+            //  * FOLDER items — saved sites (level 0 picker) AND remote
+            //    directories (level >= 1) — are NAVIGABLE containers. They
+            //    resolve to RemoteFsMicrosoftCoreType, which carries the
+            //    context-menu/property-sheet handlers but NO shell\open verb,
+            //    so double-click navigates (Explorer container semantics).
+            //  * FILE items resolve to RemoteFsFileType, a file-only ProgID
+            //    that additionally registers shell\open -> CLI open "%1".
+            //    This keeps the open verb OFF the site/directory items (a
+            //    shared ProgID made double-clicking a saved site launch the
+            //    CLI instead of navigating — see 3c45346 regression).
             if (fIsFolder)
             {
                 ASSOCIATIONELEMENT const rgAssocFolder[] =
@@ -1255,7 +1264,7 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
             {
                 ASSOCIATIONELEMENT const rgAssocItem[] =
                 {
-                    { ASSOCCLASS_PROGID_STR, NULL, L"RemoteFsMicrosoftCoreType"},
+                    { ASSOCCLASS_PROGID_STR, NULL, L"RemoteFsFileType"},
                 };
                 hr = AssocCreateForClasses(rgAssocItem, ARRAYSIZE(rgAssocItem), riid, ppv);
             }
