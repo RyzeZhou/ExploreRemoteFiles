@@ -388,6 +388,26 @@ inline void FtpCacheClear()
     // self-heals on the next refresh; freshness is not worth a hang.
 }
 
+// Ask the shell to re-enumerate a folder whose contents changed (auto-refresh
+// after a successful mutation). Runs OFF the caller's thread: SHChangeNotify
+// can make the shell synchronously poke every view, and our own data path may
+// be re-entered there. The pidl is cloned; the UI thread never blocks here.
+inline void FtpNotifyUpdateDir(PIDLIST_ABSOLUTE notifyPidl)
+{
+    if (!notifyPidl) return;
+    struct Runner
+    {
+        static DWORD WINAPI Run(LPVOID p)
+        {
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)p, NULL);
+            ILFree((PIDLIST_ABSOLUTE)p);
+            return 0;
+        }
+    };
+    HANDLE h = CreateThread(NULL, 0, Runner::Run, ILCloneFull(notifyPidl), 0, NULL);
+    if (h) CloseHandle(h);
+}
+
 // Returns count of cached entries for site+path (0 = miss/expired).
 inline int FtpCacheLookup(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxOut)
 {

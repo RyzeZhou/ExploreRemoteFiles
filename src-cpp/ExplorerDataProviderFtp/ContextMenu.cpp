@@ -148,22 +148,17 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
 
 // Single refresh pipeline for EVERY successful remote mutation — right-click
 // commands, background menu, drop target (Ctrl+V / drag-drop) all funnel here:
-// invalidate the metadata cache (local + resident bridge) so the NEXT
-// enumeration (manual refresh / F5 / re-entering the folder) fetches fresh
-// data from the server.
+// invalidate the metadata cache, then ask the affected view to re-enumerate.
 //
-// NOTE (2026-09-02 rollback): the automatic SHChangeNotify(SHCNE_UPDATEDIR)
-// that used to follow mutations made the shell synchronously re-enumerate the
-// directory and froze Explorer (delete / new-folder deadlocks). Auto-refresh
-// is deferred until that path is understood; manual refresh is the contract
-// for now. notifyPidl is retained in the signature for call-site stability
-// but is not used.
+// The 2026-09-02 freeze was NOT the notification: step logs pinned it to the
+// synchronous bridge pipe call inside FtpCacheClear (now removed). The
+// notification runs on a worker thread, so the UI thread never blocks.
 static void AfterRemoteMutation(PIDLIST_ABSOLUTE notifyPidl)
 {
-    (void)notifyPidl;
     ProbeLog(L"[MUT] AfterRemoteMutation enter (UI thread)");
     FtpCacheClear();
-    ProbeLog(L"[MUT] AfterRemoteMutation cache cleared, returning");
+    FtpNotifyUpdateDir(notifyPidl);
+    ProbeLog(L"[MUT] AfterRemoteMutation done, returning");
 }
 
 // WinSCP.com location for "script" custom commands: registry
