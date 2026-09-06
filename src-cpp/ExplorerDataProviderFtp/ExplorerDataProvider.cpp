@@ -694,9 +694,11 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
     if (!ppenumIDList) return E_POINTER;
     *ppenumIDList = NULL;
     ProbeLog(L"[ENUM] level=%d site='%s' path='%s' flags=0x%X", m_nLevel, m_szSiteName, m_szRemotePath, grfFlags);
-
+    const ULONGLONG tEnum = GetTickCount64();
     CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
     HRESULT hr = penum ? S_OK : E_OUTOFMEMORY;
+    if (SUCCEEDED(hr))
+        ProbeLog(L"[ENUM] prepared in %llu ms level=%d path='%s'", GetTickCount64() - tEnum, m_nLevel, m_szRemotePath);
     if (SUCCEEDED(hr))
     {
         hr = penum->Initialize();
