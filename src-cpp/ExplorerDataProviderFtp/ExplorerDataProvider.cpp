@@ -1152,7 +1152,13 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
         if (FAILED(hr)) return hr;
 
         DWORD attrs = SFGAO_CANRENAME | SFGAO_CANDELETE | SFGAO_HASPROPSHEET;
-        if (fIsFolder) attrs |= SFGAO_FOLDER | SFGAO_HASSUBFOLDER | SFGAO_BROWSABLE;
+        // 2026-09-06: SFGAO_BROWSABLE REMOVED (regression from 1e63bd3). The
+        // 2026-08-22 finding (RESEARCH_LOG) proved it makes Explorer request
+        // PRIVATE view interfaces (93F81976 etc.) via CreateViewObject instead
+        // of the standard DefView path, breaking double-click navigation
+        // (needs two double-clicks / intermittent). FOLDER|HASSUBFOLDER is
+        // sufficient for the shell to treat items as navigable containers.
+        if (fIsFolder) attrs |= SFGAO_FOLDER | SFGAO_HASSUBFOLDER;
 
         // Unix dotfiles are semantic metadata. Explorer owns both the visibility
         // toggle and the translucent icon through SFGAO_HIDDEN.
