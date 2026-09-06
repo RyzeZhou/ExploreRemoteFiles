@@ -467,7 +467,12 @@ inline void FtpCachePatchAdd(PCWSTR site, PCWSTR folder, PCWSTR name, BOOL isFol
         if (0 == StrCmp(e.site, site) && 0 == StrCmp(e.path, folder))
         {
             bool exists = false;
-            for (auto &it : e.items) if (0 == StrCmp(it.szName, name)) { exists = true; break; }
+            FTPENTRY sibling = {};   // inherit owner fields from a sibling when present
+            for (auto &it : e.items)
+            {
+                if (0 == StrCmp(it.szName, name)) { exists = true; break; }
+                if (!sibling.szOwner[0] && it.szOwner[0]) sibling = it;
+            }
             if (!exists)
             {
                 e.tick = GetTickCount64();
@@ -475,12 +480,13 @@ inline void FtpCachePatchAdd(PCWSTR site, PCWSTR folder, PCWSTR name, BOOL isFol
                 it.fIsFolder = isFolder;
                 it.fIsSymlink = FALSE;
                 it.dwSize = size;
-                // Real Unix time, not uptime ticks: GetTickCount64()/1000 is the
-                // system-uptime in seconds (~1970 epoch) and shows as 1970-01-01.
-                // Corrected to the true listing later by the quiet prefetch.
+                // Real Unix time (GetTickCount64()/1000 = uptime seconds ~ 1970).
                 it.dwMtime = (DWORD)time(NULL);
                 it.dwMode = isFolder ? 0x1FF : 0x1A4;             // 0777 / 0644 guess
-                it.dwUid = it.dwGid = 0xFFFFFFFF;
+                it.dwUid = sibling.szOwner[0] ? sibling.dwUid : 0xFFFFFFFF;
+                it.dwGid = sibling.szOwner[0] ? sibling.dwGid : 0xFFFFFFFF;
+                StringCchCopy(it.szOwner, ARRAYSIZE(it.szOwner), sibling.szOwner);
+                StringCchCopy(it.szGroup, ARRAYSIZE(it.szGroup), sibling.szGroup);
                 StringCchCopy(it.szName, ARRAYSIZE(it.szName), name);
                 e.items.push_back(it);
             }
@@ -560,7 +566,14 @@ static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
 {
     FtpPrefetchCtx *c = static_cast<FtpPrefetchCtx *>(p);
     std::vector<FTPENTRY> warm;
-    FtpListCachedAll(c->site, c->folder, warm);
+    if (!FtpListCachedAll(c->site, c->folder, warm) || warm.empty())
+    {
+        // Transient bridge/network hiccup: the optimistic patch entries would
+        // otherwise linger with guessed metadata. Retry once after a beat.
+        Sleep(300);
+        warm.clear();
+        FtpListCachedAll(c->site, c->folder, warm);
+    }
     ProbeLog(L"[MUT] quiet prefetch site='%s' path='%s' n=%u", c->site, c->folder, (UINT)warm.size());
     delete c;
     return 0;
