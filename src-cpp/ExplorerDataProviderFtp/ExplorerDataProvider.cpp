@@ -212,6 +212,7 @@ static int RunFtpOperation(PCWSTR site, PCWSTR verb, PCWSTR path1, PCWSTR path2)
 static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
 {
     if (!name || !name[0]) return FALSE;
+    if (!site || !site[0]) ProbeLog(L"[WARN] GetItemMeta EMPTY-SITE path='%s' name='%s'", path ? path : L"/", name);
     PCWSTR full = (path && path[0]) ? path : L"/";
     FTPENTRY found;
     // Fast path: lock-shared single-item lookup, NO full-listing copy. This
@@ -219,9 +220,24 @@ static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
     // query would make large directories unusable (2026-09-04).
     if (!FtpCacheFindOne(site, full, name, &found))
     {
+        const ULONGLONG tM = GetTickCount64();
         std::vector<FTPENTRY> items;
-        if (!FtpListCachedAll(site, full, items)) return FALSE;   // disk/network fill
-        if (!FtpCacheFindOne(site, full, name, &found)) return FALSE;
+        if (!FtpListCachedAll(site, full, items))
+        {
+            // A FAILED metadata lookup blanks the column cell; log every miss
+            // so a "Back shows empty columns" report can be pinned to data vs
+            // parameters (2026-09-06 investigation).
+            ProbeLog(L"[MISS] GetItemMeta FAIL site='%s' path='%s' name='%s'", site ? site : L"", full, name);
+            return FALSE;
+        }
+        const ULONGLONG dtM = GetTickCount64() - tM;
+        if (dtM > 40) ProbeLog(L"[PERF] GetItemMeta cold-fill site='%s' path='%s' name='%s' took %llu ms", site ? site : L"", full, name, dtM);
+        if (!FtpCacheFindOne(site, full, name, &found))
+        {
+            // Listing loaded fine but the item name was not found in it.
+            ProbeLog(L"[MISS] GetItemMeta item-not-found site='%s' path='%s' name='%s' items=%u", site ? site : L"", full, name, (UINT)items.size());
+            return FALSE;
+        }
     }
     ZeroMemory(out, sizeof(*out));
     out->dwMode = found.dwMode; out->dwMtime = found.dwMtime; out->dwSize = found.dwSize;
@@ -699,6 +715,7 @@ HRESULT CFolderViewImplFolder::BindToObject(PCUIDLIST_RELATIVE pidl,
                                             IBindCtx *pbc, REFIID riid, void **ppv)
 {
     *ppv = NULL;
+    const ULONGLONG tNav = GetTickCount64();   // nav timing probe
     // (hot-path probe removed 2026-09-02: fired per navigation, log IO froze Explorer)
     HRESULT hr = _ValidatePidl(pidl);
     if (SUCCEEDED(hr))
@@ -750,6 +767,7 @@ HRESULT CFolderViewImplFolder::BindToObject(PCUIDLIST_RELATIVE pidl,
             }
         }
     }
+    ProbeLog(L"[NAV] BindToObject level=%d elapsed=%llu hr=0x%08X iid1=0x%08X pidl=%p", m_nLevel, GetTickCount64() - tNav, hr, riid.Data1, pidl);
     return hr;
 }
 
@@ -1545,6 +1563,16 @@ HRESULT CFolderViewImplFolder::_GetColumnDisplayName(PCUITEMID_CHILD pidl,
                                                      PWSTR pszRet,
                                                      UINT cch)
 {
+    if (m_nLevel == 0)
+    {
+        // Site-picker rows (level 0) carry CONNECTION metadata only; they have
+        // no remote site context (m_szSiteName is empty). Resolving remote-file
+        // properties here would LIST '/' with an empty site, fail, and blank
+        // the cells — seen when navigating BACK to the site picker.
+        if (pv) { pv->vt = VT_EMPTY; return S_OK; }
+        if (pszRet && cch) { pszRet[0] = 0; return S_OK; }
+        return E_NOTIMPL;
+    }
     BOOL fIsFolder = FALSE;
     HRESULT hr = _GetFolderness(pidl, &fIsFolder);
     if (FAILED(hr)) return hr;

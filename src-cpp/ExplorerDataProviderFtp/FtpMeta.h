@@ -10,6 +10,7 @@
 #include <wchar.h>
 #include <wctype.h>
 #include <string>
+#include <time.h>
 #include <vector>
 #include <algorithm>
 #include "ProbeLog.h"
@@ -474,7 +475,10 @@ inline void FtpCachePatchAdd(PCWSTR site, PCWSTR folder, PCWSTR name, BOOL isFol
                 it.fIsFolder = isFolder;
                 it.fIsSymlink = FALSE;
                 it.dwSize = size;
-                it.dwMtime = (DWORD)(GetTickCount64() / 1000);   // crude; corrected by quiet prefetch
+                // Real Unix time, not uptime ticks: GetTickCount64()/1000 is the
+                // system-uptime in seconds (~1970 epoch) and shows as 1970-01-01.
+                // Corrected to the true listing later by the quiet prefetch.
+                it.dwMtime = (DWORD)time(NULL);
                 it.dwMode = isFolder ? 0x1FF : 0x1A4;             // 0777 / 0644 guess
                 it.dwUid = it.dwGid = 0xFFFFFFFF;
                 StringCchCopy(it.szName, ARRAYSIZE(it.szName), name);
