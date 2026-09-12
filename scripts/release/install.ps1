@@ -116,6 +116,15 @@ finally {
 }
 
 
+# --- shell\paste verb on the CONTAINER type: Explorer's native paste command
+# (Ctrl+V / toolbar Paste / the native "Paste" context item) never calls a
+# namespace extension's folder IDropTarget, so those paths did nothing. The
+# verb routes them to the CLI, which reads the clipboard file list and uploads
+# into the folder named by %V ("<site>:/<path>").
+$pasteCmd = '"' + (Join-Path $InstallDir 'cli\ExplorerRemoteFs.Cli.exe') + '" paste "%V"'
+New-Item -Path "$hk\RemoteFsMicrosoftCoreType\shell\paste\command" -Force | Out-Null
+Set-ItemProperty "$hk\RemoteFsMicrosoftCoreType\shell\paste\command" -Name '(default)' -Value $pasteCmd
+
 # --- RemoteFsFileType: FILE-only ProgID (level >= 1 non-directory items) ---
 # Context-menu/property-sheet handlers mirror the container type so file items
 # keep the WinSCP-style commands and the Permissions page.

@@ -65,6 +65,9 @@ switch (argv[0].ToLowerInvariant())
     case "put":
         CmdPut(argv);
         break;
+    case "paste":
+        CmdPaste(argv);
+        break;
     default:
         PrintUsage();
         break;
@@ -406,6 +409,61 @@ static void CmdDup(string[] args)
     }
 }
 
+// Shell "paste" verb entry (registered under the folder type as
+// shell\paste\command = "<cli>" paste "%V"). Explorer's native paste command
+// (Ctrl+V / toolbar / the native Paste context item) never calls the folder's
+// IDropTarget for namespace extensions, so the verb is the only hook: read the
+// clipboard file list here and upload to the target folder.
+static void CmdPaste(string[] args)
+{
+    try
+    {
+        string spec = args.Length > 1 ? args[1] : "";
+        PasteLog($"invoked target='{spec}'");
+        int colon = spec.IndexOf(':');
+        if (colon <= 0 || spec.StartsWith("::{", StringComparison.Ordinal))
+        {
+            PasteLog("FAIL: unsupported target (expected <site>:/<path>)");
+            return;
+        }
+        var conn = Find(spec[..colon]);
+        string dir = spec[(colon + 1)..];
+        if (dir.Length == 0) dir = "/";
+        var files = ClipboardFiles.Read();
+        PasteLog($"clipboard files={files.Count} dir='{dir}'");
+        if (files.Count == 0) return;
+        var fs = ProviderFactory.Get(conn);
+        foreach (var local in files)
+        {
+            string remote = dir.TrimEnd('/') + "/" + Path.GetFileName(local);
+            try
+            {
+                fs.Upload(local, remote);
+                PasteLog($"OK {local} -> {remote}");
+            }
+            catch (Exception ex)
+            {
+                PasteLog($"FAIL {local}: {ex.Message}");
+                ProviderFactory.Invalidate(conn.Name);
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        PasteLog($"FAIL: {ex.Message}");
+    }
+}
+
+static void PasteLog(string message)
+{
+    try
+    {
+        File.AppendAllText(Path.Combine(Path.GetTempPath(), "rfs-cli-paste.log"),
+            $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}");
+    }
+    catch { }
+}
+
 static void CmdPut(string[] args)
 {
     if (args.Length < 4) { PrintUsage(); return; }
@@ -421,5 +479,39 @@ static void CmdPut(string[] args)
         Console.Error.WriteLine($"FAIL: {ex.Message}");
         ProviderFactory.Invalidate(conn.Name);
         Environment.Exit(2);
+    }
+}
+
+internal static class ClipboardFiles
+{
+    private const uint CF_HDROP = 15;
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseClipboard();
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetClipboardData(uint uFormat);
+    [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern uint DragQueryFile(IntPtr hDrop, uint iFile, System.Text.StringBuilder? lpszFile, uint cch);
+
+    internal static List<string> Read()
+    {
+        var list = new List<string>();
+        if (!OpenClipboard(IntPtr.Zero)) return list;
+        try
+        {
+            IntPtr h = GetClipboardData(CF_HDROP);
+            if (h == IntPtr.Zero) return list;
+            uint count = DragQueryFile(h, 0xFFFFFFFF, null, 0);
+            for (uint i = 0; i < count; i++)
+            {
+                uint len = DragQueryFile(h, i, null, 0);
+                if (len == 0) continue;
+                var sb = new System.Text.StringBuilder((int)len + 1);
+                if (DragQueryFile(h, i, sb, (uint)sb.Capacity) > 0) list.Add(sb.ToString());
+            }
+        }
+        finally { CloseClipboard(); }
+        return list;
     }
 }
