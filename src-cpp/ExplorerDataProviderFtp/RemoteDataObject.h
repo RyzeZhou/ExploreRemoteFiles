@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include "ProbeLog.h"
+#include "FtpMeta.h"
 
 // Local path of the transfer CLI (per-user install location).
 inline std::wstring RfsCliPath()
@@ -201,10 +202,15 @@ public:
     struct Item
     {
         std::wstring site, folder, name;
+        std::wstring relPath;      // path INSIDE the copied tree ("dir\\sub\\f.txt")
         ULONGLONG size;
         DWORD mtime;
         BOOL isFolder;
     };
+
+    // Safety cap: a pathological tree must not blow up memory or the shell's
+    // copy dialog. Items beyond this are dropped (logged).
+    static const size_t kMaxItems = 5000;
 
     static HRESULT Create(REFIID riid, void **ppv)
     {
@@ -223,10 +229,11 @@ public:
         it.site = site ? site : L"";
         it.folder = folder ? folder : L"";
         it.name = name ? name : L"";
+        it.relPath = it.name;
         it.size = size;
         it.mtime = mtime;
         it.isFolder = isFolder;
-        _items.push_back(it);
+        _tops.push_back(it);
     }
 
     // IUnknown
@@ -250,10 +257,57 @@ public:
         return n;
     }
 
+    // ---- lazy tree expansion --------------------------------------------
+    // Called only from GetData (i.e. when the shell actually starts a copy).
+    // Walks each folder with the cached listing helper; a cache miss falls back
+    // to the bridge/CLI path, which is why this must not run on selection.
+    void ExpandIfNeeded()
+    {
+        if (_expanded) return;
+        _expanded = TRUE;
+        _items.clear();
+        for (size_t i = 0; i < _tops.size(); i++)
+            ExpandInto(_tops[i]);
+        ProbeLog(L"[DATAOBJ] expanded tops=%u items=%u%s", (UINT)_tops.size(), (UINT)_items.size(),
+                 _items.size() >= kMaxItems ? L" (truncated)" : L"");
+    }
+
+    void ExpandInto(const Item &dir)
+    {
+        if (_items.size() >= kMaxItems) return;
+        _items.push_back(dir);
+        if (!dir.isFolder) return;
+
+        std::wstring full = dir.folder;
+        if (!full.empty() && full[full.size() - 1] != L'/') full += L'/';
+        full += dir.name;
+
+        std::vector<FTPENTRY> kids;
+        if (!FtpListCachedAll(dir.site.c_str(), full.c_str(), kids))
+        {
+            ProbeLog(L"[DATAOBJ] list failed '%s'", full.c_str());
+            return;
+        }
+        for (size_t k = 0; k < kids.size(); k++)
+        {
+            if (_items.size() >= kMaxItems) return;
+            Item it;
+            it.site = dir.site;
+            it.folder = full;
+            it.name = kids[k].szName;
+            it.relPath = dir.relPath + L"\\" + kids[k].szName;
+            it.size = kids[k].dwSize;
+            it.mtime = kids[k].dwMtime;
+            it.isFolder = kids[k].fIsFolder;
+            ExpandInto(it);
+        }
+    }
+
     // ---- IDataObject ----------------------------------------------------
     STDMETHODIMP GetData(FORMATETC *fmt, STGMEDIUM *medium) override
     {
         if (!fmt || !medium) return E_INVALIDARG;
+        ExpandIfNeeded();
         ZeroMemory(medium, sizeof(*medium));
         CLIPFORMAT cfDesc = (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
         CLIPFORMAT cfContents = (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_FILECONTENTS);
@@ -277,7 +331,7 @@ public:
                 li.QuadPart = (ULONGLONG)_items[i].mtime * 10000000ULL + 116444736000000000ULL;
                 fd.ftLastWriteTime.dwLowDateTime = li.LowPart;
                 fd.ftLastWriteTime.dwHighDateTime = li.HighPart;
-                StringCchCopyW(fd.cFileName, ARRAYSIZE(fd.cFileName), _items[i].name.c_str());
+                StringCchCopyW(fd.cFileName, ARRAYSIZE(fd.cFileName), _items[i].relPath.c_str());
             }
             GlobalUnlock(h);
             medium->tymed = TYMED_HGLOBAL;
@@ -344,5 +398,7 @@ private:
     ~CRemoteDataObject() {}
 
     LONG _ref;
-    std::vector<Item> _items;
+    std::vector<Item> _tops;    // what the user selected
+    std::vector<Item> _items;   // flattened tree (built on first GetData)
+    BOOL _expanded = FALSE;
 };
