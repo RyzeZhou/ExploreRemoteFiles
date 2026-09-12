@@ -80,6 +80,7 @@ public partial class App : System.Windows.Application
             Visible = true
         };
         _trayIcon.DoubleClick += (_, _) => ShowTransfers();
+        _trayIcon.BalloonTipClicked += (_, _) => ShowTransfers();
         RefreshLocalizedShell();
     }
 
@@ -136,17 +137,27 @@ public partial class App : System.Windows.Application
         }
     }
 
-    private void OnTransferJobStarted()
-    {
-        bool first = (_transfers?.RunningCount ?? 0) <= 1;
-        UpdateTrayTransferState();
-        if (first && _trayIcon is not null)
-            _trayIcon.ShowBalloonTip(2500, "Explorer Remote FS",
-                Ui.IsEnglish ? "Transfer started — click here for the queue" : "已开始传输 — 点击此处查看传输队列",
-                WinForms.ToolTipIcon.Info);
-    }
+    /// <summary>No per-job balloon: copying a folder runs one job per file, so
+    /// notifying on start (or on every file's completion) spams the user. The
+    /// tray icon/tooltip still shows activity; the balloon is emitted ONCE, by
+    /// OnAllTransfersFinished, when the whole batch has drained.</summary>
+    private void OnTransferJobStarted() => UpdateTrayTransferState();
 
-    private void OnAllTransfersFinished() => UpdateTrayTransferState();
+    private void OnAllTransfersFinished()
+    {
+        UpdateTrayTransferState();
+        if (_trayIcon is null || _transfers is null) return;
+        int done = _transfers.BatchDone, failed = _transfers.BatchFailed, cancelled = _transfers.BatchCancelled;
+        int notes = failed + cancelled;
+        if (done + notes <= 0) return;
+        string text = Ui.IsEnglish
+            ? (notes > 0 ? $"{done} completed · {failed} failed · {cancelled} cancelled"
+                         : $"{done} transfer(s) completed")
+            : (notes > 0 ? $"{done} 个已完成 · {failed} 个失败 · {cancelled} 个已取消"
+                         : $"{done} 个传输已完成");
+        _trayIcon.ShowBalloonTip(3000, "Explorer Remote FS", text,
+            notes > 0 ? WinForms.ToolTipIcon.Warning : WinForms.ToolTipIcon.Info);
+    }
 
     /// <summary>Blue disc with up/down arrows, drawn once and cached.</summary>
     private static Drawing.Icon? _busyIcon;

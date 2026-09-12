@@ -132,6 +132,23 @@ public sealed class TransferTaskService
     private readonly Dispatcher _dispatcher;
     private CancellationTokenSource? _cts;
 
+    // ---- batch bookkeeping -------------------------------------------------
+    // A "batch" is one USER-level operation. Copying a folder runs one CLI job
+    // per file and the shell launches them with small gaps, so "every listed
+    // task finished" happens after EACH file; notifying there would fire once
+    // per file (the reported spam). The batch therefore stays open across a
+    // grace window and the notification is emitted once, when it really drains.
+    private bool _batchActive;
+    private int _batchDone, _batchFailed, _batchCancelled;
+    private DispatcherTimer? _batchTimer;
+    private static readonly TimeSpan BatchGrace = TimeSpan.FromSeconds(1.5);
+
+    /// <summary>Completed / failed / cancelled jobs of the batch that just
+    /// drained (valid inside the AllFinished handler).</summary>
+    public int BatchDone => _batchDone;
+    public int BatchFailed => _batchFailed;
+    public int BatchCancelled => _batchCancelled;
+
     public ObservableCollection<TransferTask> Tasks { get; } = new();
 
     /// <summary>Raised (on the UI thread) when a new job begins.</summary>
@@ -202,6 +219,12 @@ public sealed class TransferTaskService
             {
                 case "B" when f.Length >= 8:
                 {
+                    _batchTimer?.Stop();     // still the same user operation
+                    if (!_batchActive)
+                    {
+                        _batchActive = true; _batchDone = _batchFailed = _batchCancelled = 0;
+                        Log("BATCH BEGIN");
+                    }
                     var task = new TransferTask
                     {
                         Id = f[1], Direction = f[2], Server = f[3], Name = f[4],
@@ -225,8 +248,11 @@ public sealed class TransferTaskService
                 {
                     TransferTask? task = Find(f[1]);
                     if (task is null) break;
-                    task.Finish(string.Equals(f[2], "done", StringComparison.Ordinal), f.Length > 3 ? f[3] : "");
-                    if (Tasks.Count > 0 && Tasks.All(t => t.IsFinished)) AllFinished?.Invoke();
+                    bool ok = string.Equals(f[2], "done", StringComparison.Ordinal);
+                    if (!_batchActive) { _batchActive = true; _batchDone = _batchFailed = _batchCancelled = 0; }
+                    if (ok) _batchDone++; else _batchFailed++;
+                    task.Finish(ok, f.Length > 3 ? f[3] : "");
+                    MaybeEndBatch();
                     break;
                 }
             }
@@ -260,8 +286,36 @@ public sealed class TransferTaskService
     {
         if (task is null || task.IsFinished) return;
         try { if (task.Pid > 0) Process.GetProcessById(task.Pid).Kill(); } catch { }
+        if (!_batchActive) { _batchActive = true; _batchDone = _batchFailed = _batchCancelled = 0; }
+        _batchCancelled++;
         task.MarkCancelled();
-        if (Tasks.Count > 0 && Tasks.All(t => t.IsFinished)) AllFinished?.Invoke();
+        MaybeEndBatch();
+    }
+
+    /// <summary>Everything listed is finished - but hold the batch open for a
+    /// grace window: the shell starts the next file of a multi-file copy shortly
+    /// after the previous one ends, so declaring the batch done immediately
+    /// would notify once per file.</summary>
+    private void MaybeEndBatch()
+    {
+        if (Tasks.Count == 0 || !Tasks.All(t => t.IsFinished)) return;
+        _batchTimer ??= new DispatcherTimer(DispatcherPriority.Normal, _dispatcher)
+        {
+            Interval = BatchGrace,
+        };
+        _batchTimer.Tick -= OnBatchGraceElapsed;
+        _batchTimer.Tick += OnBatchGraceElapsed;
+        _batchTimer.Stop();
+        _batchTimer.Start();
+    }
+
+    private void OnBatchGraceElapsed(object? sender, EventArgs e)
+    {
+        _batchTimer?.Stop();
+        if (RunningCount > 0) return;   // a straggler arrived inside the window
+        Log("BATCH END done=" + _batchDone + " failed=" + _batchFailed + " cancelled=" + _batchCancelled);
+        AllFinished?.Invoke();
+        _batchActive = false;           // the next job opens a fresh batch
     }
 
     /// <summary>Number of jobs that have not finished yet.</summary>
