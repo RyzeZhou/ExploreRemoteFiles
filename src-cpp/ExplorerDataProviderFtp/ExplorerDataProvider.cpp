@@ -128,6 +128,14 @@ private:
     long                m_cRef;
     int                 m_nLevel;
     PIDLIST_ABSOLUTE    m_pidl;             // where this folder is in the name space
+    // Recent-enumeration snapshot (name -> isFolder) for this view. Explorer
+    // resolves an item's FORPARSING name back through ParseDisplayName to
+    // verify identity (MSDN: "ParseDisplayName implicitly validates the
+    // existence of the item"). Round-tripping through the cache/network can
+    // miss or fail right when the shell validates a fresh item, making it look
+    // invalid until a second activation. This snapshot answers instantly and
+    // deterministically for items this view just enumerated.
+    std::vector<std::pair<std::wstring, BOOL>> m_recentItems;
     PWSTR               m_rgNames[MAX_OBJS];
     WCHAR               m_szModuleName[MAX_PATH];
     WCHAR               m_szRemotePath[512];
@@ -575,6 +583,7 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
 {
     if (!pszName || !ppidl) return E_INVALIDARG;
     *ppidl = NULL;
+    ProbeLog(L"[PARSE] enter level=%d name='%s'", m_nLevel, pszName);
     WCHAR component[MAX_PATH] = {};
     PWSTR next = PathFindNextComponent(pszName);
     HRESULT hr = (next && *next)
@@ -658,8 +667,47 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
         return hr;
     }
 
+    // Fast, deterministic identity resolution for items of the CURRENT view:
+    // answer from the enumeration snapshot with no cache/network dependency.
+    for (auto const &it : m_recentItems)
+    {
+        if (0 != StrCmp(it.first.c_str(), component)) continue;
+        PIDLIST_RELATIVE current = NULL;
+        hr = CreateChildID(component, m_nLevel + 1, 1, 3, it.second, &current);
+        if (FAILED(hr))
+        {
+            ProbeLog(L"[PARSE] snapshot-create-fail name='%s' hr=0x%08X", component, hr);
+            return hr;
+        }
+        if (next && *next)
+        {
+            IShellFolder *child = NULL;
+            hr = BindToObject(current, pbc, IID_PPV_ARGS(&child));
+            if (SUCCEEDED(hr))
+            {
+                PIDLIST_RELATIVE tail = NULL;
+                hr = child->ParseDisplayName(hwnd, pbc, next, pchEaten, &tail, pdwAttributes);
+                if (SUCCEEDED(hr)) { *ppidl = ILCombine(current, tail); ILFree(tail); }
+                child->Release();
+            }
+            ILFree(current);
+        }
+        else
+        {
+            ProbeLog(L"[PARSE] snapshot-hit level=%d name='%s' folder=%d", m_nLevel, component, (int)it.second);
+            *ppidl = current;
+        }
+        return hr;
+    }
     std::vector<FTPENTRY> items;
-    if (!FtpListCachedAll(m_szSiteName, m_szRemotePath, items)) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    if (!FtpListCachedAll(m_szSiteName, m_szRemotePath, items))
+    {
+        // Round-trip contract: Explorer resolves an item's FORPARSING name back
+        // through ParseDisplayName to verify identity. A failure here makes the
+        // item look invalid/reconciling to the shell.
+        ProbeLog(L"[PARSE] LIST-FAIL level=%d site='%s' path='%s' name='%s'", m_nLevel, m_szSiteName, m_szRemotePath, component);
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
     for (auto const &item : items)
     {
         if (0 != StrCmp(item.szName, component)) continue;
@@ -682,6 +730,7 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
         else *ppidl = current;
         return hr;
     }
+    ProbeLog(L"[PARSE] NOT-FOUND level=%d site='%s' path='%s' name='%s' items=%u", m_nLevel, m_szSiteName, m_szRemotePath, component, (UINT)items.size());
     return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
 }
 
@@ -695,6 +744,17 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
     *ppenumIDList = NULL;
     ProbeLog(L"[ENUM] level=%d site='%s' path='%s' flags=0x%X", m_nLevel, m_szSiteName, m_szRemotePath, grfFlags);
     const ULONGLONG tEnum = GetTickCount64();
+    // Refresh the identity snapshot used by ParseDisplayName round-trips.
+    {
+        std::vector<FTPENTRY> snapshot;
+        if (FtpListCachedAll(m_szSiteName, m_szRemotePath, snapshot))
+        {
+            m_recentItems.clear();
+            m_recentItems.reserve(snapshot.size());
+            for (auto const &it : snapshot)
+                m_recentItems.emplace_back(std::wstring(it.szName), it.fIsFolder);
+        }
+    }
     CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
     HRESULT hr = penum ? S_OK : E_OUTOFMEMORY;
     if (SUCCEEDED(hr))
