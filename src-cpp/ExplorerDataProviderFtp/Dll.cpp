@@ -13,7 +13,9 @@
 #include <Shlobj.h>
 #include <olectl.h>
 #include <strsafe.h>
+#include <dbghelp.h>
 #include "Utils.h"
+#include "ProbeLog.h"
 #include <new>  // std::nothrow
 
 // The GUID for the FolderViewImpl
@@ -47,6 +49,63 @@ long g_cRefModule = 0;
 // Handle the the DLL's module
 HINSTANCE g_hInst = NULL;
 
+// Vectored exception handler: on a hard crash in this process, log the
+// faulting module + address (and a best-effort minidump to %TEMP%) so the
+// cause can be found without an attached debugger or admin-configured WER.
+// Does NOT swallow — returns CONTINUE_SEARCH so normal handling/WER proceeds.
+static LONG WINAPI RfsVectoredHandler(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_STACK_OVERFLOW && code != 0xC0000409 /*FAST_FAIL*/)
+        return EXCEPTION_CONTINUE_SEARCH;
+    void *ip = ep->ExceptionRecord->ExceptionAddress;
+    wchar_t modName[MAX_PATH] = L"?";
+    HMODULE mod = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)ip, &mod) && mod)
+    {
+        GetModuleFileNameW(mod, modName, MAX_PATH);
+        wchar_t *b = wcsrchr(modName, L'\\');
+        if (b) memmove(modName, b + 1, (wcslen(b + 1) + 1) * sizeof(wchar_t));
+    }
+    ProbeLog(L"[VEH] code=0x%08X ip=%p module='%s'", code, ip, modName);
+
+    static volatile LONG s_dumped = 0;
+    if (InterlockedCompareExchange(&s_dumped, 1, 0) == 0)
+    {
+        wchar_t path[MAX_PATH] = {};
+        if (GetTempPathW(MAX_PATH, path))
+        {
+            StringCchCatW(path, MAX_PATH, L"rfs-explorer-crash.dmp");
+            HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+            if (h != INVALID_HANDLE_VALUE)
+            {
+                HMODULE db = LoadLibraryW(L"dbghelp.dll");
+                if (db)
+                {
+                    typedef BOOL (WINAPI *PMD)(HANDLE, DWORD, HANDLE, DWORD,
+                        PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
+                        PMINIDUMP_CALLBACK_INFORMATION);
+                    if (PMD pmd = (PMD)GetProcAddress(db, "MiniDumpWriteDump"))
+                    {
+                        MINIDUMP_EXCEPTION_INFORMATION mei = {};
+                        mei.ThreadId = GetCurrentThreadId();
+                        mei.ExceptionPointers = ep;
+                        mei.ClientPointers = FALSE;
+                        pmd(GetCurrentProcess(), GetCurrentProcessId(), h,
+                            MiniDumpNormal | MiniDumpWithThreadInfo, &mei, NULL, NULL);
+                    }
+                    FreeLibrary(db);
+                }
+                CloseHandle(h);
+                ProbeLog(L"[VEH] minidump -> '%s'", path);
+            }
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // Standard DLL functions
 STDAPI_(BOOL) DllMain(HINSTANCE hInstance, DWORD dwReason, void *)
 {
@@ -54,6 +113,7 @@ STDAPI_(BOOL) DllMain(HINSTANCE hInstance, DWORD dwReason, void *)
     {
         g_hInst = hInstance;
         DisableThreadLibraryCalls(hInstance);
+        AddVectoredExceptionHandler(1 /*call first*/, RfsVectoredHandler);
     }
     return TRUE;
 }
