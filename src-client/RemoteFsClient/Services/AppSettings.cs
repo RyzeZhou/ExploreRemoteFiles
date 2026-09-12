@@ -14,6 +14,8 @@ public sealed class AppSettings
     public string FileCachePath { get; set; } = DefaultFileCachePath;
     /// <summary>Explorer folder default view: icons | list | details | tiles | content.</summary>
     public string DefaultViewMode { get; set; } = "details";
+    /// <summary>File-size column format: "auto" (Linux -h style) or "kb" (Windows style).</summary>
+    public string SizeFormat { get; set; } = "auto";
 
     public static string DefaultMetadataCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "MetadataCache");
     public static string DefaultFileCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "FileCache");
@@ -31,6 +33,7 @@ public sealed class AppSettings
                 MetadataCachePath = NormalizeDirectory(key?.GetValue("MetadataCachePath") as string, DefaultMetadataCachePath),
                 FileCachePath = NormalizeDirectory(key?.GetValue("FileCachePath") as string, DefaultFileCachePath),
                 DefaultViewMode = NormalizeViewMode(key?.GetValue("DefaultViewMode") as string),
+                SizeFormat = NormalizeSizeFormat(key?.GetValue("SizeFormat") as string),
             };
         }
         catch { return new AppSettings(); }
@@ -48,6 +51,7 @@ public sealed class AppSettings
         key.SetValue("MetadataCachePath", MetadataCachePath, RegistryValueKind.String);
         key.SetValue("FileCachePath", FileCachePath, RegistryValueKind.String);
         key.SetValue("DefaultViewMode", NormalizeViewMode(DefaultViewMode), RegistryValueKind.String);
+        key.SetValue("SizeFormat", NormalizeSizeFormat(SizeFormat), RegistryValueKind.String);
     }
 
     public static string NormalizeDirectory(string? path, string fallback)
@@ -64,6 +68,10 @@ public sealed class AppSettings
         "content" => "content",
         _ => "details",
     };
+
+    /// <summary>auto = human readable (1.2 MB); kb = Windows Explorer style (1234 KB).</summary>
+    public static string NormalizeSizeFormat(string? format) =>
+        string.Equals((format ?? "").Trim(), "kb", StringComparison.OrdinalIgnoreCase) ? "kb" : "auto";
 
     public static string NormalizeLanguage(string? language) =>
         string.Equals(language, "en-US", StringComparison.OrdinalIgnoreCase) ? "en-US" : "zh-CN";

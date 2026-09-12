@@ -23,6 +23,7 @@ public partial class AppSettingsWindow : Window
         ExplorerLanguageBox.SelectedValue = Settings.ExplorerLanguage;
         ServiceLanguageBox.SelectedValue = Settings.ServiceLanguage;
         DefaultViewBox.SelectedValue = Settings.DefaultViewMode;
+        SizeFormatBox.SelectedValue = Settings.SizeFormat;
         ApplyLanguage();
     }
 
@@ -39,6 +40,12 @@ public partial class AppSettingsWindow : Window
             : new[] { "图标", "列表", "详细信息", "平铺", "内容" };
         for (int i = 0; i < DefaultViewBox.Items.Count && i < viewNames.Length; i++)
             ((ComboBoxItem)DefaultViewBox.Items[i]).Content = viewNames[i];
+        SizeFormatLabel.Text = Ui.IsEnglish ? "File size format" : "文件大小格式";
+        var sizeNames = Ui.IsEnglish
+            ? new[] { "Auto (1.2 MB)", "KB (1234 KB)" }
+            : new[] { "自动单位（1.2 MB）", "固定 KB（1234 KB）" };
+        for (int i = 0; i < SizeFormatBox.Items.Count && i < sizeNames.Length; i++)
+            ((ComboBoxItem)SizeFormatBox.Items[i]).Content = sizeNames[i];
         HintText.Text = Ui.T("CacheDirectoryHint") + Environment.NewLine + Environment.NewLine + Ui.T("RestartExplorerHint"); SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");
     }
 
@@ -75,6 +82,7 @@ public partial class AppSettingsWindow : Window
         Settings.ExplorerLanguage = (ExplorerLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.ServiceLanguage = (ServiceLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.DefaultViewMode = (DefaultViewBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "details";
+        Settings.SizeFormat = (SizeFormatBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "auto";
         try
         {
             Settings.Save();

@@ -10,6 +10,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<Models.SiteInfo> _sites = new();
     private Models.SiteInfo? _selected;
     private ObservableCollection<TransferTask>? _tasks;
+    private TransferTaskService? _transferService;
     private System.Windows.Threading.DispatcherTimer? _transferSummaryTimer;
 
     public MainWindow()
@@ -44,6 +45,7 @@ public partial class MainWindow : Window
             TColSpeed.Header = Ui.IsEnglish ? "Speed" : "速度";
             TColStatus.Header = Ui.IsEnglish ? "Status" : "状态";
             TransferClearButton.Content = Ui.IsEnglish ? "Clear finished" : "清除已完成";
+            TColActions.Header = Ui.IsEnglish ? "Actions" : "操作";
         }
         NameLabel.Text = Ui.T("Name"); ProtocolLabel.Text = Ui.T("Protocol"); HostPortLabel.Text = Ui.T("HostPort");
         UsernameLabel.Text = Ui.T("Username"); StartPathLabel.Text = Ui.T("StartPath"); PasswordLabel.Text = Ui.T("Password");
@@ -56,8 +58,10 @@ public partial class MainWindow : Window
 
     /// <summary>Binds the transfer queue (owned by the resident service) to the
     /// Transfers tab. Called once from App at startup.</summary>
-    internal void AttachTasks(ObservableCollection<TransferTask> tasks)
+    internal void AttachTasks(TransferTaskService service)
     {
+        _transferService = service;
+        ObservableCollection<TransferTask> tasks = service.Tasks;
         _tasks = tasks;
         TransferList.ItemsSource = tasks;
         _transferSummaryTimer = new System.Windows.Threading.DispatcherTimer
@@ -73,6 +77,18 @@ public partial class MainWindow : Window
     internal void SelectTransferTab()
     {
         TransferTab.IsSelected = true;
+        UpdateTransferSummary();
+    }
+
+    private void OnPauseTask(object sender, RoutedEventArgs e)
+    {
+        if ((sender as System.Windows.Controls.Button)?.Tag is TransferTask task) _transferService?.TogglePause(task);
+        UpdateTransferSummary();
+    }
+
+    private void OnCancelTask(object sender, RoutedEventArgs e)
+    {
+        if ((sender as System.Windows.Controls.Button)?.Tag is TransferTask task) _transferService?.Cancel(task);
         UpdateTransferSummary();
     }
 

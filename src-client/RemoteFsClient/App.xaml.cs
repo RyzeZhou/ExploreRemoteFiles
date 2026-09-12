@@ -58,7 +58,7 @@ public partial class App : System.Windows.Application
         _transfers.AllFinished += OnAllTransfersFinished;
         _transfers.Start();
         _manager = new MainWindow();
-        _manager.AttachTasks(_transfers.Tasks);
+        _manager.AttachTasks(_transfers);
         _manager.Closing += OnManagerClosing;
         MainWindow = _manager;
         CreateTrayIcon();

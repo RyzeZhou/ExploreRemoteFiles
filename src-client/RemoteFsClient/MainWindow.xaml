@@ -91,19 +91,29 @@
                         <ListView x:Name="TransferList" Grid.Row="1" BorderThickness="1">
                             <ListView.View>
                                 <GridView>
-                                    <GridViewColumn x:Name="TColServer" Width="110" DisplayMemberBinding="{Binding Server}"/>
-                                    <GridViewColumn x:Name="TColDirection" Width="70" DisplayMemberBinding="{Binding DirectionLabel}"/>
-                                    <GridViewColumn x:Name="TColFile" Width="170" DisplayMemberBinding="{Binding Name}"/>
-                                    <GridViewColumn x:Name="TColProgress" Width="160">
+                                    <GridViewColumn x:Name="TColServer" Width="90" DisplayMemberBinding="{Binding Server}"/>
+                                    <GridViewColumn x:Name="TColDirection" Width="60" DisplayMemberBinding="{Binding DirectionLabel}"/>
+                                    <GridViewColumn x:Name="TColFile" Width="140" DisplayMemberBinding="{Binding Name}"/>
+                                    <GridViewColumn x:Name="TColProgress" Width="130">
                                         <GridViewColumn.CellTemplate>
                                             <DataTemplate>
                                                 <ProgressBar Height="14" Minimum="0" Maximum="100" Value="{Binding Percent, Mode=OneWay}"/>
                                             </DataTemplate>
                                         </GridViewColumn.CellTemplate>
                                     </GridViewColumn>
-                                    <GridViewColumn x:Name="TColDone" Width="120" DisplayMemberBinding="{Binding ProgressText}"/>
-                                    <GridViewColumn x:Name="TColSpeed" Width="80" DisplayMemberBinding="{Binding SpeedText}"/>
-                                    <GridViewColumn x:Name="TColStatus" Width="70" DisplayMemberBinding="{Binding StatusText}"/>
+                                    <GridViewColumn x:Name="TColDone" Width="110" DisplayMemberBinding="{Binding ProgressText}"/>
+                                    <GridViewColumn x:Name="TColSpeed" Width="70" DisplayMemberBinding="{Binding SpeedText}"/>
+                                    <GridViewColumn x:Name="TColStatus" Width="60" DisplayMemberBinding="{Binding StatusText}"/>
+                                    <GridViewColumn x:Name="TColActions" Width="130">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Button Content="{Binding PauseLabel}" Click="OnPauseTask" Tag="{Binding}" Padding="8,1" Margin="0,0,4,0" MinWidth="52"/>
+                                                    <Button Content="{Binding CancelLabel}" Click="OnCancelTask" Tag="{Binding}" Padding="8,1"/>
+                                                </StackPanel>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
                                 </GridView>
                             </ListView.View>
                         </ListView>

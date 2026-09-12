@@ -7,7 +7,7 @@ using System.Text;
 /// reporting is UI only and must never affect the transfer itself.
 ///
 /// Wire format (UTF-8 lines, TAB separated):
-///   B  id  direction(upload|download)  server  name  localPath  remotePath  totalBytes
+///   B  id  direction(upload|download)  server  name  localPath  remotePath  totalBytes  pid
 ///   P  id  doneBytes  totalBytes
 ///   E  id  status(done|fail)  message
 /// </summary>
@@ -17,6 +17,12 @@ internal static class JobReporter
     private static readonly object Gate = new();
     private static NamedPipeClientStream? _pipe;
     private static StreamWriter? _writer;
+    /// <summary>Pause gate: signaled = running, reset = paused. The service
+    /// resets/sets it by name (<see cref="GatePrefix"/> + job id + ".Gate") to
+    /// pause/resume the transfer; waiting inside the progress callback blocks
+    /// the transfer thread, which is exactly what a pause needs.</summary>
+    private static EventWaitHandle? _gate;
+    private const string GatePrefix = @"Local\ExplorerRemoteFs.Job.";
     private static string _id = "";
     private static long _lastSent;
     private static DateTime _lastAt = DateTime.MinValue;
@@ -31,12 +37,25 @@ internal static class JobReporter
             _lastAt = DateTime.MinValue;
             string name = Path.GetFileName(remotePath.TrimEnd('/'));
             if (string.IsNullOrEmpty(name)) name = remotePath;
-            Send($"B\t{_id}\t{direction}\t{server}\t{name}\t{localPath}\t{remotePath}\t{total}");
+            try
+            {
+                _gate = new EventWaitHandle(true, EventResetMode.ManualReset, GatePrefix + _id + ".Gate");
+            }
+            catch { _gate = null; }
+            Send($"B\t{_id}\t{direction}\t{server}\t{name}\t{localPath}\t{remotePath}\t{total}\t{Environment.ProcessId}");
         }
     }
 
     public static void Progress(long done, long total)
     {
+        // Paused? Block the transfer thread here (the callback runs on it), in
+        // short slices so a resume is picked up promptly. Killing the process
+        // (cancel) ends the wait immediately with the process.
+        EventWaitHandle? gate = _gate;
+        if (gate is not null)
+        {
+            while (!gate.WaitOne(200)) { /* paused */ }
+        }
         lock (Gate)
         {
             if (_writer is null) return;
@@ -78,7 +97,9 @@ internal static class JobReporter
     {
         try { _writer?.Dispose(); } catch { }
         try { _pipe?.Dispose(); } catch { }
+        try { _gate?.Dispose(); } catch { }
         _writer = null;
         _pipe = null;
+        _gate = null;
     }
 }

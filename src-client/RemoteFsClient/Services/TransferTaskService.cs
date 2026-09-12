@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Runtime.CompilerServices;
@@ -18,12 +19,15 @@ public sealed class TransferTask : INotifyPropertyChanged
     public string Name { get; init; } = "";
     public string LocalPath { get; init; } = "";
     public string RemotePath { get; init; } = "";
+    /// <summary>CLI process performing the transfer (0 when unknown). Cancel kills it.</summary>
+    public int Pid { get; init; }
 
     private long _done;
     private long _total;
     private long _lastBytes;
     private DateTime _lastAt = DateTime.UtcNow;
     private double _speed;          // bytes/second
+    private bool _paused;
     private string _status = "running";
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -33,8 +37,30 @@ public sealed class TransferTask : INotifyPropertyChanged
 
     public string DirectionLabel => Direction == "download" ? "↓ 下载" : "↑ 上传";
     public string TargetText => Direction == "download" ? LocalPath : RemotePath;
-    public bool IsFinished => _status is "done" or "fail";
+    public bool IsFinished => _status is "done" or "fail" or "cancel";
     public bool IsFailed => _status == "fail";
+    public bool IsPaused => _paused;
+    public string PauseLabel => _paused ? (Ui.IsEnglish ? "Resume" : "继续") : (Ui.IsEnglish ? "Pause" : "暂停");
+    public string CancelLabel => Ui.IsEnglish ? "Cancel" : "取消";
+
+    /// <summary>Reflects the pause gate state (the transfer thread blocks while paused).</summary>
+    public void SetPaused(bool paused)
+    {
+        _paused = paused;
+        Raise(nameof(IsPaused));
+        Raise(nameof(PauseLabel));
+        Raise(nameof(StatusText));
+    }
+
+    /// <summary>Cancel = the CLI process was killed; the E frame will never arrive.</summary>
+    public void MarkCancelled()
+    {
+        _status = "cancel";
+        _speed = 0;
+        Raise(nameof(Percent));
+        Raise(nameof(SpeedText));
+        Raise(nameof(StatusText));
+    }
 
     public double Percent => _total > 0
         ? (_done >= _total ? 100.0 : Math.Max(0, _done * 100.0 / _total))
@@ -48,7 +74,8 @@ public sealed class TransferTask : INotifyPropertyChanged
     {
         "done" => "完成",
         "fail" => "失败",
-        _ => Percent > 0 ? $"{Percent:0}%" : "…",
+        "cancel" => "已取消",
+        _ => _paused ? "已暂停" : (Percent > 0 ? $"{Percent:0}%" : "…"),
     };
 
     public string Failure { get; private set; } = "";
@@ -166,7 +193,7 @@ public sealed class TransferTaskService
         string[] f = line.Split('\t');
         if (f.Length < 3) return;
         if (f[0] == "B" && f.Length >= 8)
-            Log("BEGIN server=" + f[3] + " dir=" + f[2] + " name=" + f[4] + " total=" + f[7]);
+            Log("BEGIN id=" + f[1] + " server=" + f[3] + " dir=" + f[2] + " name=" + f[4] + " total=" + f[7] + " pid=" + (f.Length > 8 ? f[8] : "-"));
         else if (f[0] == "E" && f.Length >= 3)
             Log("END status=" + f[2]);
         _dispatcher.BeginInvoke(() =>
@@ -179,6 +206,7 @@ public sealed class TransferTaskService
                     {
                         Id = f[1], Direction = f[2], Server = f[3], Name = f[4],
                         LocalPath = f[5], RemotePath = f[6],
+                        Pid = (f.Length > 8 && int.TryParse(f[8], out int pid)) ? pid : 0,
                     };
                     if (long.TryParse(f[7], out long total) && total > 0) task.Update(0, total);
                     Tasks.Insert(0, task);      // newest first
@@ -203,6 +231,37 @@ public sealed class TransferTaskService
                 }
             }
         });
+    }
+
+    /// <summary>Named pause gate created by the CLI for a job.
+    /// Signaled = running, reset = paused.</summary>
+    private const string GatePrefix = @"Local\ExplorerRemoteFs.Job.";
+
+    /// <summary>Pause/resume by flipping the job's named gate; the CLI blocks in
+    /// its progress callback while the gate is reset, so the transfer thread
+    /// stops reading/writing without tearing the connection down.</summary>
+    public void TogglePause(TransferTask task)
+    {
+        if (task is null || task.IsFinished) return;
+        try
+        {
+            using EventWaitHandle gate = EventWaitHandle.OpenExisting(GatePrefix + task.Id + ".Gate");
+            if (task.IsPaused) { gate.Set(); task.SetPaused(false); }
+            else { gate.Reset(); task.SetPaused(true); }
+        }
+        catch
+        {
+            // No gate (old CLI, or the job already ended): nothing to toggle.
+        }
+    }
+
+    /// <summary>Cancel = terminate the CLI process performing the transfer.</summary>
+    public void Cancel(TransferTask task)
+    {
+        if (task is null || task.IsFinished) return;
+        try { if (task.Pid > 0) Process.GetProcessById(task.Pid).Kill(); } catch { }
+        task.MarkCancelled();
+        if (Tasks.Count > 0 && Tasks.All(t => t.IsFinished)) AllFinished?.Invoke();
     }
 
     /// <summary>Number of jobs that have not finished yet.</summary>
