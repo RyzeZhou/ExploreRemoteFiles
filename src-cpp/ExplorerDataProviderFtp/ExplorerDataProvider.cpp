@@ -1103,6 +1103,7 @@ public:
     IFACEMETHODIMP DragLeave() { return S_OK; }
     IFACEMETHODIMP Drop(IDataObject *pdo, DWORD, POINTL, DWORD *pdwEffect)
     {
+        ProbeLog(L"[PASTE] droptarget-Drop site='%s' folder='%s'", m_site.c_str(), m_folder.c_str());
         PasteDataObjectToFolder(NULL, m_site.c_str(), m_folder.c_str(), pdo, m_pidl);
         *pdwEffect = DROPEFFECT_COPY;
         return S_OK;

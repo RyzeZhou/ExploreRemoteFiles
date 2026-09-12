@@ -980,28 +980,72 @@ static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOL
 // Core upload path — the ONE implementation behind the background-menu paste,
 // the folder IDropTarget (Ctrl+V / drag-drop) and any future paste entry.
 // The caller owns hdrop's lifetime (clipboard data must not be freed here).
-static void PasteHdropToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, HDROP hdrop, PIDLIST_ABSOLUTE notifyPidl)
+// Upload worker: runs OFF the UI thread. Large transfers used to block the
+// Explorer window for the whole CLI put (no progress UI), making the window
+// appear frozen. The HDROP is consumed on the UI thread (valid only while the
+// data object/clipboard is open); the worker owns plain path strings.
+struct PasteJob
 {
-    UINT n = DragQueryFileW(hdrop, 0xFFFFFFFF, NULL, 0);
+    WCHAR site[64];
+    WCHAR folder[512];
+    std::vector<std::wstring> files;
+    PIDLIST_ABSOLUTE pidl;
+};
+static DWORD WINAPI PasteJobProc(LPVOID p)
+{
+    PasteJob *j = static_cast<PasteJob *>(p);
     BOOL ok = TRUE;
-    for (UINT k = 0; k < n; k++)
+    for (auto const &local : j->files)
     {
-        WCHAR local[MAX_PATH], name[MAX_PATH];
-        if (!DragQueryFileW(hdrop, k, local, ARRAYSIZE(local))) { ok = FALSE; continue; }
-        StringCchCopy(name, MAX_PATH, PathFindFileNameW(local));
-        WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
-        if (RunCli(site, L"put", local, full, NULL) != 0) ok = FALSE;
+        WCHAR name[MAX_PATH];
+        StringCchCopy(name, ARRAYSIZE(name), PathFindFileNameW(local.c_str()));
+        WCHAR full[700]; JoinPath(j->folder, name, full, ARRAYSIZE(full));
+        ProbeLog(L"[UPLOAD] put '%s' -> '%s'", local.c_str(), full);
+        if (RunCli(j->site, L"put", local.c_str(), full, NULL) != 0) ok = FALSE;
         else
         {
             ULONGLONG sz = 0;
             WIN32_FILE_ATTRIBUTE_DATA fa = {};
-            if (GetFileAttributesExW(local, GetFileExInfoStandard, &fa))
+            if (GetFileAttributesExW(local.c_str(), GetFileExInfoStandard, &fa))
                 sz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-            FtpCachePatchAdd(site, folder, name, FALSE, sz);   // optimistic
+            FtpCachePatchAdd(j->site, j->folder, name, FALSE, sz);   // optimistic
         }
     }
-    RefreshLocalFast(site, folder, notifyPidl);
-    if (!ok) MessageBoxW(hwnd, ExplorerText(L"error.some_uploads_failed", L"部分文件上传失败。", L"Some files could not be uploaded."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
+    RefreshLocalFast(j->site, j->folder, j->pidl);
+    if (!ok) MessageBoxW(NULL, ExplorerText(L"error.some_uploads_failed", L"部分文件上传失败。", L"Some files could not be uploaded."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
+    if (j->pidl) ILFree(j->pidl);
+    delete j;
+    DllRelease();
+    return 0;
+}
+
+static void PasteHdropToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, HDROP hdrop, PIDLIST_ABSOLUTE notifyPidl)
+{
+    (void)hwnd;
+    UINT n = DragQueryFileW(hdrop, 0xFFFFFFFF, NULL, 0);
+    if (!n) return;
+    PasteJob *j = new (std::nothrow) PasteJob();
+    if (!j) return;
+    StringCchCopy(j->site, ARRAYSIZE(j->site), site ? site : L"");
+    StringCchCopy(j->folder, ARRAYSIZE(j->folder), folder ? folder : L"/");
+    j->pidl = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    for (UINT k = 0; k < n; k++)
+    {
+        WCHAR local[MAX_PATH];
+        if (DragQueryFileW(hdrop, k, local, ARRAYSIZE(local)))
+            j->files.emplace_back(local);
+    }
+    if (j->files.empty()) { if (j->pidl) ILFree(j->pidl); delete j; return; }
+    ProbeLog(L"[UPLOAD] queued %u file(s) -> '%s' (background)", (UINT)j->files.size(), j->folder);
+    DllAddRef();   // keep the DLL loaded while the worker runs
+    HANDLE h = CreateThread(NULL, 0, PasteJobProc, j, 0, NULL);
+    if (h) CloseHandle(h);
+    else
+    {
+        if (j->pidl) ILFree(j->pidl);
+        delete j;
+        DllRelease();
+    }
 }
 
 // IDataObject entry used by the folder IDropTarget (Ctrl+V / drag-drop).
@@ -1018,8 +1062,10 @@ void PasteDataObjectToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, IDataObject 
 
 static void PasteClipboardToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
 {
-    if (!OpenClipboard(hwnd)) return;
+    ProbeLog(L"[PASTE] clipboard-menu-paste site='%s' folder='%s'", site ? site : L"", folder ? folder : L"/");
+    if (!OpenClipboard(hwnd)) { ProbeLog(L"[PASTE] OpenClipboard FAILED"); return; }
     HANDLE h = GetClipboardData(CF_HDROP);
+    ProbeLog(L"[PASTE] clipboard CF_HDROP=%p", h);
     if (h) PasteHdropToFolder(hwnd, site, folder, (HDROP)h, notifyPidl);
     CloseClipboard();
 }
