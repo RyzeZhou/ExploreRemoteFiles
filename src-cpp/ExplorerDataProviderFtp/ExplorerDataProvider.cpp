@@ -27,6 +27,7 @@
 #include "Category.h"
 #include "Guid.h"
 #include "fvcommands.h"
+#include "RemoteDataObject.h"
 
 // background context menu wrapper (defined in ContextMenu.cpp)
 HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, int level, REFIID riid, void **ppv);
@@ -1244,7 +1245,17 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
         HRESULT hr = _GetFolderness(apidl[i], &fIsFolder);
         if (FAILED(hr)) return hr;
 
-        DWORD attrs = SFGAO_CANRENAME | SFGAO_CANDELETE | SFGAO_HASPROPSHEET;
+        // 2026-09-12: declare the capabilities Explorer's command bar keys off.
+        // Copy / Cut / Move-to / Copy-to / Paste-shortcut were greyed out because
+        // we only advertised RENAME|DELETE|HASPROPSHEET. They are backed by the
+        // virtual-file data object in GetUIObjectOf (IID_IDataObject).
+        // Level 0 (site picker) rows are connection entries, not files: keep
+        // them non-copyable/non-deletable.
+        DWORD attrs = SFGAO_HASPROPSHEET;
+        if (m_nLevel >= 1)
+            // NB: no SFGAO_CANCUT exists; the shell derives Cut from CANCOPY + CANMOVE.
+            attrs |= SFGAO_CANRENAME | SFGAO_CANDELETE | SFGAO_CANCOPY |
+                     SFGAO_CANLINK | SFGAO_CANMOVE;
         // 2026-09-06: SFGAO_BROWSABLE REMOVED (regression from 1e63bd3). The
         // 2026-08-22 finding (RESEARCH_LOG) proved it makes Explorer request
         // PRIVATE view interfaces (93F81976 etc.) via CreateViewObject instead
@@ -1324,7 +1335,26 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
     }
     else if (riid == IID_IDataObject)
     {
-        hr = SHCreateDataObject(m_pidl, cidl, apidl, NULL, riid, ppv);
+        // Virtual-file data object (2026-09-12): descriptors immediately, file
+        // bytes lazily via IStream on first read. SHCreateDataObject(inner=NULL)
+        // only ever supplied a shell IDList with no content, so Copy / Cut /
+        // Move-to / Copy-to / Paste-shortcut and drag-out produced nothing.
+        hr = CRemoteDataObject::Create(riid, ppv);
+        if (SUCCEEDED(hr) && *ppv)
+        {
+            CRemoteDataObject *obj = static_cast<CRemoteDataObject *>(*ppv);
+            for (UINT i = 0; i < cidl; i++)
+            {
+                WCHAR name[MAX_PATH] = {};
+                if (FAILED(_GetName(apidl[i], name, ARRAYSIZE(name)))) continue;
+                BOOL isFolder = FALSE;
+                _GetFolderness(apidl[i], &isFolder);
+                ITEMDATA meta = {};
+                GetItemMeta(m_szSiteName, m_szRemotePath, name, &meta);
+                obj->Add(m_szSiteName, m_szRemotePath, name, meta.dwSize, meta.dwMtime, isFolder);
+            }
+            ProbeLog(L"[DATAOBJ] created for cidl=%u site='%s' path='%s'", cidl, m_szSiteName, m_szRemotePath);
+        }
     }
     else if (riid == IID_IPropertyStore)
     {
