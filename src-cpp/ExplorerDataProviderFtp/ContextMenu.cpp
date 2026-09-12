@@ -1147,6 +1147,28 @@ public:
  HRESULT InvokeCommand(LPCMINVOKECOMMANDINFO ci){
     UINT id=IS_INTRESOURCE(ci->lpVerb)?LOWORD((UINT_PTR)ci->lpVerb):99;
     if(!data)return E_INVALIDARG;
+    // HOST commands (Explorer's command bar buttons, keyboard accelerators,
+    // shell automation) arrive as STRING canonical verbs, not our menu ids.
+    // Bridge them onto the same handlers so the top bar works on our items
+    // (2026-09-12). Without this, a string verb fell through to id=99 and the
+    // call ended in E_INVALIDARG, i.e. the toolbar buttons did nothing.
+    if(id==99){
+        WCHAR verb[64]={};
+        if(ci->cbSize>=sizeof(CMINVOKECOMMANDINFOEX)){
+            LPCMINVOKECOMMANDINFOEX ex=(LPCMINVOKECOMMANDINFOEX)ci;
+            if((ex->fMask&CMIC_MASK_UNICODE)&&ex->lpVerbW)
+                StringCchCopyW(verb,ARRAYSIZE(verb),ex->lpVerbW);
+        }
+        if(!verb[0]&&ci->lpVerb)
+            MultiByteToWideChar(CP_ACP,0,ci->lpVerb,-1,verb,ARRAYSIZE(verb));
+        ProbeLog(L"[CMD] canonical verb '%s'",verb);
+        if(0==StrCmpIW(verb,L"delete"))          id=MENU_DELETE;
+        else if(0==StrCmpIW(verb,L"properties")) id=MENU_PROPERTIES;
+        else if(0==StrCmpIW(verb,L"open"))       id=MENU_OPEN;
+        else if(0==StrCmpIW(verb,L"edit"))       id=MENU_EDIT;
+        else if(0==StrCmpIW(verb,L"download"))   id=MENU_DOWNLOAD;
+        else return S_OK;   // not one of ours: succeed silently
+    }
     SELDATA sel; if(!CollectSelection(data,&sel))return E_FAIL;
     ProbeLog(L"[DBLCLK] CMenu::InvokeCommand id=%u site='%s' n=%d",id,sel.site,sel.count);
     PCWSTR pnames[MAX_SEL]; for(int k=0;k<sel.count;k++) pnames[k]=sel.names[k];
@@ -1535,6 +1557,20 @@ public:
         }
         BOOL isPaste = verbW ? (0 == lstrcmpiW(verbW, L"paste"))
                              : (!IS_INTRESOURCE(ci->lpVerb) && ci->lpVerb && 0 == lstrcmpiA(ci->lpVerb, "paste"));
+        BOOL isNew = verbW ? (0 == lstrcmpiW(verbW, L"new"))
+                           : (!IS_INTRESOURCE(ci->lpVerb) && ci->lpVerb && 0 == lstrcmpiA(ci->lpVerb, "new"));
+        if (isNew && m_nLevel >= 1)
+        {
+            WCHAR nsite[64] = {}, nfolder[512] = {};
+            if (m_pidl) {
+                PidlSite(m_pidl, nsite, ARRAYSIZE(nsite));
+                PidlPath(m_pidl, nfolder, ARRAYSIZE(nfolder));
+                ApplySiteStartPath(nsite, nfolder, ARRAYSIZE(nfolder));
+            }
+            ProbeLog(L"[BG] canonical verb new site='%s' folder='%s'", nsite, nfolder);
+            NewFolderRemote(ci->hwnd, nsite, nfolder, m_pidl);
+            return S_OK;
+        }
         if (isPaste)
         {
             WCHAR vsite[64] = {}, vfolder[512] = {};
@@ -1604,6 +1640,13 @@ public:
             ProbeLog(L"[BG] GetCommandString paste-verb requested type=%u", type);
             if (type == GCS_VERBW) return StringCchCopyW((PWSTR)s, c, L"paste");
             if (type == GCS_VERBA) return StringCchCopyA(s, c, "paste");
+        }
+        // k=1 is "New folder" — expose it as the canonical "new" verb so the
+        // shell's New command can reach us on the background.
+        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 1)
+        {
+            if (type == GCS_VERBW) return StringCchCopyW((PWSTR)s, c, L"new");
+            if (type == GCS_VERBA) return StringCchCopyA(s, c, "new");
         }
         return E_NOTIMPL;
     }

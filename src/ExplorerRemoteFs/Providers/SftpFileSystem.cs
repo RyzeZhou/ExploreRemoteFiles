@@ -134,7 +134,10 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"SFTP mkdir: {path}");
     }
 
-    public void Download(string remotePath, string localPath, Action<long, long>? progress = null)
+    // NOTE: SSH.NET has no resume API; SFTP resume would need OpenWrite + Seek
+    // against the remote offset (TODO). The flag is accepted for interface
+    // compatibility and currently ignored, so SFTP restarts the transfer.
+    public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false)
     {
         EnsureConnected();
         if (_client is null) return;
@@ -146,7 +149,7 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"SFTP get: {remotePath} -> {localPath}");
     }
 
-    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null)
+    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false)
     {
         EnsureConnected();
         if (_client is null) return;

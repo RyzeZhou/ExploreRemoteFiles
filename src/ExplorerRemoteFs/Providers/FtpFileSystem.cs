@@ -140,7 +140,7 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"FTP mkdir: {path}");
     }
 
-    public void Download(string remotePath, string localPath, Action<long, long>? progress = null)
+    public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false)
     {
         EnsureConnected();
         if (_client is null) return;
@@ -152,14 +152,18 @@ public sealed class FtpFileSystem : IRemoteFileSystem
                 long total = p.Progress > 0 ? (long)(p.TransferredBytes / (p.Progress / 100.0)) : 0;
                 progress(p.TransferredBytes, total);
             };
-        var result = _client.DownloadFile(localPath, remotePath, FtpLocalExists.Overwrite, FtpVerify.None, fp);
+        // Resume uses the FTP REST command (FluentFTP handles it): the server
+        // continues from the existing local file's size. Only requested when we
+        // know a previous attempt of this transfer was interrupted.
+        var mode = resume ? FtpLocalExists.Resume : FtpLocalExists.Overwrite;
+        var result = _client.DownloadFile(localPath, remotePath, mode, FtpVerify.None, fp);
         if (result == FtpStatus.Failed)
             throw new InvalidOperationException($"FTP download failed: {remotePath}");
         progress?.Invoke(new FileInfo(localPath).Length, new FileInfo(localPath).Length);
         Utils.ShellLog.Write($"FTP get: {remotePath} -> {localPath}");
     }
 
-    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null)
+    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false)
     {
         EnsureConnected();
         if (_client is null) return;
@@ -168,7 +172,10 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         Action<FtpProgress>? fp = null;
         if (progress is not null)
             fp = p => progress(p.TransferredBytes, total);
-        var result = _client.UploadFile(localPath, remotePath, FtpRemoteExists.Overwrite, true, FtpVerify.None, fp);
+        // FtpRemoteExists.Resume makes FluentFTP issue REST and continue from
+        // the remote file's current size.
+        var mode = resume ? FtpRemoteExists.Resume : FtpRemoteExists.Overwrite;
+        var result = _client.UploadFile(localPath, remotePath, mode, true, FtpVerify.None, fp);
         if (result == FtpStatus.Failed)
             throw new InvalidOperationException($"FTP upload failed: {remotePath}");
         progress?.Invoke(total, total);

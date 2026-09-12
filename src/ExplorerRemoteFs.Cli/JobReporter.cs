@@ -69,6 +69,18 @@ internal static class JobReporter
         }
     }
 
+    /// <summary>Appends a diagnostic line (resume decisions etc.) to
+    /// %TEMP%/rfs-cli.log — handy when verifying that resume actually engaged.</summary>
+    public static void Note(string message)
+    {
+        try
+        {
+            File.AppendAllText(Path.Combine(Path.GetTempPath(), "rfs-cli.log"),
+                DateTime.Now.ToString("HH:mm:ss.fff") + " " + message + Environment.NewLine);
+        }
+        catch { }
+    }
+
     public static void End(bool ok, string message = "")
     {
         lock (Gate)

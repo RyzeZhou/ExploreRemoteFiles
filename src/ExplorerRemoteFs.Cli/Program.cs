@@ -337,16 +337,62 @@ static void UploadTracked(IRemoteFileSystem fs, string server, string local, str
 {
     long total = 0;
     try { total = new FileInfo(local).Length; } catch { }
+    // Resume only when THIS transfer was interrupted before (see ResumeStore):
+    // resuming blindly could append onto an unrelated same-named file.
+    bool resume = ResumeStore.HasPending("upload", server, remote, total);
+    if (resume) JobReporter.Note("resume upload " + remote);
     JobReporter.Begin("upload", server, local, remote, total);
-    try { fs.Upload(local, remote, JobReporter.Progress); JobReporter.End(true); }
-    catch (Exception ex) { JobReporter.End(false, ex.Message); throw; }
+    DateTime lastMark = DateTime.MinValue;
+    try
+    {
+        fs.Upload(local, remote, (done, size) =>
+        {
+            JobReporter.Progress(done, size);
+            if ((DateTime.UtcNow - lastMark).TotalSeconds >= 2)
+            {
+                lastMark = DateTime.UtcNow;
+                ResumeStore.Mark("upload", server, remote, total, done);   // survives a kill
+            }
+        }, resume);
+        JobReporter.End(true);
+        ResumeStore.Clear("upload", server, remote);
+    }
+    catch (Exception ex)
+    {
+        JobReporter.End(false, ex.Message);
+        ResumeStore.Mark("upload", server, remote, total, 0);   // keep a resume marker
+        throw;
+    }
 }
 
 static void DownloadTracked(IRemoteFileSystem fs, string server, string remote, string local)
 {
+    long sourceSize = 0;
+    try { sourceSize = new FileInfo(local).Length; } catch { }
+    bool resume = ResumeStore.HasPending("download", server, local, sourceSize);
+    if (resume) JobReporter.Note("resume download " + remote);
     JobReporter.Begin("download", server, local, remote, 0);
-    try { fs.Download(remote, local, JobReporter.Progress); JobReporter.End(true); }
-    catch (Exception ex) { JobReporter.End(false, ex.Message); throw; }
+    DateTime lastMark = DateTime.MinValue;
+    try
+    {
+        fs.Download(remote, local, (done, size) =>
+        {
+            JobReporter.Progress(done, size);
+            if ((DateTime.UtcNow - lastMark).TotalSeconds >= 2)
+            {
+                lastMark = DateTime.UtcNow;
+                ResumeStore.Mark("download", server, local, sourceSize, done);
+            }
+        }, resume);
+        JobReporter.End(true);
+        ResumeStore.Clear("download", server, local);
+    }
+    catch (Exception ex)
+    {
+        JobReporter.End(false, ex.Message);
+        ResumeStore.Mark("download", server, local, sourceSize, 0);
+        throw;
+    }
 }
 
 static void CmdGet(string[] args)
