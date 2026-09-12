@@ -12,8 +12,10 @@ public partial class App : System.Windows.Application
 {
     private const string SingleInstanceName = @"Local\ExplorerRemoteFs.Client";
     private const string ShowManagerEventName = @"Local\ExplorerRemoteFs.ShowManager";
+    private const string ShowTransfersEventName = @"Local\ExplorerRemoteFs.ShowTransfers";
     private Mutex? _singleInstance;
     private EventWaitHandle? _showManagerEvent;
+    private EventWaitHandle? _showTransfersEvent;
     private CancellationTokenSource? _shutdown;
     private WinForms.NotifyIcon? _trayIcon;
     private WinForms.ContextMenuStrip? _trayMenu;
@@ -29,11 +31,17 @@ public partial class App : System.Windows.Application
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
         bool background = e.Args.Any(a => string.Equals(a, "--background", StringComparison.OrdinalIgnoreCase));
         bool showRequested = e.Args.Any(a => string.Equals(a, "--show", StringComparison.OrdinalIgnoreCase));
+        bool transfersRequested = e.Args.Any(a => string.Equals(a, "--transfers", StringComparison.OrdinalIgnoreCase));
 
         _singleInstance = new Mutex(true, SingleInstanceName, out bool isFirstInstance);
         if (!isFirstInstance)
         {
-            if (showRequested || !background)
+            if (transfersRequested)
+            {
+                try { EventWaitHandle.OpenExisting(ShowTransfersEventName).Set(); }
+                catch { }
+            }
+            else if (showRequested || !background)
             {
                 try { EventWaitHandle.OpenExisting(ShowManagerEventName).Set(); }
                 catch { }
@@ -44,6 +52,7 @@ public partial class App : System.Windows.Application
 
         _shutdown = new CancellationTokenSource();
         _showManagerEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowManagerEventName, out _);
+        _showTransfersEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowTransfersEventName, out _);
         _transfers = new TransferTaskService(Dispatcher);
         _transfers.JobStarted += OnTransferJobStarted;
         _transfers.AllFinished += OnAllTransfersFinished;
@@ -56,7 +65,8 @@ public partial class App : System.Windows.Application
         _bridge = new RemoteBridgeService();
         _bridge.Start();
         ListenForShowRequests();
-        if (!background || showRequested) ShowManager();
+        if (transfersRequested) ShowTransfers();
+        else if (!background || showRequested) ShowManager();
     }
 
     private void CreateTrayIcon()
@@ -92,10 +102,13 @@ public partial class App : System.Windows.Application
         {
             try
             {
+                WaitHandle[] waits = { _showManagerEvent!, _showTransfersEvent! };
                 while (!_shutdown!.IsCancellationRequested)
                 {
-                    _showManagerEvent!.WaitOne();
-                    if (!_shutdown.IsCancellationRequested) Dispatcher.BeginInvoke(ShowManager);
+                    int which = WaitHandle.WaitAny(waits);
+                    if (_shutdown.IsCancellationRequested) break;
+                    if (which == 1) Dispatcher.BeginInvoke(ShowTransfers);
+                    else Dispatcher.BeginInvoke(ShowManager);
                 }
             }
             catch (ObjectDisposedException) { }

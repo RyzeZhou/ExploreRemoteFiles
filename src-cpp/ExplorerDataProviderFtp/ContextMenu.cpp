@@ -1494,6 +1494,12 @@ public:
             // current-site configuration. Directory metadata is shown when available.
             BG_INSERT(ExplorerText(L"menu.current_directory_properties", L"显示当前目录属性", L"Current directory properties"));
             BG_INSERT(ExplorerText(L"menu.current_site_information", L"显示当前站点信息", L"Current site information"));
+            // Entry point to the resident client's Transfers tab. The Explorer
+            // command bar cannot host a persistent custom NSE button on Win10/11
+            // (SFVM_GETBUTTONS targets the pre-Vista toolbar; IExplorerCommand-
+            // Provider only yields selection-scoped commands), so the folder
+            // context menu is the reliable launcher.
+            BG_INSERT(ExplorerText(L"menu.transfer_queue", L"传输队列", L"Transfer queue"));
         }
 #undef BG_INSERT
         int custom = 0;
@@ -1571,7 +1577,12 @@ public:
         case 2: PasteClipboardToFolder(ci->hwnd, site, folder, m_pidl); break;
         case 3: ShowCurrentFolderProperties(ci->hwnd, site, folder); break;
         case 4: ShowCurrentSiteInfo(ci->hwnd, site); break;
-        default: BgCustomCommand(ci->hwnd, site, folder, k - 5); break;
+        case 5:
+            // Open the resident client focused on the Transfers tab.
+            if (GetClientPath()[0])
+                ShellExecuteW(ci->hwnd, NULL, GetClientPath(), L"--transfers", NULL, SW_SHOWNORMAL);
+            break;
+        default: BgCustomCommand(ci->hwnd, site, folder, k - 6); break;
         }
         return S_OK;
     }
