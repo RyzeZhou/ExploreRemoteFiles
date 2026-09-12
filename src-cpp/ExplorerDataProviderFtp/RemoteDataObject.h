@@ -167,8 +167,10 @@ private:
         StringCchCopyW(dir, ARRAYSIZE(dir), tmp);
         StringCchCatW(dir, ARRAYSIZE(dir), L"rfs-dataobj");
         CreateDirectoryW(dir, NULL);
+        static LONG s_seq = 0;
+        LONG seq = InterlockedIncrement(&s_seq);
         WCHAR name[MAX_PATH] = {};
-        StringCchPrintfW(name, ARRAYSIZE(name), L"%s\\%u_%s", dir, GetCurrentProcessId(),
+        StringCchPrintfW(name, ARRAYSIZE(name), L"%s\\%u_%ld_%s", dir, GetCurrentProcessId(), seq,
                          PathFindFileNameW(_remote.c_str()));
         _local = name;
         DeleteFileW(_local.c_str());

@@ -27,6 +27,7 @@
 #include "Category.h"
 #include "Guid.h"
 #include "fvcommands.h"
+#include "RemoteDataObject.h"
 
 // background context menu wrapper (defined in ContextMenu.cpp)
 HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, int level, REFIID riid, void **ppv);
@@ -1245,6 +1246,11 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
         if (FAILED(hr)) return hr;
 
         DWORD attrs = SFGAO_CANRENAME | SFGAO_CANDELETE | SFGAO_HASPROPSHEET;
+        // Stage 1 (2026-09-12): advertise COPY only, on real items (not the
+        // site picker). MOVE/LINK follow once Copy is verified end-to-end —
+        // the previous one-shot attempt to add COPY+MOVE+LINK together broke
+        // every level-1 view.
+        if (m_nLevel >= 1) attrs |= SFGAO_CANCOPY;
         // 2026-09-06: SFGAO_BROWSABLE REMOVED (regression from 1e63bd3). The
         // 2026-08-22 finding (RESEARCH_LOG) proved it makes Explorer request
         // PRIVATE view interfaces (93F81976 etc.) via CreateViewObject instead
@@ -1324,7 +1330,45 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
     }
     else if (riid == IID_IDataObject)
     {
-        hr = SHCreateDataObject(m_pidl, cidl, apidl, NULL, riid, ppv);
+        // Stage 1: keep the SHELL's data object (IDList etc.) and attach our
+        // virtual-file content to it through pdtInner, instead of substituting
+        // our own object — the substitution is what destabilised the shell.
+        // Site-picker rows (level 0) are connection entries, never files.
+        if (m_nLevel < 1)
+        {
+            hr = SHCreateDataObject(m_pidl, cidl, apidl, NULL, riid, ppv);
+        }
+        else
+        {
+            IDataObject *inner = NULL;
+            hr = CRemoteDataObject::Create(IID_IDataObject, (void **)&inner);
+            if (SUCCEEDED(hr) && inner)
+            {
+                CRemoteDataObject *obj = static_cast<CRemoteDataObject *>(inner);
+                for (UINT i = 0; i < cidl; i++)
+                {
+                    WCHAR name[MAX_PATH] = {};
+                    if (FAILED(_GetName(apidl[i], name, ARRAYSIZE(name)))) continue;
+                    BOOL isFolder = FALSE;
+                    _GetFolderness(apidl[i], &isFolder);
+                    // Cache-only lookup: never start a network fetch from here
+                    // (this runs on the shell's thread while it builds menus).
+                    ULONGLONG size = 0;
+                    DWORD mtime = 0;
+                    FTPENTRY found;
+                    if (FtpCacheFindOne(m_szSiteName, m_szRemotePath, name, &found))
+                    {
+                        size = found.dwSize;
+                        mtime = found.dwMtime;
+                    }
+                    obj->Add(m_szSiteName, m_szRemotePath, name, size, mtime, isFolder);
+                }
+                hr = SHCreateDataObject(m_pidl, cidl, apidl, inner, riid, ppv);
+                inner->Release();
+                ProbeLog(L"[DATAOBJ] attached inner cidl=%u site='%s' path='%s' hr=0x%08X",
+                         cidl, m_szSiteName, m_szRemotePath, hr);
+            }
+        }
     }
     else if (riid == IID_IPropertyStore)
     {
