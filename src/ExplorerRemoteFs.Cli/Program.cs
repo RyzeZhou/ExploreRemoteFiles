@@ -360,13 +360,20 @@ static void CmdGetR(string[] args)
         foreach (var f in files) total += f.Size;
         JobReporter.Note($"getr scan {remoteDir}: {files.Count} files, {dirs.Count} dirs, {total} bytes");
 
-        Directory.CreateDirectory(localDir);
+        // Recreate the top-level folder name inside localDir: the shell extension
+        // builds descriptor relPaths that INCLUDE the top-level folder name
+        // ("ssh_keysile.txt"), so the local tree must mirror that — files land
+        // at <localDir>\<folderName>\<rel>, not <localDir>\<rel>.
+        string folderName = Path.GetFileName(remoteDir.TrimEnd('/'));
+        if (string.IsNullOrEmpty(folderName)) folderName = "root";
+        string treeRoot = Path.Combine(localDir, folderName);
+        Directory.CreateDirectory(treeRoot);
         foreach (string d in dirs)
         {
-            try { Directory.CreateDirectory(Path.Combine(localDir, d.Replace('/', Path.DirectorySeparatorChar))); }
+            try { Directory.CreateDirectory(Path.Combine(treeRoot, d.Replace('/', Path.DirectorySeparatorChar))); }
             catch { }
         }
-        DownloadTreeTracked(fs, conn.Name, remoteDir, localDir, files, total);
+        DownloadTreeTracked(fs, conn.Name, remoteDir, treeRoot, files, total);
         Console.WriteLine($"GETR: {remoteDir} -> {localDir} ({files.Count} files)");
     }
     catch (Exception ex)
