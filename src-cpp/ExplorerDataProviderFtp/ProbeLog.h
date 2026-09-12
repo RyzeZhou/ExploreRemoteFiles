@@ -45,6 +45,8 @@ inline void ProbeLog(const wchar_t *fmt, ...)
         }
         if (s_f)
         {
+            // ms timestamp prefix so navigation "busy windows" can be measured.
+            fwprintf(s_f, L"[%llu] ", GetTickCount64());
             va_list args;
             va_start(args, fmt);
             vfwprintf(s_f, fmt, args);

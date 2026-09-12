@@ -1167,7 +1167,7 @@ public:
         else if(0==StrCmpIW(verb,L"open"))       id=MENU_OPEN;
         else if(0==StrCmpIW(verb,L"edit"))       id=MENU_EDIT;
         else if(0==StrCmpIW(verb,L"download"))   id=MENU_DOWNLOAD;
-        else return S_OK;   // not one of ours: succeed silently
+        else { ProbeLog(L"[CMD] verb '%s' not mapped",verb); return S_OK; }
     }
     SELDATA sel; if(!CollectSelection(data,&sel))return E_FAIL;
     ProbeLog(L"[DBLCLK] CMenu::InvokeCommand id=%u site='%s' n=%d",id,sel.site,sel.count);
@@ -1221,6 +1221,10 @@ public:
       case MENU_COPY_NATIVE:v=L"copy_remote_path";break;case MENU_COPY_FULL:v=L"copy_full_path";break;
       case MENU_RCOPY:v=L"remote_copy";break;case MENU_RMOVE:v=L"remote_move";break;case MENU_RENAME:v=L"rename";break;
       case MENU_DELETE:v=L"delete";break;case MENU_PROPERTIES:v=L"properties";break;default:return E_NOTIMPL;}
+    // Probe (2026-09-12): the shell asks which canonical verbs we support
+    // before wiring up command-bar buttons / context items. Logging the query
+    // shows which host commands are actually offered to a namespace extension.
+    ProbeLog(L"[CMD] GetCommandString id=%u type=%u -> '%s'",(UINT)id,type,v);
     if(type==GCS_VERBW) return StringCchCopyW((PWSTR)s,c,v);
     if(type==GCS_VERBA){ char a[64]; WideCharToMultiByte(CP_ACP,0,v,-1,a,ARRAYSIZE(a),NULL,NULL); return StringCchCopyA(s,c,a); }
     return E_NOTIMPL;
