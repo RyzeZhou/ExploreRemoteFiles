@@ -2253,6 +2253,24 @@ HRESULT CFolderViewImplEnumIDList::Clone(IEnumIDList **ppenum)
 }
 
 
+// Reads the user-configured default view mode for Explorer folder views.
+// Defaults to Details (see the GUI app settings, "Default view").
+static FOLDERLOGICALVIEWMODE ReadDefaultViewMode()
+{
+    WCHAR buf[32] = {};
+    DWORD cb = sizeof(buf);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\ExplorerRemoteFs", L"DefaultViewMode",
+                     RRF_RT_REG_SZ, NULL, buf, &cb) == ERROR_SUCCESS && buf[0])
+    {
+        if (0 == StrCmpIW(buf, L"icons"))   return FLVM_ICONS;
+        if (0 == StrCmpIW(buf, L"list"))    return FLVM_LIST;
+        if (0 == StrCmpIW(buf, L"tiles"))   return FLVM_TILES;
+        if (0 == StrCmpIW(buf, L"content")) return FLVM_CONTENT;
+        if (0 == StrCmpIW(buf, L"details")) return FLVM_DETAILS;
+    }
+    return FLVM_DETAILS;   // default: 详细信息
+}
+
 class CFolderViewCB : public IShellFolderViewCB,
                       public IFolderViewSettings
 {
@@ -2303,8 +2321,16 @@ public:
         { *ppv = NULL; return E_NOTIMPL; }
     IFACEMETHODIMP GetGroupByProperty(PROPERTYKEY * /* pkey */, BOOL * /* pfGroupAscending */)
         { return E_NOTIMPL; }
-    IFACEMETHODIMP GetViewMode(FOLDERLOGICALVIEWMODE * /* plvm */)
-        { return E_NOTIMPL; }
+    // Default logical view mode (settings: "DefaultViewMode" under
+    // HKCU\Software\ExplorerRemoteFs; values icons|list|details|tiles|content).
+    // Returns the folder's default view for the FIRST time a view is created;
+    // once the user picks a view, Explorer persists that choice per folder.
+    IFACEMETHODIMP GetViewMode(FOLDERLOGICALVIEWMODE *plvm)
+    {
+        if (!plvm) return E_POINTER;
+        *plvm = ReadDefaultViewMode();
+        return S_OK;
+    }
     IFACEMETHODIMP GetIconSize(UINT * /* puIconSize */)
         { return E_NOTIMPL; }
 

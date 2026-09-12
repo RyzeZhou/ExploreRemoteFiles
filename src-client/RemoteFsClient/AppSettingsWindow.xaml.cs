@@ -22,6 +22,7 @@ public partial class AppSettingsWindow : Window
         FileCachePathBox.Text = Settings.FileCachePath;
         ExplorerLanguageBox.SelectedValue = Settings.ExplorerLanguage;
         ServiceLanguageBox.SelectedValue = Settings.ServiceLanguage;
+        DefaultViewBox.SelectedValue = Settings.DefaultViewMode;
         ApplyLanguage();
     }
 
@@ -32,6 +33,12 @@ public partial class AppSettingsWindow : Window
         MetadataCachePathLabel.Text = Ui.T("MetadataCachePath"); FileCachePathLabel.Text = Ui.T("FileCachePath");
         BrowseMetadataCacheButton.Content = Ui.T("Browse"); BrowseFileCacheButton.Content = Ui.T("Browse");
         ExplorerLanguageLabel.Text = Ui.T("ExplorerLanguage"); ServiceLanguageLabel.Text = Ui.T("ServiceLanguage");
+        DefaultViewLabel.Text = Ui.IsEnglish ? "Default view" : "默认视图";
+        var viewNames = Ui.IsEnglish
+            ? new[] { "Icons", "List", "Details", "Tiles", "Content" }
+            : new[] { "图标", "列表", "详细信息", "平铺", "内容" };
+        for (int i = 0; i < DefaultViewBox.Items.Count && i < viewNames.Length; i++)
+            ((ComboBoxItem)DefaultViewBox.Items[i]).Content = viewNames[i];
         HintText.Text = Ui.T("CacheDirectoryHint") + Environment.NewLine + Environment.NewLine + Ui.T("RestartExplorerHint"); SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");
     }
 
@@ -67,6 +74,7 @@ public partial class AppSettingsWindow : Window
         Settings.FileCachePath = FileCachePathBox.Text.Trim();
         Settings.ExplorerLanguage = (ExplorerLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.ServiceLanguage = (ServiceLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
+        Settings.DefaultViewMode = (DefaultViewBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "details";
         try
         {
             Settings.Save();

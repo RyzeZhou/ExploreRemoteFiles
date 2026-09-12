@@ -1,10 +1,10 @@
 <Window x:Class="RemoteFsClient.AppSettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Height="390" Width="650" ResizeMode="NoResize" WindowStartupLocation="CenterOwner">
+        Height="436" Width="650" ResizeMode="NoResize" WindowStartupLocation="CenterOwner">
     <Grid Margin="16">
         <Grid.ColumnDefinitions><ColumnDefinition Width="175"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
 
         <TextBlock x:Name="WinScpPathLabel" VerticalAlignment="Center"/>
         <TextBox x:Name="WinScpPathBox" Grid.Column="1" Margin="0,0,8,0"/>
@@ -26,8 +26,12 @@
         <ComboBox x:Name="ServiceLanguageBox" Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,10,0,0" SelectedValuePath="Tag">
             <ComboBoxItem Tag="zh-CN">简体中文</ComboBoxItem><ComboBoxItem Tag="en-US">English</ComboBoxItem>
         </ComboBox>
-        <TextBlock x:Name="HintText" Grid.Row="5" Grid.ColumnSpan="3" TextWrapping="Wrap" Foreground="#666" Margin="0,16,0,0"/>
-        <StackPanel Grid.Row="6" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+        <TextBlock x:Name="DefaultViewLabel" Grid.Row="5" VerticalAlignment="Center" Margin="0,14,0,0"/>
+        <ComboBox x:Name="DefaultViewBox" Grid.Row="5" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,14,0,0" SelectedValuePath="Tag">
+            <ComboBoxItem Tag="icons"/><ComboBoxItem Tag="list"/><ComboBoxItem Tag="details"/><ComboBoxItem Tag="tiles"/><ComboBoxItem Tag="content"/>
+        </ComboBox>
+        <TextBlock x:Name="HintText" Grid.Row="6" Grid.ColumnSpan="3" TextWrapping="Wrap" Foreground="#666" Margin="0,16,0,0"/>
+        <StackPanel Grid.Row="7" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
             <Button x:Name="SaveButton" Click="OnSave" Padding="16,4" Margin="0,0,8,0"/><Button x:Name="CancelButton" IsCancel="True" Padding="16,4"/>
         </StackPanel>
     </Grid>

@@ -12,6 +12,8 @@ public sealed class AppSettings
     public string ServiceLanguage { get; set; } = "zh-CN";
     public string MetadataCachePath { get; set; } = DefaultMetadataCachePath;
     public string FileCachePath { get; set; } = DefaultFileCachePath;
+    /// <summary>Explorer folder default view: icons | list | details | tiles | content.</summary>
+    public string DefaultViewMode { get; set; } = "details";
 
     public static string DefaultMetadataCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "MetadataCache");
     public static string DefaultFileCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "FileCache");
@@ -28,6 +30,7 @@ public sealed class AppSettings
                 ServiceLanguage = NormalizeLanguage(key?.GetValue("ServiceLanguage") as string),
                 MetadataCachePath = NormalizeDirectory(key?.GetValue("MetadataCachePath") as string, DefaultMetadataCachePath),
                 FileCachePath = NormalizeDirectory(key?.GetValue("FileCachePath") as string, DefaultFileCachePath),
+                DefaultViewMode = NormalizeViewMode(key?.GetValue("DefaultViewMode") as string),
             };
         }
         catch { return new AppSettings(); }
@@ -44,12 +47,23 @@ public sealed class AppSettings
         FileCachePath = NormalizeDirectory(FileCachePath, DefaultFileCachePath); Directory.CreateDirectory(FileCachePath);
         key.SetValue("MetadataCachePath", MetadataCachePath, RegistryValueKind.String);
         key.SetValue("FileCachePath", FileCachePath, RegistryValueKind.String);
+        key.SetValue("DefaultViewMode", NormalizeViewMode(DefaultViewMode), RegistryValueKind.String);
     }
 
     public static string NormalizeDirectory(string? path, string fallback)
     {
         try { return string.IsNullOrWhiteSpace(path) ? fallback : Path.GetFullPath(path.Trim()); } catch { return fallback; }
     }
+
+    /// <summary>icons | list | details | tiles | content; anything else falls back to details.</summary>
+    public static string NormalizeViewMode(string? mode) => (mode ?? "").Trim().ToLowerInvariant() switch
+    {
+        "icons" => "icons",
+        "list" => "list",
+        "tiles" => "tiles",
+        "content" => "content",
+        _ => "details",
+    };
 
     public static string NormalizeLanguage(string? language) =>
         string.Equals(language, "en-US", StringComparison.OrdinalIgnoreCase) ? "en-US" : "zh-CN";
