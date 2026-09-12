@@ -29,6 +29,7 @@ public sealed class TransferTask : INotifyPropertyChanged
     private double _speed;          // bytes/second
     private bool _paused;
     private string _status = "running";
+    private string _currentFile = "";
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -40,6 +41,14 @@ public sealed class TransferTask : INotifyPropertyChanged
     public bool IsFinished => _status is "done" or "fail" or "cancel";
     public bool IsFailed => _status == "fail";
     public bool IsPaused => _paused;
+
+    /// <summary>For a multi-file (batch) job, the file currently being transferred. Empty for single-file jobs and after completion.</summary>
+    public string CurrentFile
+    {
+        get => _currentFile;
+        set { _currentFile = value ?? ""; Raise(nameof(CurrentFileText)); }
+    }
+    public string CurrentFileText => _currentFile;
     public string PauseLabel => _paused ? (Ui.IsEnglish ? "Resume" : "继续") : (Ui.IsEnglish ? "Pause" : "暂停");
     public string CancelLabel => Ui.IsEnglish ? "Cancel" : "取消";
 
@@ -103,11 +112,13 @@ public sealed class TransferTask : INotifyPropertyChanged
         _status = ok ? "done" : "fail";
         if (ok && _total > 0) _done = _total;
         _speed = 0;
+        _currentFile = "";
         if (!ok && !string.IsNullOrWhiteSpace(message)) Failure = message;
         Raise(nameof(Percent));
         Raise(nameof(ProgressText));
         Raise(nameof(SpeedText));
         Raise(nameof(StatusText));
+        Raise(nameof(CurrentFileText));
     }
 
     internal static string Format(long bytes)
@@ -242,6 +253,7 @@ public sealed class TransferTaskService
                     if (task is null) break;
                     if (long.TryParse(f[2], out long done) && long.TryParse(f[3], out long total))
                         task.Update(done, total);
+                    if (f.Length >= 5) task.CurrentFile = f[4];
                     break;
                 }
                 case "E" when f.Length >= 3:

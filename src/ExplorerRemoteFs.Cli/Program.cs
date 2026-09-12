@@ -56,6 +56,9 @@ switch (argv[0].ToLowerInvariant())
     case "get":
         CmdGet(argv);
         break;
+    case "getr":
+        CmdGetR(argv);
+        break;
     case "open":
         CmdOpen(argv);
         break;
@@ -329,6 +332,109 @@ static void CmdChown(string[] args)
         ProviderFactory.Invalidate(conn.Name);
         Environment.Exit(2);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Recursive whole-tree download: ONE job, ONE connection, ONE queue entry.
+//
+// Mirrors WinSCP's queue model, where "each entry in the queue list represents
+// one background transfer (not file to transfer)": the tree is scanned first so
+// the job has a real total size (WinSCP's "Calculate total size"), then every
+// file is transferred over the same session while the job reports CUMULATIVE
+// bytes plus the file currently in flight (WinSCP shows that on the batch's
+// second line). Without this, pasting a folder produced one job per file.
+// ---------------------------------------------------------------------------
+static void CmdGetR(string[] args)
+{
+    if (args.Length < 4) { PrintUsage(); return; }
+    var conn = Find(args[1]);
+    string remoteDir = args[2];
+    string localDir = args[3];
+    try
+    {
+        var fs = ProviderFactory.Get(conn);
+        var files = new List<(string Remote, string Rel, long Size)>();
+        var dirs = new List<string>();
+        ScanTree(fs, remoteDir, "", files, dirs, 0);
+        long total = 0;
+        foreach (var f in files) total += f.Size;
+        JobReporter.Note($"getr scan {remoteDir}: {files.Count} files, {dirs.Count} dirs, {total} bytes");
+
+        Directory.CreateDirectory(localDir);
+        foreach (string d in dirs)
+        {
+            try { Directory.CreateDirectory(Path.Combine(localDir, d.Replace('/', Path.DirectorySeparatorChar))); }
+            catch { }
+        }
+        DownloadTreeTracked(fs, conn.Name, remoteDir, localDir, files, total);
+        Console.WriteLine($"GETR: {remoteDir} -> {localDir} ({files.Count} files)");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+/// <summary>Depth-limited recursive listing (relative paths use '/').</summary>
+static void ScanTree(IRemoteFileSystem fs, string remoteDir, string relDir,
+                     List<(string Remote, string Rel, long Size)> files, List<string> dirs, int depth)
+{
+    if (depth > 32) return;
+    IReadOnlyList<RemoteEntry> entries;
+    try { entries = fs.List(remoteDir); }
+    catch { return; }
+    foreach (var e in entries)
+    {
+        string rel = relDir.Length == 0 ? e.Name : relDir + "/" + e.Name;
+        if (e.IsDirectory && !e.IsSymlink)
+        {
+            dirs.Add(rel);
+            ScanTree(fs, e.Path, rel, files, dirs, depth + 1);
+        }
+        else if (e.IsFile)
+        {
+            files.Add((e.Path, rel, e.Size));
+        }
+    }
+}
+
+static void DownloadTreeTracked(IRemoteFileSystem fs, string server, string remoteDir, string localDir,
+                                List<(string Remote, string Rel, long Size)> files, long total)
+{
+    JobReporter.Begin("download", server, localDir, remoteDir, total);
+    long done = 0;
+    bool ok = true;
+    string failure = "";
+    foreach (var f in files)
+    {
+        string localPath = Path.Combine(localDir, f.Rel.Replace('/', Path.DirectorySeparatorChar));
+        try
+        {
+            string? parent = Path.GetDirectoryName(localPath);
+            if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+            // Write to a temp name and rename when complete: the shell
+            // extension starts reading a file as soon as it appears, so it must
+            // never observe a half-written one.
+            string tmp = localPath + ".rfs-part";
+            try { File.Delete(tmp); } catch { }
+            long baseDone = done;
+            fs.Download(f.Remote, tmp, (d, _) => JobReporter.Progress(baseDone + d, total, f.Rel));
+            try { File.Delete(localPath); } catch { }
+            File.Move(tmp, localPath);
+            done = baseDone + f.Size;
+            JobReporter.Progress(done, total, f.Rel);
+        }
+        catch (Exception ex)
+        {
+            ok = false;
+            failure = ex.Message;
+            JobReporter.Note($"getr FAIL {f.Remote}: {ex.Message}");
+            break;
+        }
+    }
+    JobReporter.End(ok, failure);
 }
 
 // Tracked transfer helpers: report the job to the service task window while

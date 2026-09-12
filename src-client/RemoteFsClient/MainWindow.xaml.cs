@@ -40,6 +40,7 @@ public partial class MainWindow : Window
             TColServer.Header = Ui.IsEnglish ? "Server" : "服务器";
             TColDirection.Header = Ui.IsEnglish ? "Direction" : "方向";
             TColFile.Header = Ui.IsEnglish ? "File" : "文件";
+            TColCurFile.Header = Ui.IsEnglish ? "Current file" : "当前文件";
             TColProgress.Header = Ui.IsEnglish ? "Progress" : "进度";
             TColDone.Header = Ui.IsEnglish ? "Transferred" : "已传输";
             TColSpeed.Header = Ui.IsEnglish ? "Speed" : "速度";

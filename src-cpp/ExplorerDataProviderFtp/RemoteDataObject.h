@@ -2,15 +2,16 @@
 // ---------------------------------------------------------------------------
 // RemoteDataObject.h — a virtual-file IDataObject for remote items.
 //
-// WHY: Explorer implements Copy / Cut / Move-to / Copy-to / Paste-shortcut and
-// "drag out to a local folder" through the shell's data-object + file-operation
-// engine. It never sends a canonical verb for those, so a namespace extension
-// must hand it a data object that can actually produce file CONTENT.
-//
-// DESIGN: file descriptors (name / size / mtime / attributes) are produced
-// immediately from the enumeration we already have, so Explorer can render its
-// own progress; the bytes are fetched LAZILY, the first time the shell reads
-// the stream (IStream::Read), into a temp file via the CLI's `get`.
+// Two content paths:
+//   * TOP-LEVEL FILE       -> CRemoteStream  (one CLI 'get' per file, one job)
+//   * FILE INSIDE A FOLDER -> CFolderFetch   (ONE CLI 'getr' for the whole
+//                                            tree, one job, WinSCP-style)
+// The folder path mirrors WinSCP's queue model: "each entry in the queue
+// represents one background transfer (not a file)" — a directory copy is a
+// single job that scans the tree, sums the total size, then transfers every
+// file over the same session while reporting cumulative bytes + the file in
+// flight. Descriptors are produced from the listing walk (no download);
+// contents are served from the local temp tree the 'getr' writes into.
 // ---------------------------------------------------------------------------
 
 #include <windows.h>
@@ -19,6 +20,7 @@
 #include <strsafe.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include "ProbeLog.h"
 #include "FtpMeta.h"
 
@@ -32,7 +34,8 @@ inline std::wstring RfsCliPath()
     return p;
 }
 
-// Synchronous `cli get <site> <remote> <local>`; TRUE on success.
+// Synchronous `cli get <site> <remote> <local>`; TRUE on success. (Top-level
+// single-file copies still use this — one job per file.)
 inline BOOL RfsFetchToFile(PCWSTR site, PCWSTR remote, PCWSTR local)
 {
     std::wstring cli = RfsCliPath();
@@ -57,6 +60,7 @@ inline BOOL RfsFetchToFile(PCWSTR site, PCWSTR remote, PCWSTR local)
 
 // ---------------------------------------------------------------------------
 // Lazy stream: downloads once, then serves the local temp file.
+// (Top-level single-file path.)
 // ---------------------------------------------------------------------------
 class CRemoteStream : public IStream
 {
@@ -67,7 +71,6 @@ public:
     {
     }
 
-    // IUnknown
     STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
     {
         if (!ppv) return E_POINTER;
@@ -89,7 +92,6 @@ public:
         return n;
     }
 
-    // ISequentialStream
     STDMETHODIMP Read(void *pv, ULONG cb, ULONG *pcbRead) override
     {
         if (pcbRead) *pcbRead = 0;
@@ -103,7 +105,6 @@ public:
     }
     STDMETHODIMP Write(const void *, ULONG, ULONG *) override { return STG_E_ACCESSDENIED; }
 
-    // IStream
     STDMETHODIMP Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *newPos) override
     {
         if (!Ensure()) return STG_E_READFAULT;
@@ -194,6 +195,260 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Folder fetch: ONE 'cli getr' process downloads the whole tree into a temp
+// root, writing each file to <name>.rfs-part and renaming on completion (so a
+// waiter never sees a half-written file). Streams served from the local tree.
+// Refcounted: the data object + every live stream hold a ref; at 0 the process
+// is killed (if still running) and the temp tree is deleted.
+// ---------------------------------------------------------------------------
+class CFolderFetch
+{
+public:
+    CFolderFetch(PCWSTR site, PCWSTR remoteDir)
+        : _ref(1), _proc(NULL), _started(FALSE), _seq(0)
+    {
+        if (site) _site = site;
+        if (remoteDir) _remoteDir = remoteDir;
+        WCHAR tmp[MAX_PATH] = {};
+        if (GetTempPathW(ARRAYSIZE(tmp), tmp))
+        {
+            _seq = InterlockedIncrement(&s_seq);
+            WCHAR buf[MAX_PATH] = {};
+            StringCchPrintfW(buf, ARRAYSIZE(buf), L"%srfs-copy-%u-%ld", tmp, GetCurrentProcessId(), _seq);
+            _localRoot = buf;
+            CreateDirectoryW(_localRoot.c_str(), NULL);
+        }
+        InitializeCriticalSection(&_cs);
+    }
+
+    ~CFolderFetch()
+    {
+        if (_proc)
+        {
+            DWORD code = STILL_ACTIVE;
+            if (GetExitCodeProcess(_proc, &code) && code == STILL_ACTIVE)
+                TerminateProcess(_proc, 1);
+            CloseHandle(_proc);
+        }
+        DeleteTree(_localRoot);
+        DeleteCriticalSection(&_cs);
+    }
+
+    LONG AddRef() { return InterlockedIncrement(&_ref); }
+    LONG Release()
+    {
+        LONG n = InterlockedDecrement(&_ref);
+        if (n == 0) delete this;
+        return n;
+    }
+
+    void EnsureStarted()
+    {
+        EnterCriticalSection(&_cs);
+        if (_started) { LeaveCriticalSection(&_cs); return; }
+        _started = TRUE;
+        LeaveCriticalSection(&_cs);
+
+        std::wstring cli = RfsCliPath();
+        if (cli.empty() || _localRoot.empty())
+        {
+            ProbeLog(L"[DATAOBJ] getr cannot start (cli/root empty)");
+            return;
+        }
+        std::wstring cmd = L"\"" + cli + L"\" getr \"" + _site + L"\" \"" + _remoteDir + L"\" \"" + _localRoot + L"\"";
+        std::vector<WCHAR> line(cmd.begin(), cmd.end());
+        line.push_back(0);
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {};
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        if (CreateProcessW(NULL, line.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        {
+            _proc = pi.hProcess;
+            CloseHandle(pi.hThread);
+            ProbeLog(L"[DATAOBJ] getr started site='%s' dir='%s' root='%s' pid=%u",
+                     _site.c_str(), _remoteDir.c_str(), _localRoot.c_str(), pi.dwProcessId);
+        }
+        else
+        {
+            ProbeLog(L"[DATAOBJ] getr CreateProcess FAILED err=%u", GetLastError());
+        }
+    }
+
+    std::wstring LocalPath(const std::wstring &rel) const
+    {
+        std::wstring p = _localRoot;
+        p += L"\\";
+        p += rel;       // rel already uses backslash separators
+        return p;
+    }
+
+    // Wait until the file appears (the 'getr' process renames it into place
+    // when its download completes). Returns FALSE if the process ended without
+    // producing this file.
+    BOOL WaitForFile(const std::wstring &rel)
+    {
+        std::wstring p = LocalPath(rel);
+        for (;;)
+        {
+            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES)
+                return TRUE;
+            if (_proc)
+            {
+                DWORD code = STILL_ACTIVE;
+                if (GetExitCodeProcess(_proc, &code) && code != STILL_ACTIVE)
+                {
+                    // Process ended — give the final rename a brief moment to
+                    // land, then a last check.
+                    for (int i = 0; i < 5; i++)
+                    {
+                        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return TRUE;
+                        Sleep(80);
+                    }
+                    return FALSE;
+                }
+            }
+            Sleep(80);
+        }
+    }
+
+private:
+    static LONG s_seq;
+
+    static void DeleteTree(const std::wstring &path)
+    {
+        if (path.empty()) return;
+        // Double-null-terminated path for SHFileOperation.
+        int n = (int)path.size();
+        std::vector<WCHAR> buf(n + 2, 0);
+        memcpy(buf.data(), path.c_str(), (size_t)n * sizeof(WCHAR));
+        buf[n] = 0; buf[n + 1] = 0;
+        SHFILEOPSTRUCTW op = {};
+        op.wFunc = FO_DELETE;
+        op.pFrom = buf.data();
+        op.fFlags = FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_ALLOWUNDO;
+        SHFileOperationW(&op);
+    }
+
+    LONG _ref;
+    std::wstring _site, _remoteDir, _localRoot;
+    HANDLE _proc;
+    BOOL _started;
+    LONG _seq;
+    CRITICAL_SECTION _cs;
+};
+LONG CFolderFetch::s_seq = 0;
+
+// ---------------------------------------------------------------------------
+// Local-file stream: serves bytes from a file the 'getr' process already
+// wrote. Holds a ref on the owning fetch so the temp tree stays alive while the
+// shell reads.
+// ---------------------------------------------------------------------------
+class CLocalStream : public IStream
+{
+public:
+    CLocalStream(PCWSTR localPath, ULONGLONG size, CFolderFetch *fetch)
+        : _ref(1), _size(size), _pos(0), _h(INVALID_HANDLE_VALUE), _fetch(fetch)
+    {
+        if (localPath) _local = localPath;
+        _h = CreateFileW(_local.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (_fetch) _fetch->AddRef();
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IStream) ||
+            IsEqualIID(riid, IID_ISequentialStream))
+        {
+            *ppv = static_cast<IStream *>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&_ref); }
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        LONG n = InterlockedDecrement(&_ref);
+        if (n == 0) delete this;
+        return n;
+    }
+
+    STDMETHODIMP Read(void *pv, ULONG cb, ULONG *pcbRead) override
+    {
+        if (pcbRead) *pcbRead = 0;
+        if (!pv) return STG_E_INVALIDPOINTER;
+        if (_h == INVALID_HANDLE_VALUE) return STG_E_READFAULT;
+        DWORD got = 0;
+        if (!ReadFile(_h, pv, cb, &got, NULL)) return STG_E_READFAULT;
+        if (pcbRead) *pcbRead = got;
+        _pos += got;
+        return got == 0 ? S_FALSE : S_OK;
+    }
+    STDMETHODIMP Write(const void *, ULONG, ULONG *) override { return STG_E_ACCESSDENIED; }
+    STDMETHODIMP Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *newPos) override
+    {
+        if (_h == INVALID_HANDLE_VALUE) return STG_E_READFAULT;
+        LARGE_INTEGER zero = {};
+        if (!SetFilePointerEx(_h, move, &zero, origin)) return STG_E_INVALIDFUNCTION;
+        _pos = (ULONGLONG)zero.QuadPart;
+        if (newPos) newPos->QuadPart = _pos;
+        return S_OK;
+    }
+    STDMETHODIMP SetSize(ULARGE_INTEGER) override { return STG_E_ACCESSDENIED; }
+    STDMETHODIMP CopyTo(IStream *dst, ULARGE_INTEGER cb, ULARGE_INTEGER *rd, ULARGE_INTEGER *wr) override
+    {
+        if (!dst) return STG_E_INVALIDPOINTER;
+        std::vector<BYTE> buf(64 * 1024);
+        ULONGLONG tr = 0, tw = 0;
+        while (tr < cb.QuadPart)
+        {
+            ULONGLONG want64 = (ULONGLONG)buf.size();
+            if (want64 > cb.QuadPart - tr) want64 = cb.QuadPart - tr;
+            ULONG want = (ULONG)want64, got = 0;
+            if (FAILED(Read(buf.data(), want, &got)) || got == 0) break;
+            ULONG put = 0;
+            if (FAILED(dst->Write(buf.data(), got, &put))) break;
+            tr += got; tw += put;
+            if (put != got) break;
+        }
+        if (rd) rd->QuadPart = tr;
+        if (wr) wr->QuadPart = tw;
+        return S_OK;
+    }
+    STDMETHODIMP Commit(DWORD) override { return S_OK; }
+    STDMETHODIMP Revert() override { return E_NOTIMPL; }
+    STDMETHODIMP LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
+    STDMETHODIMP UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
+    STDMETHODIMP Stat(STATSTG *st, DWORD) override
+    {
+        if (!st) return STG_E_INVALIDPOINTER;
+        ZeroMemory(st, sizeof(*st));
+        st->type = STGTY_STREAM;
+        st->cbSize.QuadPart = _size;
+        st->grfMode = STGM_READ;
+        return S_OK;
+    }
+    STDMETHODIMP Clone(IStream **) override { return E_NOTIMPL; }
+
+private:
+    ~CLocalStream()
+    {
+        if (_h != INVALID_HANDLE_VALUE) CloseHandle(_h);
+        if (_fetch) _fetch->Release();
+    }
+
+    LONG _ref;
+    std::wstring _local;
+    ULONGLONG _size, _pos;
+    HANDLE _h;
+    CFolderFetch *_fetch;
+};
+
+// ---------------------------------------------------------------------------
 // Data object: descriptors up front, contents lazily.
 // ---------------------------------------------------------------------------
 class CRemoteDataObject : public IDataObject
@@ -206,10 +461,9 @@ public:
         ULONGLONG size;
         DWORD mtime;
         BOOL isFolder;
+        CFolderFetch *fetch = nullptr;   // non-null for items inside a top-level folder
     };
 
-    // Safety cap: a pathological tree must not blow up memory or the shell's
-    // copy dialog. Items beyond this are dropped (logged).
     static const size_t kMaxItems = 5000;
 
     static HRESULT Create(REFIID riid, void **ppv)
@@ -236,7 +490,6 @@ public:
         _tops.push_back(it);
     }
 
-    // IUnknown
     STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
     {
         if (!ppv) return E_POINTER;
@@ -257,25 +510,34 @@ public:
         return n;
     }
 
-    // ---- lazy tree expansion --------------------------------------------
-    // Called only from GetData (i.e. when the shell actually starts a copy).
-    // Walks each folder with the cached listing helper; a cache miss falls back
-    // to the bridge/CLI path, which is why this must not run on selection.
     void ExpandIfNeeded()
     {
         if (_expanded) return;
         _expanded = TRUE;
         _items.clear();
         for (size_t i = 0; i < _tops.size(); i++)
-            ExpandInto(_tops[i]);
+        {
+            CFolderFetch *fetch = nullptr;
+            if (_tops[i].isFolder)
+            {
+                std::wstring full = _tops[i].folder;
+                if (!full.empty() && full[full.size() - 1] != L'/') full += L'/';
+                full += _tops[i].name;
+                fetch = new (std::nothrow) CFolderFetch(_tops[i].site.c_str(), full.c_str());
+                if (fetch) _fetches.push_back(fetch);
+            }
+            ExpandInto(_tops[i], fetch);
+        }
         ProbeLog(L"[DATAOBJ] expanded tops=%u items=%u%s", (UINT)_tops.size(), (UINT)_items.size(),
                  _items.size() >= kMaxItems ? L" (truncated)" : L"");
     }
 
-    void ExpandInto(const Item &dir)
+    void ExpandInto(const Item &dir, CFolderFetch *fetch)
     {
         if (_items.size() >= kMaxItems) return;
-        _items.push_back(dir);
+        Item it = dir;
+        it.fetch = fetch;
+        _items.push_back(it);
         if (!dir.isFolder) return;
 
         std::wstring full = dir.folder;
@@ -291,19 +553,19 @@ public:
         for (size_t k = 0; k < kids.size(); k++)
         {
             if (_items.size() >= kMaxItems) return;
-            Item it;
-            it.site = dir.site;
-            it.folder = full;
-            it.name = kids[k].szName;
-            it.relPath = dir.relPath + L"\\" + kids[k].szName;
-            it.size = kids[k].dwSize;
-            it.mtime = kids[k].dwMtime;
-            it.isFolder = kids[k].fIsFolder;
-            ExpandInto(it);
+            Item it2;
+            it2.site = dir.site;
+            it2.folder = full;
+            it2.name = kids[k].szName;
+            it2.relPath = dir.relPath + L"\\" + kids[k].szName;
+            it2.size = kids[k].dwSize;
+            it2.mtime = kids[k].dwMtime;
+            it2.isFolder = kids[k].fIsFolder;
+            it2.fetch = fetch;       // inherit the folder's fetch context
+            ExpandInto(it2, fetch);
         }
     }
 
-    // ---- IDataObject ----------------------------------------------------
     STDMETHODIMP GetData(FORMATETC *fmt, STGMEDIUM *medium) override
     {
         if (!fmt || !medium) return E_INVALIDARG;
@@ -344,7 +606,29 @@ public:
         if (fmt->cfFormat == cfContents && fmt->lindex >= 0 && (size_t)fmt->lindex < _items.size())
         {
             const Item &it = _items[(size_t)fmt->lindex];
-            if (it.isFolder) return DV_E_LINDEX;      // folders have no byte stream
+            if (it.isFolder) return DV_E_LINDEX;
+
+            // File inside a copied folder: ONE 'getr' downloads the whole
+            // tree; serve this file from the local temp tree once it lands.
+            if (it.fetch)
+            {
+                it.fetch->EnsureStarted();
+                if (!it.fetch->WaitForFile(it.relPath))
+                {
+                    ProbeLog(L"[DATAOBJ] fetch wait failed '%s'", it.relPath.c_str());
+                    return STG_E_READFAULT;
+                }
+                std::wstring local = it.fetch->LocalPath(it.relPath);
+                CLocalStream *stream = new (std::nothrow) CLocalStream(local.c_str(), it.size, it.fetch);
+                if (!stream) return E_OUTOFMEMORY;
+                medium->tymed = TYMED_ISTREAM;
+                medium->pstm = stream;
+                medium->pUnkForRelease = NULL;
+                ProbeLog(L"[DATAOBJ] GetData contents idx=%d '%s' (from folder fetch)", (int)fmt->lindex, it.name.c_str());
+                return S_OK;
+            }
+
+            // Top-level single file: one 'get' per file.
             std::wstring remote = it.folder;
             if (!remote.empty() && remote[remote.size() - 1] != L'/') remote += L'/';
             remote += it.name;
@@ -395,10 +679,14 @@ public:
 
 private:
     CRemoteDataObject() : _ref(1) {}
-    ~CRemoteDataObject() {}
+    ~CRemoteDataObject()
+    {
+        for (size_t i = 0; i < _fetches.size(); i++) _fetches[i]->Release();
+    }
 
     LONG _ref;
-    std::vector<Item> _tops;    // what the user selected
-    std::vector<Item> _items;   // flattened tree (built on first GetData)
+    std::vector<Item> _tops;        // what the user selected
+    std::vector<Item> _items;       // flattened tree (built on first GetData)
+    std::vector<CFolderFetch *> _fetches;   // top-level folder contexts (owned)
     BOOL _expanded = FALSE;
 };

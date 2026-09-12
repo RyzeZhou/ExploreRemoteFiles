@@ -93,7 +93,8 @@
                                 <GridView>
                                     <GridViewColumn x:Name="TColServer" Width="90" DisplayMemberBinding="{Binding Server}"/>
                                     <GridViewColumn x:Name="TColDirection" Width="60" DisplayMemberBinding="{Binding DirectionLabel}"/>
-                                    <GridViewColumn x:Name="TColFile" Width="140" DisplayMemberBinding="{Binding Name}"/>
+                                    <GridViewColumn x:Name="TColFile" Width="120" DisplayMemberBinding="{Binding Name}"/>
+                                    <GridViewColumn x:Name="TColCurFile" Width="150" DisplayMemberBinding="{Binding CurrentFileText}"/>
                                     <GridViewColumn x:Name="TColProgress" Width="130">
                                         <GridViewColumn.CellTemplate>
                                             <DataTemplate>

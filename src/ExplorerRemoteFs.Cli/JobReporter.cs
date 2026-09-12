@@ -8,7 +8,7 @@ using System.Text;
 ///
 /// Wire format (UTF-8 lines, TAB separated):
 ///   B  id  direction(upload|download)  server  name  localPath  remotePath  totalBytes  pid
-///   P  id  doneBytes  totalBytes
+///   P  id  doneBytes  totalBytes  [currentFile]
 ///   E  id  status(done|fail)  message
 /// </summary>
 internal static class JobReporter
@@ -26,6 +26,7 @@ internal static class JobReporter
     private static string _id = "";
     private static long _lastSent;
     private static DateTime _lastAt = DateTime.MinValue;
+    private static string _lastFile = "";
 
     public static void Begin(string direction, string server, string localPath, string remotePath, long total)
     {
@@ -35,6 +36,7 @@ internal static class JobReporter
             _id = Guid.NewGuid().ToString("N")[..8];
             _lastSent = 0;
             _lastAt = DateTime.MinValue;
+            _lastFile = "";
             string name = Path.GetFileName(remotePath.TrimEnd('/'));
             if (string.IsNullOrEmpty(name)) name = remotePath;
             try
@@ -46,7 +48,16 @@ internal static class JobReporter
         }
     }
 
-    public static void Progress(long done, long total)
+    public static void Progress(long done, long total) => Progress(done, total, null);
+
+    /// <summary>
+    /// Progress of a job. For a MULTI-FILE job (a whole directory tree fetched
+    /// as one transfer, mirroring WinSCP's queue where one entry represents a
+    /// transfer and not a file) <paramref name="currentFile"/> names the file in
+    /// flight; the service shows it on the batch's second line.
+    /// bytes are cumulative across ALL files of the job.
+    /// </summary>
+    public static void Progress(long done, long total, string? currentFile)
     {
         // Paused? Block the transfer thread here (the callback runs on it), in
         // short slices so a resume is picked up promptly. Killing the process
@@ -60,12 +71,15 @@ internal static class JobReporter
         {
             if (_writer is null) return;
             DateTime now = DateTime.UtcNow;
-            // Throttle to ~8 updates/s (plus always report the final byte) so a
-            // fast transfer cannot flood the pipe/window.
-            if (now - _lastAt < TimeSpan.FromMilliseconds(120) && done - _lastSent < 262144) return;
+            string file = currentFile ?? "";
+            bool fileChanged = !string.Equals(file, _lastFile, StringComparison.Ordinal);
+            // Throttle to ~8 updates/s (plus always report the final byte and
+            // every file change) so a fast transfer cannot flood the window.
+            if (!fileChanged && now - _lastAt < TimeSpan.FromMilliseconds(120) && done - _lastSent < 262144) return;
             _lastAt = now;
             _lastSent = done;
-            Send($"P\t{_id}\t{done}\t{total}");
+            _lastFile = file;
+            Send($"P\t{_id}\t{done}\t{total}\t{file}");
         }
     }
 
