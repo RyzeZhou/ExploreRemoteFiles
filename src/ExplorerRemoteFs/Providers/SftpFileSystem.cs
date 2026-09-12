@@ -134,21 +134,27 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"SFTP mkdir: {path}");
     }
 
-    public void Download(string remotePath, string localPath)
+    public void Download(string remotePath, string localPath, Action<long, long>? progress = null)
     {
         EnsureConnected();
         if (_client is null) return;
+        long total = 0;
+        try { total = _client.GetAttributes(remotePath).Size; } catch { }
         using var fs = File.Create(localPath);
-        _client.DownloadFile(remotePath, fs);
+        _client.DownloadFile(remotePath, fs, downloaded => progress?.Invoke((long)downloaded, total));
+        progress?.Invoke(new FileInfo(localPath).Length, new FileInfo(localPath).Length);
         Utils.ShellLog.Write($"SFTP get: {remotePath} -> {localPath}");
     }
 
-    public void Upload(string localPath, string remotePath)
+    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null)
     {
         EnsureConnected();
         if (_client is null) return;
+        long total = 0;
+        try { total = new FileInfo(localPath).Length; } catch { }
         using var fs = File.OpenRead(localPath);
-        _client.UploadFile(fs, remotePath);
+        _client.UploadFile(fs, remotePath, uploaded => progress?.Invoke((long)uploaded, total));
+        progress?.Invoke(total, total);
         Utils.ShellLog.Write($"SFTP put: {localPath} -> {remotePath}");
     }
 

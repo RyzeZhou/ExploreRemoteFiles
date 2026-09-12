@@ -21,11 +21,11 @@ public interface IRemoteFileSystem : IDisposable
     /// <summary>创建目录（远程）。</summary>
     void CreateDirectory(string path);
 
-    /// <summary>下载远程文件到本地路径。</summary>
-    void Download(string remotePath, string localPath);
+    /// <summary>下载远程文件到本地路径。progress(已传字节, 总字节) 可选。</summary>
+    void Download(string remotePath, string localPath, Action<long, long>? progress = null);
 
-    /// <summary>上传本地文件到远程路径。</summary>
-    void Upload(string localPath, string remotePath);
+    /// <summary>上传本地文件到远程路径。progress(已传字节, 总字节) 可选。</summary>
+    void Upload(string localPath, string remotePath, Action<long, long>? progress = null);
 
     /// <summary>修改远程权限（chmod；mode 为 8 进制数字，如 640）。</summary>
     void SetPermissions(string path, int mode);

@@ -140,23 +140,38 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"FTP mkdir: {path}");
     }
 
-    public void Download(string remotePath, string localPath)
+    public void Download(string remotePath, string localPath, Action<long, long>? progress = null)
     {
         EnsureConnected();
         if (_client is null) return;
-        var result = _client.DownloadFile(localPath, remotePath, FtpLocalExists.Overwrite);
+        Action<FtpProgress>? fp = null;
+        if (progress is not null)
+            fp = p =>
+            {
+                // FluentFTP exposes no TotalBytes; derive it from the percentage.
+                long total = p.Progress > 0 ? (long)(p.TransferredBytes / (p.Progress / 100.0)) : 0;
+                progress(p.TransferredBytes, total);
+            };
+        var result = _client.DownloadFile(localPath, remotePath, FtpLocalExists.Overwrite, FtpVerify.None, fp);
         if (result == FtpStatus.Failed)
             throw new InvalidOperationException($"FTP download failed: {remotePath}");
+        progress?.Invoke(new FileInfo(localPath).Length, new FileInfo(localPath).Length);
         Utils.ShellLog.Write($"FTP get: {remotePath} -> {localPath}");
     }
 
-    public void Upload(string localPath, string remotePath)
+    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null)
     {
         EnsureConnected();
         if (_client is null) return;
-        var result = _client.UploadFile(localPath, remotePath, FtpRemoteExists.Overwrite, true, FtpVerify.None, null);
+        long total = 0;
+        try { total = new FileInfo(localPath).Length; } catch { }
+        Action<FtpProgress>? fp = null;
+        if (progress is not null)
+            fp = p => progress(p.TransferredBytes, total);
+        var result = _client.UploadFile(localPath, remotePath, FtpRemoteExists.Overwrite, true, FtpVerify.None, fp);
         if (result == FtpStatus.Failed)
             throw new InvalidOperationException($"FTP upload failed: {remotePath}");
+        progress?.Invoke(total, total);
         Utils.ShellLog.Write($"FTP put: {localPath} -> {remotePath}");
     }
 

@@ -1,5 +1,6 @@
 using System.Threading;
 using System.Windows;
+using System.Windows.Threading;
 using WinForms = System.Windows.Forms;
 using Drawing = System.Drawing;
 using RemoteFsClient.Services;
@@ -18,6 +19,9 @@ public partial class App : System.Windows.Application
     private WinForms.ContextMenuStrip? _trayMenu;
     private MainWindow? _manager;
     private RemoteBridgeService? _bridge;
+    private TransferTaskService? _transfers;
+    private TransferWindow? _transferWindow;
+    private DispatcherTimer? _transferHideTimer;
     private bool _isExiting;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -48,6 +52,10 @@ public partial class App : System.Windows.Application
         CreateTrayIcon();
         _bridge = new RemoteBridgeService();
         _bridge.Start();
+        _transfers = new TransferTaskService(Dispatcher);
+        _transfers.JobStarted += OnTransferJobStarted;
+        _transfers.AllFinished += OnAllTransfersFinished;
+        _transfers.Start();
         ListenForShowRequests();
         if (!background || showRequested) ShowManager();
     }
@@ -92,6 +100,33 @@ public partial class App : System.Windows.Application
             }
             catch (ObjectDisposedException) { }
         });
+    }
+
+    /// <summary>Show the transfer window when a job starts (it stays open while
+    /// jobs run and auto-hides a few seconds after the last one finishes).</summary>
+    private void OnTransferJobStarted()
+    {
+        _transferHideTimer?.Stop();
+        _transferWindow ??= new TransferWindow(_transfers!.Tasks);
+        if (!_transferWindow.IsVisible) _transferWindow.Show();
+        if (_transferWindow.WindowState == WindowState.Minimized)
+            _transferWindow.WindowState = WindowState.Normal;
+        _transferWindow.Activate();
+    }
+
+    private void OnAllTransfersFinished()
+    {
+        _transferHideTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
+        _transferHideTimer.Tick -= OnTransferHideTick;
+        _transferHideTimer.Tick += OnTransferHideTick;
+        _transferHideTimer.Stop();
+        _transferHideTimer.Start();
+    }
+
+    private void OnTransferHideTick(object? sender, EventArgs e)
+    {
+        _transferHideTimer?.Stop();
+        if (_transferWindow is { RunningCount: 0 }) _transferWindow.Hide();
     }
 
     private void ShowManager()
