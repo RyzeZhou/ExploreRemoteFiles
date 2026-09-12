@@ -80,6 +80,38 @@
                         <Button x:Name="EditSiteSettingsButton" Click="OnEdit" Padding="12,4" HorizontalAlignment="Left" Margin="0,20,0,0"/>
                     </StackPanel>
                 </TabItem>
+                <TabItem x:Name="TransferTab">
+                    <Grid Margin="12">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <TextBlock x:Name="TransferSummary" Grid.Row="0" Margin="0,0,0,8" TextWrapping="Wrap"/>
+                        <ListView x:Name="TransferList" Grid.Row="1" BorderThickness="1">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn x:Name="TColServer" Width="110" DisplayMemberBinding="{Binding Server}"/>
+                                    <GridViewColumn x:Name="TColDirection" Width="70" DisplayMemberBinding="{Binding DirectionLabel}"/>
+                                    <GridViewColumn x:Name="TColFile" Width="170" DisplayMemberBinding="{Binding Name}"/>
+                                    <GridViewColumn x:Name="TColProgress" Width="160">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <ProgressBar Height="14" Minimum="0" Maximum="100" Value="{Binding Percent, Mode=OneWay}"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn x:Name="TColDone" Width="120" DisplayMemberBinding="{Binding ProgressText}"/>
+                                    <GridViewColumn x:Name="TColSpeed" Width="80" DisplayMemberBinding="{Binding SpeedText}"/>
+                                    <GridViewColumn x:Name="TColStatus" Width="70" DisplayMemberBinding="{Binding StatusText}"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
+                            <Button x:Name="TransferClearButton" Click="OnClearTransfers" Padding="12,4"/>
+                        </StackPanel>
+                    </Grid>
+                </TabItem>
             </TabControl>
         </Grid>
     </DockPanel>

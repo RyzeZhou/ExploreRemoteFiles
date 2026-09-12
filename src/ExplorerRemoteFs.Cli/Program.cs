@@ -333,18 +333,18 @@ static void CmdChown(string[] args)
 
 // Tracked transfer helpers: report the job to the service task window while
 // keeping the CLI's own error behaviour unchanged (rethrow after reporting).
-static void UploadTracked(IRemoteFileSystem fs, string local, string remote)
+static void UploadTracked(IRemoteFileSystem fs, string server, string local, string remote)
 {
     long total = 0;
     try { total = new FileInfo(local).Length; } catch { }
-    JobReporter.Begin("upload", local, remote, total);
+    JobReporter.Begin("upload", server, local, remote, total);
     try { fs.Upload(local, remote, JobReporter.Progress); JobReporter.End(true); }
     catch (Exception ex) { JobReporter.End(false, ex.Message); throw; }
 }
 
-static void DownloadTracked(IRemoteFileSystem fs, string remote, string local)
+static void DownloadTracked(IRemoteFileSystem fs, string server, string remote, string local)
 {
-    JobReporter.Begin("download", local, remote, 0);
+    JobReporter.Begin("download", server, local, remote, 0);
     try { fs.Download(remote, local, JobReporter.Progress); JobReporter.End(true); }
     catch (Exception ex) { JobReporter.End(false, ex.Message); throw; }
 }
@@ -356,7 +356,7 @@ static void CmdGet(string[] args)
     try
     {
         var fs = ProviderFactory.Get(conn);
-        DownloadTracked(fs, args[2], args[3]);
+        DownloadTracked(fs, conn.Name, args[2], args[3]);
         Console.WriteLine($"GET: {args[2]} -> {args[3]}");
     }
     catch (Exception ex)
@@ -396,7 +396,7 @@ static void CmdOpen(string[] args)
             "rfs-open-" + Guid.NewGuid().ToString("N").Substring(0, 6) + "-" + name);
         try { if (File.Exists(local)) File.Delete(local); } catch { }
         var fs = ProviderFactory.Get(conn);
-        DownloadTracked(fs, remotePath, local);
+        DownloadTracked(fs, conn.Name, remotePath, local);
         var psi = new System.Diagnostics.ProcessStartInfo(local) { UseShellExecute = true };
         System.Diagnostics.Process.Start(psi);
         Console.WriteLine($"OPEN: {remotePath} -> {local}");
@@ -456,7 +456,7 @@ static void CmdPaste(string[] args)
             string remote = dir.TrimEnd('/') + "/" + Path.GetFileName(local);
             try
             {
-                UploadTracked(fs, local, remote);
+                UploadTracked(fs, conn.Name, local, remote);
                 PasteLog($"OK {local} -> {remote}");
             }
             catch (Exception ex)
@@ -489,7 +489,7 @@ static void CmdPut(string[] args)
     try
     {
         var fs = ProviderFactory.Get(conn);
-        UploadTracked(fs, args[2], args[3]);
+        UploadTracked(fs, conn.Name, args[2], args[3]);
         Console.WriteLine($"PUT: {args[2]} -> {args[3]}");
     }
     catch (Exception ex)

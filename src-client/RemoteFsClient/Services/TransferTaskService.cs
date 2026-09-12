@@ -13,6 +13,8 @@ public sealed class TransferTask : INotifyPropertyChanged
 {
     public string Id { get; init; } = "";
     public string Direction { get; init; } = "upload";     // upload | download
+    /// <summary>Saved-site (server) name this transfer belongs to.</summary>
+    public string Server { get; init; } = "";
     public string Name { get; init; } = "";
     public string LocalPath { get; init; } = "";
     public string RemotePath { get; init; } = "";
@@ -32,6 +34,7 @@ public sealed class TransferTask : INotifyPropertyChanged
     public string DirectionLabel => Direction == "download" ? "↓ 下载" : "↑ 上传";
     public string TargetText => Direction == "download" ? LocalPath : RemotePath;
     public bool IsFinished => _status is "done" or "fail";
+    public bool IsFailed => _status == "fail";
 
     public double Percent => _total > 0
         ? (_done >= _total ? 100.0 : Math.Max(0, _done * 100.0 / _total))
@@ -162,21 +165,22 @@ public sealed class TransferTaskService
     {
         string[] f = line.Split('\t');
         if (f.Length < 3) return;
-        if (f[0] == "B" && f.Length >= 7)
-            Log("BEGIN dir=" + f[2] + " name=" + f[3] + " total=" + f[6]);
+        if (f[0] == "B" && f.Length >= 8)
+            Log("BEGIN server=" + f[3] + " dir=" + f[2] + " name=" + f[4] + " total=" + f[7]);
         else if (f[0] == "E" && f.Length >= 3)
             Log("END status=" + f[2]);
         _dispatcher.BeginInvoke(() =>
         {
             switch (f[0])
             {
-                case "B" when f.Length >= 7:
+                case "B" when f.Length >= 8:
                 {
                     var task = new TransferTask
                     {
-                        Id = f[1], Direction = f[2], Name = f[3], LocalPath = f[4], RemotePath = f[5],
+                        Id = f[1], Direction = f[2], Server = f[3], Name = f[4],
+                        LocalPath = f[5], RemotePath = f[6],
                     };
-                    if (long.TryParse(f[6], out long total) && total > 0) task.Update(0, total);
+                    if (long.TryParse(f[7], out long total) && total > 0) task.Update(0, total);
                     Tasks.Insert(0, task);      // newest first
                     JobStarted?.Invoke();
                     break;
@@ -199,6 +203,17 @@ public sealed class TransferTaskService
                 }
             }
         });
+    }
+
+    /// <summary>Number of jobs that have not finished yet.</summary>
+    public int RunningCount
+    {
+        get
+        {
+            int n = 0;
+            foreach (TransferTask t in Tasks) if (!t.IsFinished) n++;
+            return n;
+        }
     }
 
     private TransferTask? Find(string id)

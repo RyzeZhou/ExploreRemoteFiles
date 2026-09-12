@@ -7,7 +7,7 @@ using System.Text;
 /// reporting is UI only and must never affect the transfer itself.
 ///
 /// Wire format (UTF-8 lines, TAB separated):
-///   B  id  direction(upload|download)  name  localPath  remotePath  totalBytes
+///   B  id  direction(upload|download)  server  name  localPath  remotePath  totalBytes
 ///   P  id  doneBytes  totalBytes
 ///   E  id  status(done|fail)  message
 /// </summary>
@@ -21,7 +21,7 @@ internal static class JobReporter
     private static long _lastSent;
     private static DateTime _lastAt = DateTime.MinValue;
 
-    public static void Begin(string direction, string localPath, string remotePath, long total)
+    public static void Begin(string direction, string server, string localPath, string remotePath, long total)
     {
         lock (Gate)
         {
@@ -31,7 +31,7 @@ internal static class JobReporter
             _lastAt = DateTime.MinValue;
             string name = Path.GetFileName(remotePath.TrimEnd('/'));
             if (string.IsNullOrEmpty(name)) name = remotePath;
-            Send($"B\t{_id}\t{direction}\t{name}\t{localPath}\t{remotePath}\t{total}");
+            Send($"B\t{_id}\t{direction}\t{server}\t{name}\t{localPath}\t{remotePath}\t{total}");
         }
     }
 

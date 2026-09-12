@@ -20,8 +20,6 @@ public partial class App : System.Windows.Application
     private MainWindow? _manager;
     private RemoteBridgeService? _bridge;
     private TransferTaskService? _transfers;
-    private TransferWindow? _transferWindow;
-    private DispatcherTimer? _transferHideTimer;
     private bool _isExiting;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -46,16 +44,17 @@ public partial class App : System.Windows.Application
 
         _shutdown = new CancellationTokenSource();
         _showManagerEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowManagerEventName, out _);
+        _transfers = new TransferTaskService(Dispatcher);
+        _transfers.JobStarted += OnTransferJobStarted;
+        _transfers.AllFinished += OnAllTransfersFinished;
+        _transfers.Start();
         _manager = new MainWindow();
+        _manager.AttachTasks(_transfers.Tasks);
         _manager.Closing += OnManagerClosing;
         MainWindow = _manager;
         CreateTrayIcon();
         _bridge = new RemoteBridgeService();
         _bridge.Start();
-        _transfers = new TransferTaskService(Dispatcher);
-        _transfers.JobStarted += OnTransferJobStarted;
-        _transfers.AllFinished += OnAllTransfersFinished;
-        _transfers.Start();
         ListenForShowRequests();
         if (!background || showRequested) ShowManager();
     }
@@ -70,7 +69,7 @@ public partial class App : System.Windows.Application
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
-        _trayIcon.DoubleClick += (_, _) => ShowManager();
+        _trayIcon.DoubleClick += (_, _) => ShowTransfers();
         RefreshLocalizedShell();
     }
 
@@ -80,6 +79,7 @@ public partial class App : System.Windows.Application
         {
             _trayMenu.Items.Clear();
             _trayMenu.Items.Add(Ui.T("TrayManage"), null, (_, _) => ShowManager());
+            _trayMenu.Items.Add(Ui.IsEnglish ? "Transfer queue" : "传输队列", null, (_, _) => ShowTransfers());
             _trayMenu.Items.Add(new WinForms.ToolStripSeparator());
             _trayMenu.Items.Add(Ui.T("Exit"), null, (_, _) => ExitApplication());
         }
@@ -102,31 +102,73 @@ public partial class App : System.Windows.Application
         });
     }
 
-    /// <summary>Show the transfer window when a job starts (it stays open while
-    /// jobs run and auto-hides a few seconds after the last one finishes).</summary>
+    /// <summary>Tray reflects transfer state: while jobs run the icon becomes a
+    /// transfer glyph and the tooltip counts them, so "something is happening"
+    /// is visible in Explorer's notification area; double-click / the menu item
+    /// jumps to the Transfers tab in the site manager.</summary>
+    private void UpdateTrayTransferState()
+    {
+        if (_trayIcon is null) return;
+        int running = _transfers?.RunningCount ?? 0;
+        if (running > 0)
+        {
+            _trayIcon.Icon = BusyTransferIcon();
+            _trayIcon.Text = (Ui.IsEnglish ? "Explorer Remote FS — transferring " : "Explorer Remote FS — 正在传输 ")
+                             + running + (Ui.IsEnglish ? " file(s)" : " 个文件");
+        }
+        else
+        {
+            _trayIcon.Icon = Drawing.SystemIcons.Application;
+            _trayIcon.Text = "Explorer Remote FS";
+        }
+    }
+
     private void OnTransferJobStarted()
     {
-        _transferHideTimer?.Stop();
-        _transferWindow ??= new TransferWindow(_transfers!.Tasks);
-        if (!_transferWindow.IsVisible) _transferWindow.Show();
-        if (_transferWindow.WindowState == WindowState.Minimized)
-            _transferWindow.WindowState = WindowState.Normal;
-        _transferWindow.Activate();
+        bool first = (_transfers?.RunningCount ?? 0) <= 1;
+        UpdateTrayTransferState();
+        if (first && _trayIcon is not null)
+            _trayIcon.ShowBalloonTip(2500, "Explorer Remote FS",
+                Ui.IsEnglish ? "Transfer started — click here for the queue" : "已开始传输 — 点击此处查看传输队列",
+                WinForms.ToolTipIcon.Info);
     }
 
-    private void OnAllTransfersFinished()
+    private void OnAllTransfersFinished() => UpdateTrayTransferState();
+
+    /// <summary>Blue disc with up/down arrows, drawn once and cached.</summary>
+    private static Drawing.Icon? _busyIcon;
+
+    private static Drawing.Icon BusyTransferIcon()
     {
-        _transferHideTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
-        _transferHideTimer.Tick -= OnTransferHideTick;
-        _transferHideTimer.Tick += OnTransferHideTick;
-        _transferHideTimer.Stop();
-        _transferHideTimer.Start();
+        if (_busyIcon is not null) return _busyIcon;
+        try
+        {
+            using var bmp = new Drawing.Bitmap(16, 16);
+            using (Drawing.Graphics g = Drawing.Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.Clear(Drawing.Color.Transparent);
+                using var disc = new Drawing.SolidBrush(Drawing.Color.FromArgb(0, 120, 215));
+                g.FillEllipse(disc, 0, 0, 15, 15);
+                using var pen = new Drawing.Pen(Drawing.Color.White, 1.6f);
+                g.DrawLine(pen, 5.5f, 10.5f, 5.5f, 5f);
+                g.DrawLine(pen, 3.5f, 7f, 5.5f, 5f);
+                g.DrawLine(pen, 7.5f, 7f, 5.5f, 5f);
+                g.DrawLine(pen, 10.5f, 5f, 10.5f, 10.5f);
+                g.DrawLine(pen, 8.5f, 8.5f, 10.5f, 10.5f);
+                g.DrawLine(pen, 12.5f, 8.5f, 10.5f, 10.5f);
+            }
+            _busyIcon = Drawing.Icon.FromHandle(bmp.GetHicon());
+        }
+        catch { _busyIcon = Drawing.SystemIcons.Application; }
+        return _busyIcon;
     }
 
-    private void OnTransferHideTick(object? sender, EventArgs e)
+    /// <summary>Open the site manager focused on the transfer queue.</summary>
+    private void ShowTransfers()
     {
-        _transferHideTimer?.Stop();
-        if (_transferWindow is { RunningCount: 0 }) _transferWindow.Hide();
+        ShowManager();
+        _manager?.SelectTransferTab();
     }
 
     private void ShowManager()

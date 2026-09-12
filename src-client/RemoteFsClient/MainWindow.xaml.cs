@@ -9,6 +9,8 @@ public partial class MainWindow : Window
 {
     private readonly ObservableCollection<Models.SiteInfo> _sites = new();
     private Models.SiteInfo? _selected;
+    private ObservableCollection<TransferTask>? _tasks;
+    private System.Windows.Threading.DispatcherTimer? _transferSummaryTimer;
 
     public MainWindow()
     {
@@ -31,6 +33,18 @@ public partial class MainWindow : Window
         NewButton.Content = Ui.T("New"); EditButton.Content = Ui.T("Edit"); DeleteButton.Content = Ui.T("Delete");
         TestButton.Content = Ui.T("Test"); SettingsButton.Content = Ui.T("Settings");
         DetailsTab.Header = Ui.T("SiteDetails"); SiteSettingsTab.Header = Ui.T("SiteSettings");
+        if (TransferTab != null)
+        {
+            TransferTab.Header = Ui.IsEnglish ? "Transfers" : "传输队列";
+            TColServer.Header = Ui.IsEnglish ? "Server" : "服务器";
+            TColDirection.Header = Ui.IsEnglish ? "Direction" : "方向";
+            TColFile.Header = Ui.IsEnglish ? "File" : "文件";
+            TColProgress.Header = Ui.IsEnglish ? "Progress" : "进度";
+            TColDone.Header = Ui.IsEnglish ? "Transferred" : "已传输";
+            TColSpeed.Header = Ui.IsEnglish ? "Speed" : "速度";
+            TColStatus.Header = Ui.IsEnglish ? "Status" : "状态";
+            TransferClearButton.Content = Ui.IsEnglish ? "Clear finished" : "清除已完成";
+        }
         NameLabel.Text = Ui.T("Name"); ProtocolLabel.Text = Ui.T("Protocol"); HostPortLabel.Text = Ui.T("HostPort");
         UsernameLabel.Text = Ui.T("Username"); StartPathLabel.Text = Ui.T("StartPath"); PasswordLabel.Text = Ui.T("Password");
         WinScpSiteLabel.Text = Ui.T("WinScpSite"); TestResultGroup.Header = Ui.T("TestResult");
@@ -38,6 +52,51 @@ public partial class MainWindow : Window
         PrivateKeyLabel.Text = Ui.IsEnglish ? "Private key" : "私钥文件";
         EditSiteSettingsButton.Content = Ui.T("EditSiteSettings");
         ShowDetails();
+    }
+
+    /// <summary>Binds the transfer queue (owned by the resident service) to the
+    /// Transfers tab. Called once from App at startup.</summary>
+    internal void AttachTasks(ObservableCollection<TransferTask> tasks)
+    {
+        _tasks = tasks;
+        TransferList.ItemsSource = tasks;
+        _transferSummaryTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(1),
+        };
+        _transferSummaryTimer.Tick += (_, _) => UpdateTransferSummary();
+        _transferSummaryTimer.Start();
+        UpdateTransferSummary();
+    }
+
+    /// <summary>Brings the Transfers tab to the front (tray "Transfer queue").</summary>
+    internal void SelectTransferTab()
+    {
+        TransferTab.IsSelected = true;
+        UpdateTransferSummary();
+    }
+
+    private void OnClearTransfers(object sender, RoutedEventArgs e)
+    {
+        if (_tasks is null) return;
+        for (int i = _tasks.Count - 1; i >= 0; i--)
+            if (_tasks[i].IsFinished) _tasks.RemoveAt(i);
+        UpdateTransferSummary();
+    }
+
+    private void UpdateTransferSummary()
+    {
+        if (_tasks is null || TransferSummary is null) return;
+        int running = 0, done = 0, failed = 0;
+        foreach (TransferTask t in _tasks)
+        {
+            if (!t.IsFinished) running++;
+            else if (t.IsFailed) failed++;
+            else done++;
+        }
+        TransferSummary.Text = Ui.IsEnglish
+            ? $"{running} in progress · {done} completed · {failed} failed"
+            : $"{running} 个进行中 · {done} 个已完成 · {failed} 个失败";
     }
 
     private void OnSiteSelected(object sender, SelectionChangedEventArgs e)
