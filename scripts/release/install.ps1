@@ -116,14 +116,12 @@ finally {
 }
 
 
-# --- shell\paste verb on the CONTAINER type: Explorer's native paste command
-# (Ctrl+V / toolbar Paste / the native "Paste" context item) never calls a
-# namespace extension's folder IDropTarget, so those paths did nothing. The
-# verb routes them to the CLI, which reads the clipboard file list and uploads
-# into the folder named by %V ("<site>:/<path>").
-$pasteCmd = '"' + (Join-Path $InstallDir 'cli\ExplorerRemoteFs.Cli.exe') + '" paste "%V"'
-New-Item -Path "$hk\RemoteFsMicrosoftCoreType\shell\paste\command" -Force | Out-Null
-Set-ItemProperty "$hk\RemoteFsMicrosoftCoreType\shell\paste\command" -Name '(default)' -Value $pasteCmd
+# NOTE (2026-09-12): do NOT register shell\paste (or any sole verb) under the
+# CONTAINER ProgID. A lone verb under the shell key becomes the DEFAULT verb,
+# so double-clicking a folder executed paste instead of navigating (folder
+# items could not be opened at all). Explorer's native paste is instead hooked
+# through the folder background context menu's canonical "paste" verb
+# (IContextMenu::GetCommandString/GCS_VERBW) in the extension DLL.
 
 # --- RemoteFsFileType: FILE-only ProgID (level >= 1 non-directory items) ---
 # Context-menu/property-sheet handlers mirror the container type so file items

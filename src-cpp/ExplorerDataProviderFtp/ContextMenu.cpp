@@ -1512,6 +1512,35 @@ public:
 
     HRESULT InvokeCommand(LPCMINVOKECOMMANDINFO ci)
     {
+        // Host-invoked CANONICAL VERB. Explorer's native paste command (Ctrl+V,
+        // the toolbar Paste button, the native "Paste" context item) does NOT
+        // call a namespace extension's IDropTarget — it asks the folder's
+        // BACKGROUND context menu for a verb named "paste" (IContextMenu::
+        // GetCommandString / GCS_VERBW) and then InvokeCommand(lpVerb="paste").
+        // Do NOT register shell\paste in the registry: a lone verb under the
+        // ProgID's shell key becomes the DEFAULT verb and hijacks double-click
+        // (2026-09-12 regression: double-clicking a folder ran paste, so no
+        // folder could be opened).
+        LPCWSTR verbW = NULL;
+        if (ci->cbSize >= sizeof(CMINVOKECOMMANDINFOEX))
+        {
+            LPCMINVOKECOMMANDINFOEX ex = (LPCMINVOKECOMMANDINFOEX)ci;
+            if (ex->fMask & CMIC_MASK_UNICODE) verbW = ex->lpVerbW;
+        }
+        BOOL isPaste = verbW ? (0 == lstrcmpiW(verbW, L"paste"))
+                             : (!IS_INTRESOURCE(ci->lpVerb) && ci->lpVerb && 0 == lstrcmpiA(ci->lpVerb, "paste"));
+        if (isPaste)
+        {
+            WCHAR vsite[64] = {}, vfolder[512] = {};
+            if (m_pidl) {
+                PidlSite(m_pidl, vsite, ARRAYSIZE(vsite));
+                PidlPath(m_pidl, vfolder, ARRAYSIZE(vfolder));
+                ApplySiteStartPath(vsite, vfolder, ARRAYSIZE(vfolder));
+            }
+            ProbeLog(L"[BG] canonical verb paste site='%s' folder='%s'", vsite, vfolder);
+            if (m_nLevel >= 1) PasteClipboardToFolder(ci->hwnd, vsite, vfolder, m_pidl);
+            return S_OK;
+        }
         UINT id = IS_INTRESOURCE(ci->lpVerb) ? LOWORD((UINT_PTR)ci->lpVerb) : 99;
         // Explorer may pass either the absolute menu id (first+k) or the
         // relative index (k). Normalize to relative.
@@ -1549,8 +1578,22 @@ public:
 
     HRESULT GetCommandString(UINT_PTR id, UINT type, UINT *r, LPSTR s, UINT c)
     {
-        if (m_pDefault && id < m_lastFirst + m_defaultCount)
-            return m_pDefault->GetCommandString(id, type, r, s, c);
+        // COM passes the menu id as an OFFSET from idCmdFirst. Normalize both
+        // forms (offset or absolute) so we work regardless of caller.
+        UINT off = (UINT)((id >= (UINT_PTR)m_lastFirst) ? (id - (UINT_PTR)m_lastFirst) : id);
+        if (m_pDefault && off < m_defaultCount)
+            return m_pDefault->GetCommandString(off, type, r, s, c);
+        // Canonical verb names let HOST commands reach our items. Explorer's
+        // native paste resolves the target folder's background menu for a
+        // "paste" verb; returning E_NOTIMPL here is why Ctrl+V / toolbar Paste
+        // silently did nothing. Item layout (level >= 1): k=0 copy path,
+        // k=1 new folder, k=2 paste.
+        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 2)
+        {
+            ProbeLog(L"[BG] GetCommandString paste-verb requested type=%u", type);
+            if (type == GCS_VERBW) return StringCchCopyW((PWSTR)s, c, L"paste");
+            if (type == GCS_VERBA) return StringCchCopyA(s, c, "paste");
+        }
         return E_NOTIMPL;
     }
 
