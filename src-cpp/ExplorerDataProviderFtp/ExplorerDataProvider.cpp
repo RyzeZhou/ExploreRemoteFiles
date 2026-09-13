@@ -37,6 +37,14 @@ HRESULT CFolderViewImplBgMenu_Create(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlF
 // identically (single implementation per function).
 void PasteDataObjectToFolder(HWND hwnd, PCWSTR site, PCWSTR folder, IDataObject *pdo, PIDLIST_ABSOLUTE notifyPidl);
 
+// Native command-bar Delete is not an IContextMenu verb.  Explorer routes it
+// through the folder's ITransferSource, then hands that object the selected
+// IShellItem.  Keep the actual remote mutation in ContextMenu.cpp, next to the
+// existing right-click Delete implementation, so both entry points share the
+// same CLI/cache/refresh semantics.
+HRESULT DeleteRemoteShellItem(IShellItem *psiSource, PIDLIST_ABSOLUTE notifyPidl,
+                              TRANSFER_SOURCE_FLAGS flags);
+
 
 HRESULT CFolderViewCB_CreateInstance(REFIID riid, void **ppv);
 
@@ -626,6 +634,19 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
     // Level 0 is the site picker: the first path segment must be a site name.
     if (m_nLevel == 0)
     {
+        // The public ERF address form is "erf:<site>:/absolute/unix/path".
+        // The registered URI handler normally converts it to the desktop-level
+        // parsing name before launching Explorer. Accept it here as well so the
+        // FTP root can parse a pasted address directly when it receives one.
+        if (0 == StrCmpNIW(component, L"erf:", 4))
+        {
+            WCHAR target[MAX_PATH] = {};
+            HRESULT ehr = StringCchCopy(target, ARRAYSIZE(target), component + 4);
+            if (FAILED(ehr)) return ehr;
+            ehr = StringCchCopy(component, ARRAYSIZE(component), target);
+            if (FAILED(ehr)) return ehr;
+        }
+
         // Address bar direct entry: "<site>:/unix/path".
         WCHAR *colon = wcschr(component, L':');
         if (colon && colon != component)
@@ -639,10 +660,40 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
             hr = CreateChildID(site, 1, 1, 3, TRUE, &result);
             if (FAILED(hr)) return hr;
 
-            // Split the unix path into segments and bind step by step.
+            // A public ERF address uses the SERVER'S absolute Unix path, while
+            // the virtual site root can be configured at StartPath.  Do not
+            // bind StartPath a second time: for a WSL site rooted at
+            // /home/zhou, "WSL:/home/zhou/AI_work" must start with AI_work,
+            // not attempt /home/zhou/home.
+            PCWSTR pathToBind = colon + 1;
+            WCHAR startPath[256] = {};
+            StringCchCopy(startPath, ARRAYSIZE(startPath), s->startPath[0] ? s->startPath : L"/");
+            size_t startLength = lstrlen(startPath);
+            while (startLength > 1 && startPath[startLength - 1] == L'/')
+                startPath[--startLength] = 0;
+
+            if (StrCmpW(startPath, L"/") == 0)
+            {
+                while (*pathToBind == L'/') ++pathToBind;
+            }
+            else
+            {
+                if (0 != StrCmpNW(pathToBind, startPath, (int)startLength) ||
+                    (pathToBind[startLength] && pathToBind[startLength] != L'/'))
+                {
+                    ProbeLog(L"[PARSE] path outside site root; site='%s' start='%s' requested='%s'", site, startPath, pathToBind);
+                    ILFree(result);
+                    return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+                }
+                pathToBind += startLength;
+                while (*pathToBind == L'/') ++pathToBind;
+            }
+
+            // Split the path RELATIVE TO THE SITE ROOT into segments and bind
+            // them step by step.
             std::vector<std::wstring> segs;
             std::wstring cur;
-            for (PCWSTR c = colon + 1; ; c++)
+            for (PCWSTR c = pathToBind; ; c++)
             {
                 if (*c == L'/' || *c == 0) { if (!cur.empty()) segs.push_back(cur); cur.clear(); if (!*c) break; }
                 else cur += *c;
@@ -1152,6 +1203,85 @@ private:
     bool m_fHdrop;
 };
 
+// Explorer's native Delete command bar button uses IFileOperation rather than
+// the selected item's IContextMenu.  A virtual folder receives this request
+// through CreateViewObject(IID_ITransferSource).  Returning E_NOINTERFACE here
+// is exactly what produced the post-confirmation 0x80004002 failure.
+//
+// ERF has no Recycle Bin namespace.  Consequently both RecycleItem and
+// RemoveItem are deliberately mapped to the already-established remote
+// permanent-delete operation.  Explorer owns the one native confirmation;
+// this bridge must not show a second dialog.
+class CFolderTransferSource : public ITransferSource
+{
+public:
+    CFolderTransferSource(PCWSTR site, PCWSTR folder, PCIDLIST_ABSOLUTE viewPidl)
+        : m_cRef(1), m_pidl(viewPidl ? ILCloneFull(viewPidl) : NULL), m_cookie(0)
+    {
+        StringCchCopy(m_site, ARRAYSIZE(m_site), site ? site : L"");
+        StringCchCopy(m_folder, ARRAYSIZE(m_folder), folder ? folder : L"/");
+        DllAddRef();
+    }
+    ~CFolderTransferSource()
+    {
+        if (m_pidl) ILFree(m_pidl);
+        DllRelease();
+    }
+
+    IFACEMETHODIMP QueryInterface(REFIID riid, void **ppv)
+    {
+        static const QITAB q[] = { QITABENT(CFolderTransferSource, ITransferSource), { 0 } };
+        return QISearch(this, q, riid, ppv);
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() { return InterlockedIncrement(&m_cRef); }
+    IFACEMETHODIMP_(ULONG) Release()
+    {
+        long c = InterlockedDecrement(&m_cRef);
+        if (!c) delete this;
+        return c;
+    }
+
+    IFACEMETHODIMP Advise(ITransferAdviseSink *, DWORD *pdwCookie)
+    {
+        if (!pdwCookie) return E_POINTER;
+        *pdwCookie = ++m_cookie;
+        ProbeLog(L"[XFER] Advise site='%s' folder='%s' cookie=%lu", m_site, m_folder, *pdwCookie);
+        return S_OK;
+    }
+    IFACEMETHODIMP Unadvise(DWORD dwCookie)
+    {
+        ProbeLog(L"[XFER] Unadvise site='%s' folder='%s' cookie=%lu", m_site, m_folder, dwCookie);
+        return S_OK;
+    }
+    IFACEMETHODIMP SetProperties(IPropertyChangeArray *) { return E_NOTIMPL; }
+    IFACEMETHODIMP OpenItem(IShellItem *, TRANSFER_SOURCE_FLAGS, REFIID, void **) { return E_NOTIMPL; }
+    IFACEMETHODIMP MoveItem(IShellItem *, IShellItem *, LPCWSTR, TRANSFER_SOURCE_FLAGS, IShellItem **) { return E_NOTIMPL; }
+    IFACEMETHODIMP RecycleItem(IShellItem *psiSource, IShellItem *, TRANSFER_SOURCE_FLAGS flags, IShellItem **ppsiNewDest)
+    {
+        if (ppsiNewDest) *ppsiNewDest = NULL;
+        ProbeLog(L"[XFER] RecycleItem -> remote permanent delete site='%s' folder='%s' flags=0x%08X", m_site, m_folder, flags);
+        return DeleteRemoteShellItem(psiSource, m_pidl, flags);
+    }
+    IFACEMETHODIMP RemoveItem(IShellItem *psiSource, TRANSFER_SOURCE_FLAGS flags)
+    {
+        ProbeLog(L"[XFER] RemoveItem site='%s' folder='%s' flags=0x%08X", m_site, m_folder, flags);
+        return DeleteRemoteShellItem(psiSource, m_pidl, flags);
+    }
+    IFACEMETHODIMP RenameItem(IShellItem *, LPCWSTR, TRANSFER_SOURCE_FLAGS, IShellItem **) { return E_NOTIMPL; }
+    IFACEMETHODIMP LinkItem(IShellItem *, IShellItem *, LPCWSTR, TRANSFER_SOURCE_FLAGS, IShellItem **) { return E_NOTIMPL; }
+    IFACEMETHODIMP ApplyPropertiesToItem(IShellItem *, IShellItem **) { return E_NOTIMPL; }
+    IFACEMETHODIMP GetDefaultDestinationName(IShellItem *, IShellItem *, LPWSTR *) { return E_NOTIMPL; }
+    IFACEMETHODIMP EnterFolder(IShellItem *) { return S_OK; }
+    IFACEMETHODIMP LeaveFolder(IShellItem *) { return S_OK; }
+
+private:
+    long m_cRef;
+    WCHAR m_site[64] = {};
+    WCHAR m_folder[512] = {};
+    PIDLIST_ABSOLUTE m_pidl;
+    DWORD m_cookie;
+};
+
 //  Called by the Shell to create the View Object and return it.
 HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **ppv)
 {
@@ -1173,6 +1303,26 @@ HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **p
                 hr = pdt->QueryInterface(riid, ppv);
                 pdt->Release();
             }
+        }
+    }
+    else if (riid == IID_ITransferSource)
+    {
+        // IFileOperation asks the *containing folder* for this interface when
+        // the user clicks Explorer's native Delete command.  It is unrelated
+        // to IContextMenu, hence canonical verb logging never appeared for
+        // the failing command-bar path.
+        if (m_nLevel >= 1)
+        {
+            CFolderTransferSource *pts = new (std::nothrow)
+                CFolderTransferSource(m_szSiteName, m_szRemotePath, m_pidl);
+            hr = pts ? S_OK : E_OUTOFMEMORY;
+            if (SUCCEEDED(hr))
+            {
+                hr = pts->QueryInterface(riid, ppv);
+                pts->Release();
+            }
+            ProbeLog(L"[XFER] CreateViewObject ITransferSource site='%s' folder='%s' hr=0x%08X",
+                     m_szSiteName, m_szRemotePath, hr);
         }
     }
     else if (riid == IID_IShellView)
@@ -1446,7 +1596,7 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
 {
     ProbeLog(L"[NAME] GetDisplayNameOf flags=0x%X", shgdnFlags);
     HRESULT hr = S_OK;
-    if (shgdnFlags & SHGDN_FORPARSING)
+    if (shgdnFlags & (SHGDN_FORPARSING | SHGDN_FORADDRESSBAR))
     {
         WCHAR szDisplayName[MAX_PATH];
         if (shgdnFlags & SHGDN_INFOLDER)
@@ -1494,6 +1644,32 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
                         StringCchCat(szDisplayName, ARRAYSIZE(szDisplayName), szName);
                     }
                     // siteFromPidl: the site root itself -> keep just "WSL-FTP:/"
+                    // Explorer commonly combines SHGDN_FORPARSING and
+                    // SHGDN_FORADDRESSBAR in one request.  FORPARSING is an
+                    // implementation detail needed by the shell, but the
+                    // address bar must never expose that private CLSID form.
+                    // Keep the public ERF address whenever this is an
+                    // address-bar request; return the qualified parsing name
+                    // only for a pure parsing-name request below.
+                    if (shgdnFlags & SHGDN_FORADDRESSBAR)
+                    {
+                        WCHAR erfAddress[MAX_PATH];
+                        HRESULT ehr = StringCchPrintf(erfAddress, ARRAYSIZE(erfAddress), L"erf:%s", szDisplayName);
+                        if (SUCCEEDED(ehr)) return StringToStrRet(erfAddress, pName);
+                        return ehr;
+                    }
+                    // A desktop-level parsing name must identify the namespace
+                    // root that owns the site:/ grammar.  It is private Shell
+                    // plumbing and is deliberately not returned to the address
+                    // bar (handled above).
+                    if (SUCCEEDED(hr) && (shgdnFlags & SHGDN_FORPARSING))
+                    {
+                        WCHAR qualified[MAX_PATH];
+                        HRESULT qhr = StringCchPrintf(qualified, ARRAYSIZE(qualified),
+                            L"::{C816CE0E-728C-4FC9-98E5-D0B35B384597}\\%s", szDisplayName);
+                        if (SUCCEEDED(qhr)) return StringToStrRet(qualified, pName);
+                        return qhr;
+                    }
                 }
                 else
                 {
@@ -2334,7 +2510,7 @@ static FOLDERLOGICALVIEWMODE ReadDefaultViewMode()
 {
     WCHAR buf[32] = {};
     DWORD cb = sizeof(buf);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\ExplorerRemoteFs", L"DefaultViewMode",
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", L"DefaultViewMode",
                      RRF_RT_REG_SZ, NULL, buf, &cb) == ERROR_SUCCESS && buf[0])
     {
         if (0 == StrCmpIW(buf, L"icons"))   return FLVM_ICONS;

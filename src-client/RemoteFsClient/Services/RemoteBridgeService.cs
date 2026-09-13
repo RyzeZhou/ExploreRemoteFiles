@@ -13,12 +13,21 @@ namespace RemoteFsClient.Services;
 public sealed class RemoteBridgeService : IDisposable
 {
     public const string PipeName = "ExplorerRemoteFs.Bridge.v1";
+    private readonly Func<ErfNavigationRequest, Task>? _navigationHandler;
+    private readonly DeleteProgressService? _deleteProgress;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _providerGate = new(1, 1);
     private readonly object _listingCacheGate = new();
-    private readonly Dictionary<string, Task<string>> _listingCache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ListingCacheEntry> _listingCache = new(StringComparer.Ordinal);
     private Task? _listener;
+    private static readonly TimeSpan CompletedListingCacheLifetime = TimeSpan.FromSeconds(3);
 
+    public RemoteBridgeService(Func<ErfNavigationRequest, Task>? navigationHandler = null,
+                               DeleteProgressService? deleteProgress = null)
+    {
+        _navigationHandler = navigationHandler;
+        _deleteProgress = deleteProgress;
+    }
 
     public void Start() => _listener ??= Task.WhenAll(
         Enumerable.Range(0, 4).Select(_ => Task.Run(() => ListenAsync(_stop.Token))));
@@ -48,6 +57,39 @@ public sealed class RemoteBridgeService : IDisposable
         await using var writer = new StreamWriter(stream, new UTF8Encoding(false), 4096, leaveOpen: true) { AutoFlush = true };
         string? operation = await reader.ReadLineAsync(token);
 
+        // ERF-NAVIGATE is deliberately handled by the resident process.  The
+        // short-lived URL-protocol process only forwards the original Explorer
+        // HWND and exits; it must not create providers or open its own window.
+        if (string.Equals(operation, "ERF-NAVIGATE", StringComparison.Ordinal))
+        {
+            var sourceWindowText = await reader.ReadLineAsync(token);
+            var address = await reader.ReadLineAsync(token);
+            if (_navigationHandler is null ||
+                !long.TryParse(sourceWindowText, out var sourceWindow) ||
+                string.IsNullOrWhiteSpace(address))
+            {
+                await writer.WriteLineAsync("FAIL: invalid ERF navigation request");
+                return;
+            }
+
+            try
+            {
+                // Resolve the complete directory chain before touching the
+                // Explorer window.  GetListingAsync first uses the resident
+                // cache and only asks the remote provider for a cache miss.
+                // The warmed responses are then reused by NSE PIDL parsing.
+                await WarmErfNavigationAsync(address);
+                await _navigationHandler(new ErfNavigationRequest(address, sourceWindow));
+            }
+            catch (Exception ex)
+            {
+                await writer.WriteLineAsync($"FAIL: {ex.Message.Replace('\r', ' ').Replace('\n', ' ')}");
+                return;
+            }
+            await writer.WriteLineAsync("QUEUED");
+            return;
+        }
+
         // CACHE-CLEAR: the Explorer extension invalidates its own metadata
         // cache after a successful remote mutation and asks the bridge to drop
         // the matching listing cache too — otherwise a refresh right after an
@@ -59,6 +101,27 @@ public sealed class RemoteBridgeService : IDisposable
             string? site = await reader.ReadLineAsync(token);
             ClearListingCache(site);
             await writer.WriteLineAsync("OK");
+            return;
+        }
+
+        // DELETE is deliberately synchronous at this boundary: IFileOperation
+        // must not be told an item is deleted until the remote service has
+        // actually completed (or failed) the mutation.  The work itself runs
+        // on the resident service and reuses its ProviderFactory session.
+        if (string.Equals(operation, "DELETE", StringComparison.Ordinal))
+        {
+            string? site = await reader.ReadLineAsync(token);
+            string? deleteRemotePath = await reader.ReadLineAsync(token);
+            string? recursiveText = await reader.ReadLineAsync(token);
+            if (string.IsNullOrWhiteSpace(site) || string.IsNullOrWhiteSpace(deleteRemotePath) ||
+                (recursiveText is not "0" and not "1"))
+            {
+                await writer.WriteLineAsync("FAIL: invalid delete request");
+                return;
+            }
+
+            var result = await DeleteAsync(site, deleteRemotePath, recursiveText == "1");
+            await writer.WriteLineAsync(result);
             return;
         }
 
@@ -98,32 +161,202 @@ public sealed class RemoteBridgeService : IDisposable
         }
     }
 
-    // Explorer can ask for the same uncached directory CONCURRENTLY while it
-    // binds the target and prepares the new view. Share one backend list call
-    // for IN-FLIGHT requests only; a COMPLETED entry is removed immediately so
-    // no stale listing can ever be served after a mutation (2026-09-03: the
-    // former 1s completed-entry cache made post-mutation auto-refresh show an
-    // empty/stale listing — the bridge served the pre-mutation listing).
+    // Explorer can ask for the same directory concurrently while it binds a
+    // target and prepares its view.  Keep completed responses briefly as well:
+    // ERF preflight warms every path component before the original Explorer
+    // window navigates.  Remote mutations send CACHE-CLEAR, so a confirmed
+    // write never leaves this cache authoritative.
     private Task<string> GetListingAsync(string siteName, string remotePath)
     {
         var key = siteName.ToUpperInvariant() + "\0" + remotePath;
         lock (_listingCacheGate)
         {
+            var now = DateTimeOffset.UtcNow;
+            foreach (var expired in _listingCache.Where(pair => pair.Value.ExpiresAt <= now).Select(pair => pair.Key).ToArray())
+                _listingCache.Remove(expired);
+
             if (_listingCache.TryGetValue(key, out var existing))
-                return existing;   // still in flight -> coalesce concurrent binds
+                return existing.Response; // completed hit or in-flight coalescing
 
             var task = BuildListingAsync(siteName, remotePath);
-            _listingCache[key] = task;
+            _listingCache[key] = new ListingCacheEntry(task, now + CompletedListingCacheLifetime);
             _ = task.ContinueWith(t =>
             {
                 lock (_listingCacheGate)
                 {
-                    if (_listingCache.TryGetValue(key, out var cur) && ReferenceEquals(cur, task))
-                        _listingCache.Remove(key);   // completed -> drop; next request re-fetches
+                    if (_listingCache.TryGetValue(key, out var cur) && ReferenceEquals(cur.Response, task) &&
+                        (t.IsFaulted || t.IsCanceled || (t.Status == TaskStatus.RanToCompletion && t.Result.StartsWith("FAIL:", StringComparison.Ordinal))))
+                        _listingCache.Remove(key); // failures are never cached
                 }
             }, TaskScheduler.Default);
             return task;
         }
+    }
+
+    private async Task<string> DeleteAsync(string siteName, string requestedPath, bool recursive)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        DeleteProgressHandle? progress = null;
+        bool gateHeld = false;
+        try
+        {
+            var connection = FindConnection(siteName);
+            var root = NormalizeRemotePath(connection.StartPath);
+            var path = NormalizeRemotePath(requestedPath);
+            if (!IsAtOrBelow(path, root) || path == root)
+                return "FAIL: refusing to delete the configured site root or a path outside it";
+
+            progress = _deleteProgress?.Begin(siteName, path,
+                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
+            progress?.Update(0, 0, Ui.IsEnglish ? "Waiting for remote connection" : "等待远程连接");
+
+            await _providerGate.WaitAsync(cancellation.Token);
+            gateHeld = true;
+            var fs = ProviderFactory.Get(connection);
+            await Task.Run(() => ExecuteDelete(fs, path, recursive, cancellation.Token, progress), cancellation.Token);
+            ClearListingCache(siteName);
+            progress?.Complete(true, false, null);
+            return "OK";
+        }
+        catch (OperationCanceledException)
+        {
+            progress?.Complete(false, true, null);
+            return "FAIL: cancelled";
+        }
+        catch (Exception ex)
+        {
+            ProviderFactory.Invalidate(siteName);
+            progress?.Complete(false, false, ex.Message);
+            return $"FAIL: {SanitizeBridgeError(ex.Message)}";
+        }
+        finally
+        {
+            if (gateHeld) _providerGate.Release();
+        }
+    }
+
+    private void ExecuteDelete(IRemoteFileSystem fs, string path, bool recursive,
+                               CancellationToken cancellation, DeleteProgressHandle? progress)
+    {
+        var plan = new List<DeletePlanItem>();
+        var lastUiUpdate = DateTime.MinValue;
+        void Report(long done, long total, string current, bool force = false)
+        {
+            var now = DateTime.UtcNow;
+            // A tree can contain millions of entries.  Reporting every delete
+            // would enqueue millions of Dispatcher work items and make the
+            // control centre itself the bottleneck; 5 updates/sec is enough
+            // for visible progress while the final item is always reported.
+            if (!force && now - lastUiUpdate < TimeSpan.FromMilliseconds(200)) return;
+            lastUiUpdate = now;
+            progress?.Update(done, total, current);
+        }
+        if (recursive)
+            BuildDeletePlan(fs, path, plan, cancellation, item =>
+                Report(0, 0, Ui.IsEnglish ? "Scanning " + item : "正在扫描 " + item));
+        else
+            plan.Add(new DeletePlanItem(path, false));
+
+        Report(0, plan.Count, Ui.IsEnglish ? "Deleting" : "正在删除", force: true);
+        long completed = 0;
+        foreach (var item in plan)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            Report(completed, plan.Count, item.Path);
+            fs.Delete(item.Path);
+            completed++;
+            Report(completed, plan.Count, item.Path, force: completed == plan.Count);
+        }
+    }
+
+    // Delete children before their parent.  Symlinks are leaf objects even if
+    // their targets happen to be directories; never recurse through them.
+    private static void BuildDeletePlan(IRemoteFileSystem fs, string directory,
+                                        List<DeletePlanItem> plan, CancellationToken cancellation,
+                                        Action<string> scanning)
+    {
+        cancellation.ThrowIfCancellationRequested();
+        scanning(directory);
+        foreach (var entry in fs.List(directory))
+        {
+            cancellation.ThrowIfCancellationRequested();
+            if (entry.IsDirectory && !entry.IsSymlink)
+                BuildDeletePlan(fs, entry.Path, plan, cancellation, scanning);
+            else
+                plan.Add(new DeletePlanItem(entry.Path, false));
+        }
+        plan.Add(new DeletePlanItem(directory, true));
+    }
+
+    private static string SanitizeBridgeError(string message) =>
+        (message ?? "remote delete failed").Replace('\r', ' ').Replace('\n', ' ');
+
+    private sealed record DeletePlanItem(string Path, bool IsDirectory);
+
+    private async Task WarmErfNavigationAsync(string address)
+    {
+        if (!TryParseErfAddress(address, out var siteName, out var requestedPath))
+            throw new InvalidOperationException("Invalid ERF address. Expected erf:<site>:/absolute/unix/path.");
+
+        var connection = FindConnection(siteName);
+        var startPath = NormalizeRemotePath(connection.StartPath);
+        var fullPath = NormalizeRemotePath(requestedPath);
+        if (!IsAtOrBelow(fullPath, startPath))
+            throw new InvalidOperationException($"The ERF path is outside the configured start path '{startPath}'.");
+
+        var currentPath = startPath;
+        var remainder = fullPath.Length == startPath.Length ? string.Empty : fullPath[startPath.Length..].TrimStart('/');
+        foreach (var segment in remainder.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var listing = await GetListingAsync(siteName, currentPath);
+            if (listing.StartsWith("FAIL:", StringComparison.Ordinal))
+                throw new InvalidOperationException(listing[5..].Trim());
+            if (!ListingContainsDirectory(listing, segment))
+                throw new DirectoryNotFoundException($"Remote directory not found: {fullPath}");
+            currentPath = currentPath == "/" ? "/" + segment : currentPath + "/" + segment;
+        }
+
+        // Prewarm the target view as well; the first Explorer enumeration can
+        // consume this completed cache entry without another remote round trip.
+        var targetListing = await GetListingAsync(siteName, currentPath);
+        if (targetListing.StartsWith("FAIL:", StringComparison.Ordinal))
+            throw new InvalidOperationException(targetListing[5..].Trim());
+    }
+
+    private static bool TryParseErfAddress(string address, out string siteName, out string remotePath)
+    {
+        siteName = string.Empty;
+        remotePath = string.Empty;
+        if (!address.StartsWith("erf:", StringComparison.OrdinalIgnoreCase)) return false;
+        var target = address[4..];
+        var separator = target.IndexOf(':');
+        if (separator <= 0 || separator == target.Length - 1) return false;
+        siteName = Uri.UnescapeDataString(target[..separator]);
+        remotePath = Uri.UnescapeDataString(target[(separator + 1)..]);
+        return siteName.IndexOfAny(['/', '\\', ':']) < 0 && remotePath.StartsWith('/') && !remotePath.Contains('\\');
+    }
+
+    private static string NormalizeRemotePath(string? path)
+    {
+        var normalized = string.IsNullOrWhiteSpace(path) ? "/" : path.Trim();
+        if (!normalized.StartsWith('/')) normalized = "/" + normalized;
+        while (normalized.Length > 1 && normalized.EndsWith('/')) normalized = normalized[..^1];
+        return normalized;
+    }
+
+    private static bool IsAtOrBelow(string path, string root) =>
+        root == "/" || path.Equals(root, StringComparison.Ordinal) ||
+        (path.StartsWith(root, StringComparison.Ordinal) && path.Length > root.Length && path[root.Length] == '/');
+
+    private static bool ListingContainsDirectory(string listing, string name)
+    {
+        foreach (var line in listing.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var fields = line.TrimEnd('\r').Split('\t');
+            if (fields.Length > 9 && fields[0] == "ITEM" && fields[6] == "1" && fields[9] == name)
+                return true;
+        }
+        return false;
     }
 
     private async Task<string> BuildListingAsync(string siteName, string remotePath)
@@ -174,4 +407,11 @@ public sealed class RemoteBridgeService : IDisposable
         _providerGate.Dispose();
         _stop.Dispose();
     }
+
+    private sealed record ListingCacheEntry(Task<string> Response, DateTimeOffset ExpiresAt);
 }
+
+/// <summary>Navigation intent forwarded from the erf: protocol entry point to
+/// the per-user resident service.  SourceWindowHandle is the root HWND of the
+/// Explorer window in which the user entered the address.</summary>
+public readonly record struct ErfNavigationRequest(string Address, long SourceWindowHandle);

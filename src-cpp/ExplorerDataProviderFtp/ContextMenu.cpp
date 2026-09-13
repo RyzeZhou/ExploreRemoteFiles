@@ -3,6 +3,7 @@
 // copies / server-side copy & move / rename / delete / custom commands / properties.
 #include <windows.h>
 #include <shlobj.h>
+#include <shlobj_core.h>   // COPYENGINE_S_DONT_PROCESS_CHILDREN (sherrors.h)
 #include <shlwapi.h>
 #include <strsafe.h>
 #include <string>
@@ -172,6 +173,187 @@ static void RefreshLocalFast(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE pidl)
     ProbeLog(L"[MUT] optimistic refresh site='%s' path='%s'", site ? site : L"", folder ? folder : L"/");
     FtpNotifyUpdateDir(pidl);
     FtpPrefetchQuiet(site, folder);
+}
+
+// Defined immediately after the transfer-source bridge below.  Keep this
+// declaration here because that bridge needs the parent remote directory.
+static void PathParent(PCWSTR full, PWSTR out, UINT cch);
+
+// Context handed to the background delete thread. All strings and the view
+// PIDL must be copied (the IShellItem passed into RemoveItem is only valid for
+// the duration of that call); the thread owns them and frees them when done.
+struct DeleteRemoteCtx
+{
+    WCHAR site[64];
+    WCHAR full[600];
+    WCHAR parent[600];
+    WCHAR name[MAX_PATH];
+    BOOL isFolder;                 // recursive delete when the target is a dir
+    PIDLIST_ABSOLUTE notifyPidl;   // cloned, freed by the thread
+    UINT_PTR seq;
+};
+
+static DWORD WINAPI DeleteRemoteThreadProc(LPVOID p)
+{
+    DeleteRemoteCtx *c = static_cast<DeleteRemoteCtx *>(p);
+    ProbeLog(L"[XFER] async delete begin site='%s' full='%s' folder=%d seq=%u",
+             c->site, c->full, c->isFolder, (UINT)c->seq);
+
+    // This waits for the real remote deletion to complete inside the resident
+    // service (which owns the provider session and shows the self progress
+    // window). It runs on a worker thread, never on Explorer's UI thread.
+    std::string bridgeReply;
+    if (FtpBridgeDelete(c->site, c->full, c->isFolder, bridgeReply))
+    {
+        // Deletion truly finished on the server. Only now update the view —
+        // never remove an entry from the list before its remote delete has
+        // actually completed (ERF_RESIDENT_SERVICE_ARCHITECTURE §一致性).
+        FtpCachePatchRemove(c->site, c->parent, c->name);
+        RefreshLocalFast(c->site, c->parent, c->notifyPidl);
+        ProbeLog(L"[XFER] async delete done site='%s' full='%s' seq=%u", c->site, c->full, (UINT)c->seq);
+    }
+    else
+    {
+        // Delete failed (or was cancelled from the resident-side progress
+        // window). Deliberately do NOT patch the cache / notify the view: the
+        // item must stay visible so the user can retry, and the resident-side
+        // window already surfaced the error/cancelled state.
+        ProbeLog(L"[XFER] async delete failed site='%s' full='%s' reply='%hs' seq=%u",
+                 c->site, c->full, bridgeReply.c_str(), (UINT)c->seq);
+    }
+
+    if (c->notifyPidl) ILFree(c->notifyPidl);
+    delete c;
+    return 0;
+}
+
+// Bridge for Explorer's native IFileOperation Delete path.  The command bar
+// obtains ITransferSource from the containing folder and calls RemoveItem (or
+// RecycleItem) with an absolute ERF IShellItem.
+//
+// The native delete confirmation has already been accepted before this method
+// is called.  Do not show another dialog here.
+//
+// IMPORTANT (deferred-delete design): this method does NOT wait for the remote
+// delete to finish.  Actual deletion, progress and cancellation are owned by
+// the resident service (and its own foreground progress window).  We only
+// decode the requested item, hand it to a background thread that issues the
+// bridge DELETE, and return instantly so Explorer's native transfer queue
+// completes immediately instead of pinning a task (which is what made both the
+// native pause/cancel and subsequent queued jobs hang).  A successful
+// directory delete returns COPYENGINE_S_DONT_PROCESS_CHILDREN so the shell
+// does not also enumerate and re-delete each child that is already gone.
+HRESULT DeleteRemoteShellItem(IShellItem *psiSource, PIDLIST_ABSOLUTE notifyPidl,
+                              TRANSFER_SOURCE_FLAGS flags)
+{
+    if (!psiSource) return E_INVALIDARG;
+
+    PIDLIST_ABSOLUTE source = NULL;
+    HRESULT hr = SHGetIDListFromObject(psiSource, &source);
+    if (FAILED(hr) || !source)
+    {
+        ProbeLog(L"[XFER] Delete could not get source PIDL hr=0x%08X", hr);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    WCHAR site[64] = {}, full[600] = {}, parent[600] = {}, name[MAX_PATH] = {};
+    BOOL isFolder = FALSE;
+    BOOL valid = PidlSite(source, site, ARRAYSIZE(site));
+    PidlPath(source, full, ARRAYSIZE(full));
+    ApplySiteStartPath(site, full, ARRAYSIZE(full));
+    PCUIDLIST_RELATIVE last = ILFindLastID(source);
+    if (valid && IsOurs(last))
+    {
+        CopyName((const COMPACTITEM *)last, name, ARRAYSIZE(name));
+        isFolder = ((const COMPACTITEM *)last)->fIsFolder;
+    }
+    ILFree(source);
+
+    if (!valid || !site[0] || !name[0])
+    {
+        ProbeLog(L"[XFER] Delete source is not an ERF child valid=%d site='%s' full='%s' name='%s'", valid, site, full, name);
+        return E_INVALIDARG;
+    }
+
+    PathParent(full, parent, ARRAYSIZE(parent));
+
+    DeleteRemoteCtx *c = new (std::nothrow) DeleteRemoteCtx{};
+    if (!c) return E_OUTOFMEMORY;
+    StringCchCopy(c->site, ARRAYSIZE(c->site), site);
+    StringCchCopy(c->full, ARRAYSIZE(c->full), full);
+    StringCchCopy(c->parent, ARRAYSIZE(c->parent), parent);
+    StringCchCopy(c->name, ARRAYSIZE(c->name), name);
+    c->isFolder = isFolder;
+    c->notifyPidl = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    static volatile UINT_PTR s_seq = 0;
+    c->seq = ++s_seq;
+
+    ProbeLog(L"[XFER] Delete remote item queued (async) site='%s' full='%s' parent='%s' name='%s' folder=%d flags=0x%08X seq=%u",
+             site, full, parent, name, isFolder, flags, (UINT)c->seq);
+
+    HANDLE h = CreateThread(NULL, 0, DeleteRemoteThreadProc, c, 0, NULL);
+    if (!h)
+    {
+        if (c->notifyPidl) ILFree(c->notifyPidl);
+        delete c;
+        return E_OUTOFMEMORY;
+    }
+    CloseHandle(h);
+
+    // Hand back success to the shell transfer engine immediately.  For a
+    // directory the whole subtree is being deleted by the resident service
+    // (recursive=1), so tell the shell not to also walk and delete its
+    // children — that redundant walk is what produced the "file already
+    // deleted" 550 errors and the pinned-queue task.
+    return isFolder ? COPYENGINE_S_DONT_PROCESS_CHILDREN : S_OK;
+}
+
+// Run the same public IFileOperation path that Explorer uses for its command
+// bar Delete button.  This gives the context-menu command the same shell-owned
+// confirmation and progress UI, and it reaches DeleteRemoteShellItem above via
+// the folder's ITransferSource implementation.  That makes ITransferSource
+// the sole authority for actual ERF deletion.
+static HRESULT DeleteSelectionWithNativeFileOperation(HWND hwnd, IDataObject *data)
+{
+    if (!data) return E_INVALIDARG;
+
+    IShellItemArray *items = NULL;
+    HRESULT hr = SHCreateShellItemArrayFromDataObject(data, IID_PPV_ARGS(&items));
+    if (FAILED(hr))
+    {
+        ProbeLog(L"[XFER] native delete: SHCreateShellItemArrayFromDataObject failed hr=0x%08X", hr);
+        return hr;
+    }
+
+    IFileOperation *op = NULL;
+    hr = CoCreateInstance(CLSID_FileOperation, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&op));
+    if (SUCCEEDED(hr))
+    {
+        if (hwnd) op->SetOwnerWindow(hwnd);
+        hr = op->DeleteItems(items);
+        if (SUCCEEDED(hr)) hr = op->PerformOperations();
+        BOOL aborted = FALSE;
+        // Explorer builds do not agree on the HRESULT used when the user
+        // dismisses the native confirmation.  GetAnyOperationsAborted is the
+        // authoritative cancellation signal and must be queried even when
+        // PerformOperations has already returned a failure HRESULT.
+        HRESULT hrAbort = op->GetAnyOperationsAborted(&aborted);
+        if (SUCCEEDED(hrAbort) && aborted) hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        op->Release();
+    }
+    items->Release();
+    ProbeLog(L"[XFER] native delete completed hr=0x%08X", hr);
+    return hr;
+}
+
+// IFileOperation uses both HRESULT_FROM_WIN32(ERROR_CANCELLED) and E_ABORT
+// for a user declining/cancelling its own confirmation UI, depending on the
+// Explorer build and the exact point of cancellation.  They are normal user
+// choices, not remote failures, and must behave exactly like the top button.
+static BOOL IsNativeDeleteCancelled(HRESULT hr)
+{
+    return hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) ||
+           hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) || hr == E_ABORT;
 }
 
 // View directory for a property-page mutation = parent of the mutated path.
@@ -615,6 +797,26 @@ static BOOL TempLocalPath(PCWSTR sub, PCWSTR site, PCWSTR name, PWSTR out, UINT 
     StringCchCat(out,cch,name);
     return TRUE;
 }
+static BOOL GetConfiguredEditor(PWSTR out, UINT cch)
+{
+    if (!out || cch == 0) return FALSE;
+    out[0] = 0;
+    DWORD cb = cch * sizeof(WCHAR);
+    // The control centre stores either an executable path (for example
+    // Code.exe) or the built-in default.  Do not accept arguments here: the
+    // staged file is always passed as exactly one ShellExecute parameter.
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", L"EditorPath",
+                     RRF_RT_REG_SZ, NULL, out, &cb) != ERROR_SUCCESS || !out[0])
+        StringCchCopyW(out, cch, L"notepad.exe");
+    return TRUE;
+}
+static BOOL LaunchConfiguredEditor(HWND hwnd, PCWSTR local)
+{
+    WCHAR editor[MAX_PATH] = {};
+    if (!GetConfiguredEditor(editor, ARRAYSIZE(editor))) return FALSE;
+    HINSTANCE result = ShellExecuteW(hwnd, L"open", editor, local, NULL, SW_SHOWNORMAL);
+    return (INT_PTR)result > 32;
+}
 static void CleanupDir(PCWSTR dir)
 {
     // Best-effort delete of temp staging dir contents (files only, no recursion depth 1).
@@ -625,36 +827,92 @@ static void CleanupDir(PCWSTR dir)
         while(FindNextFileW(h,&fd)); FindClose(h); }
 }
 
-// Edit watcher: poll local mtime; on change, upload back to the server.
-typedef struct { WCHAR site[64]; WCHAR remote[600]; WCHAR local[MAX_PATH]; } EDITCTX;
+// Edit watcher: poll local mtime; on a saved change, upload back to the
+// server.  A deferred-create draft deliberately has no remote object until
+// that first successful upload.
+typedef struct {
+    WCHAR site[64]; WCHAR remote[600]; WCHAR local[MAX_PATH];
+    BOOL deferredCreate;
+    PIDLIST_ABSOLUTE notify;
+} EDITCTX;
+static ULONGLONG LocalWriteStamp(PCWSTR local)
+{
+    HANDLE h = CreateFileW(local, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    FILETIME ft = {};
+    if (h != INVALID_HANDLE_VALUE) { GetFileTime(h, NULL, NULL, &ft); CloseHandle(h); }
+    return ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+static BOOL UploadEditedFile(EDITCTX *c, BOOL *remoteCreated)
+{
+    // The first saved revision claims the remote name without overwrite.  The
+    // subsequent normal PUT can therefore only update the file we just
+    // created, rather than silently replacing a document created by somebody
+    // else while the local draft was open.
+    if (c->deferredCreate && !*remoteCreated)
+    {
+        if (RunCli(c->site, L"touch", c->remote, NULL, NULL) != 0) return FALSE;
+        *remoteCreated = TRUE;
+    }
+    if (RunCli(c->site, L"put", c->local, c->remote, NULL) != 0) return FALSE;
+    if (c->deferredCreate)
+    {
+        WCHAR parent[600] = {};
+        PathParent(c->remote, parent, ARRAYSIZE(parent));
+        PCWSTR name = PathFindFileNameW(c->remote);
+        ULONGLONG size = 0;
+        WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+        if (GetFileAttributesExW(c->local, GetFileExInfoStandard, &attributes))
+            size = ((ULONGLONG)attributes.nFileSizeHigh << 32) | attributes.nFileSizeLow;
+        FtpCachePatchAdd(c->site, parent, name, FALSE, size);
+        RefreshLocalFast(c->site, parent, c->notify);
+    }
+    else FtpCacheClear();
+    return TRUE;
+}
 static DWORD WINAPI EditWatch(LPVOID p)
 {
     EDITCTX *c=(EDITCTX*)p;
-    HANDLE h=CreateFileW(c->local,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
-    FILETIME last={}; if(h!=INVALID_HANDLE_VALUE){ GetFileTime(h,NULL,NULL,&last); CloseHandle(h); }
-    ULONGLONG lastT=((ULONGLONG)last.dwHighDateTime<<32)|last.dwLowDateTime;
+    ULONGLONG lastT = LocalWriteStamp(c->local);
+    BOOL remoteCreated = FALSE;
     ULONGLONG start=GetTickCount64();
     while(GetTickCount64()-start < 30*60*1000){
         Sleep(3000);
         if(!PathFileExistsW(c->local)) break;   // editor deleted temp file / closed
-        HANDLE h2=CreateFileW(c->local,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
-        if(h2==INVALID_HANDLE_VALUE) break;
-        FILETIME now={}; GetFileTime(h2,NULL,NULL,&now); CloseHandle(h2);
-        ULONGLONG nowT=((ULONGLONG)now.dwHighDateTime<<32)|now.dwLowDateTime;
+        ULONGLONG nowT = LocalWriteStamp(c->local);
         if(nowT!=lastT && nowT!=0){
-            lastT=nowT;
             // small settle delay, then upload
             Sleep(1200);
-            RunCli(c->site,L"put",c->local,c->remote,NULL);
-            FtpCacheClear();
+            if (UploadEditedFile(c, &remoteCreated)) lastT = LocalWriteStamp(c->local);
         }
     }
-    // File finished editing; upload a final time if it changed after the loop.
-    RunCli(c->site,L"put",c->local,c->remote,NULL);
-    FtpCacheClear();
+    // Catch a save immediately before the editor/watch loop ended.  Unlike the
+    // previous unconditional final PUT, an untouched new-file draft remains
+    // entirely local and never creates an empty remote file.
+    if (PathFileExistsW(c->local))
+    {
+        ULONGLONG finalT = LocalWriteStamp(c->local);
+        if (finalT != 0 && finalT != lastT) UploadEditedFile(c, &remoteCreated);
+    }
     DeleteFileW(c->local);
+    if (c->notify) ILFree(c->notify);
     CoTaskMemFree(c);   // allocated via CoTaskMemAlloc
     return 0;
+}
+static BOOL StartEditWatch(PCWSTR site, PCWSTR remote, PCWSTR local,
+                           BOOL deferredCreate, PIDLIST_ABSOLUTE notifyPidl)
+{
+    EDITCTX *c = (EDITCTX *)CoTaskMemAlloc(sizeof(EDITCTX));
+    if (!c) return FALSE;
+    StringCchCopy(c->site, ARRAYSIZE(c->site), site);
+    StringCchCopy(c->remote, ARRAYSIZE(c->remote), remote);
+    StringCchCopy(c->local, ARRAYSIZE(c->local), local);
+    c->deferredCreate = deferredCreate;
+    c->notify = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    HANDLE thread = CreateThread(NULL, 0, EditWatch, c, 0, NULL);
+    if (thread) { CloseHandle(thread); return TRUE; }
+    if (c->notify) ILFree(c->notify);
+    CoTaskMemFree(c);
+    return FALSE;
 }
 static void OpenRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, BOOL edit)
 {
@@ -662,13 +920,13 @@ static void OpenRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, BOOL 
     WCHAR local[MAX_PATH];
     if(!TempLocalPath(L"Open",site,name,local,ARRAYSIZE(local))) return;
     if(RunCli(site,L"get",full,local,NULL)!=0){ MessageBoxW(hwnd,ExplorerText(L"error.download_failed",L"下载失败。",L"Download failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR); return; }
-    HINSTANCE hr=ShellExecuteW(hwnd,edit?L"open":L"open",local,NULL,NULL,SW_SHOWNORMAL);
-    if((INT_PTR)hr<=32){ MessageBoxW(hwnd,ExplorerText(L"error.open_failed",L"打开失败。",L"Open failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR); DeleteFileW(local); return; }
+    BOOL opened = edit ? LaunchConfiguredEditor(hwnd, local)
+                       : ((INT_PTR)ShellExecuteW(hwnd, L"open", local, NULL, NULL, SW_SHOWNORMAL) > 32);
+    if(!opened){ MessageBoxW(hwnd,ExplorerText(L"error.open_failed",L"打开失败。",L"Open failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR); DeleteFileW(local); return; }
     if(edit){
-        EDITCTX *c=(EDITCTX*)CoTaskMemAlloc(sizeof(EDITCTX));
-        if(c){ StringCchCopy(c->site,ARRAYSIZE(c->site),site); StringCchCopy(c->remote,ARRAYSIZE(c->remote),full);
-               StringCchCopy(c->local,ARRAYSIZE(c->local),local);
-               CloseHandle(CreateThread(NULL,0,EditWatch,c,0,NULL)); }
+        if (!StartEditWatch(site, full, local, FALSE, NULL))
+            MessageBoxW(hwnd, ExplorerText(L"error.edit_watch_failed", L"已打开文件，但无法启动自动上传监视。", L"The file was opened, but automatic upload monitoring could not start."),
+                        ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
     }
 }
 static void DownloadFiles(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count)
@@ -977,6 +1235,49 @@ static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOL
     }
 }
 
+// A new file is deliberately not implemented as a clipboard upload.  It
+// begins as a private local draft only.  The first saved revision claims the
+// remote name without overwrite, then the established edit watcher uploads it.
+static void NewFileRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
+{
+    WCHAR name[256] = {};
+    StringCchCopy(name, ARRAYSIZE(name), ExplorerText(L"dialog.new_file_default", L"新建文本文档.txt", L"New Text Document.txt"));
+    if (!PromptText(hwnd, ExplorerText(L"dialog.new_file", L"新建文件", L"New file"), name, ARRAYSIZE(name), name)) return;
+    if (wcspbrk(name, L"\\/") || 0 == lstrcmpW(name, L".") || 0 == lstrcmpW(name, L".."))
+    {
+        MessageBoxW(hwnd, ExplorerText(L"error.invalid_file_name", L"文件名不能包含路径分隔符。", L"The file name cannot contain a path separator."),
+                    ExplorerText(L"dialog.new_file", L"新建文件", L"New file"), MB_OK | MB_ICONWARNING);
+        return;
+    }
+    WCHAR full[700] = {}, editDir[MAX_PATH] = {}, local[MAX_PATH] = {};
+    JoinPath(folder, name, full, ARRAYSIZE(full));
+    if (!TempDir(L"Edit", site, editDir, ARRAYSIZE(editDir)) ||
+        FAILED(StringCchPrintfW(local, ARRAYSIZE(local), L"%s%08X_%s", editDir, GetTickCount(), name)))
+    {
+        MessageBoxW(hwnd, ExplorerText(L"error.create_file_failed", L"无法准备本地编辑缓存。", L"Unable to prepare the local editing cache."),
+                    ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        return;
+    }
+    HANDLE empty = CreateFileW(local, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (empty == INVALID_HANDLE_VALUE)
+    {
+        MessageBoxW(hwnd, ExplorerText(L"error.create_file_failed", L"无法创建本地编辑文件。", L"Unable to create the local editing file."),
+                    ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        return;
+    }
+    CloseHandle(empty);
+    if (!LaunchConfiguredEditor(hwnd, local))
+    {
+        MessageBoxW(hwnd, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        DeleteFileW(local);
+        return;
+    }
+    if (!StartEditWatch(site, full, local, TRUE, notifyPidl))
+        MessageBoxW(hwnd, ExplorerText(L"error.edit_watch_failed", L"已创建并打开文件，但无法启动自动上传监视。", L"The file was created and opened, but automatic upload monitoring could not start."),
+                    ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
+}
+
 // Core upload path — the ONE implementation behind the background-menu paste,
 // the folder IDropTarget (Ctrl+V / drag-drop) and any future paste entry.
 // The caller owns hdrop's lifetime (clipboard data must not be freed here).
@@ -1167,6 +1468,10 @@ public:
         else if(0==StrCmpIW(verb,L"open"))       id=MENU_OPEN;
         else if(0==StrCmpIW(verb,L"edit"))       id=MENU_EDIT;
         else if(0==StrCmpIW(verb,L"download"))   id=MENU_DOWNLOAD;
+        // Explorer's native "Copy path" command reaches the selected item
+        // through this canonical verb.  Its public, pasteable ERF equivalent
+        // is exactly the existing "Copy full path" operation.
+        else if(0==StrCmpIW(verb,L"copyaspath")) id=MENU_COPY_FULL;
         else { ProbeLog(L"[CMD] verb '%s' not mapped",verb); return S_OK; }
     }
     SELDATA sel; if(!CollectSelection(data,&sel))return E_FAIL;
@@ -1183,24 +1488,21 @@ public:
     case MENU_COPY_NATIVE:
         { std::wstring t; for(int k=0;k<sel.count;k++){ if(k)t+=L"\r\n"; WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full)); t+=full; } CopyTextToClipboard(ci->hwnd,t.c_str()); break; }
     case MENU_COPY_FULL:
-        { std::wstring t; for(int k=0;k<sel.count;k++){ if(k)t+=L"\r\n"; WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full)); t+=sel.site; t+=L":"; t+=full; } CopyTextToClipboard(ci->hwnd,t.c_str()); break; }
+        { std::wstring t; for(int k=0;k<sel.count;k++){ if(k)t+=L"\r\n"; WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full)); t+=L"erf:"; t+=sel.site; t+=L":"; t+=full; } CopyTextToClipboard(ci->hwnd,t.c_str()); break; }
     case MENU_RCOPY: ServerCopy(ci->hwnd,sel.site,sel.folder,pnames,sel.count,sel.notify); break;
     case MENU_RMOVE: ServerMove(ci->hwnd,sel.site,sel.folder,pnames,sel.count,sel.notify); break;
     case MENU_RENAME: DoRename(ci->hwnd,sel.site,sel.folder,sel.names[0],sel.notify); break;
     case MENU_DELETE:
-        if(IDYES==MessageBoxW(ci->hwnd,ExplorerText(L"confirm.delete_remote",L"要从远程服务器删除选中的项目吗？",L"Delete the selected item(s) on the remote server?"),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_YESNO|MB_ICONWARNING)){
-            BOOL ok=TRUE;
-            for(int k=0;k<sel.count;k++){
-                WCHAR full[700]; JoinPath(sel.folder,sel.names[k],full,ARRAYSIZE(full));
-                if(RunCli(sel.site,L"delete",full,NULL,NULL)!=0) ok=FALSE;
-                else FtpCachePatchRemove(sel.site, sel.folder, sel.names[k]);   // optimistic
-            }
-            ProbeLog(L"[MUT] delete loop done, ok=%d", ok);
-            RefreshLocalFast(sel.site, sel.folder, sel.notify);
-            ProbeLog(L"[MUT] delete case: mutation done, about to return");
-            if(!ok) MessageBoxW(ci->hwnd,ExplorerText(L"error.some_deletes_failed",L"部分项目删除失败。",L"Some items could not be deleted."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-        }
+    {
+        // Do not duplicate a custom confirmation/CLI loop here.  The native
+        // IFileOperation obtains our ITransferSource and funnels the actual
+        // mutation through DeleteRemoteShellItem, exactly like the top button.
+        HRESULT hrDelete = DeleteSelectionWithNativeFileOperation(ci->hwnd, data);
+        if (FAILED(hrDelete) && !IsNativeDeleteCancelled(hrDelete))
+            MessageBoxW(ci->hwnd, ExplorerText(L"error.some_deletes_failed",L"删除失败。",L"Delete failed."),
+                        ExplorerText(L"dialog.remote",L"远程操作",L"Remote"), MB_OK|MB_ICONERROR);
         break;
+    }
     case MENU_PROPERTIES:{
         PROPMETA pm={}; StringCchCopy(pm.site,ARRAYSIZE(pm.site),sel.site);
         pm.canSetOwner = SiteCanSetOwner(sel.site);
@@ -1218,7 +1520,7 @@ public:
     PCWSTR v=L"";
     switch(id){case MENU_OPEN:v=L"open";break;case MENU_EDIT:v=L"edit";break;case MENU_DOWNLOAD:v=L"download";break;
       case MENU_COPY_CLIP:v=L"copy_to_clipboard";break;case MENU_COPY_NAME:v=L"copy_file_name";break;
-      case MENU_COPY_NATIVE:v=L"copy_remote_path";break;case MENU_COPY_FULL:v=L"copy_full_path";break;
+      case MENU_COPY_NATIVE:v=L"copy_remote_path";break;case MENU_COPY_FULL:v=L"copyaspath";break;
       case MENU_RCOPY:v=L"remote_copy";break;case MENU_RMOVE:v=L"remote_move";break;case MENU_RENAME:v=L"rename";break;
       case MENU_DELETE:v=L"delete";break;case MENU_PROPERTIES:v=L"properties";break;default:return E_NOTIMPL;}
     // Probe (2026-09-12): the shell asks which canonical verbs we support
@@ -1515,7 +1817,7 @@ public:
         {
             BG_INSERT(ExplorerText(L"menu.copy_current_path", L"复制当前路径", L"Copy current path"));
             BG_INSERT(ExplorerText(L"menu.new_folder", L"新建文件夹...", L"New folder..."));
-            BG_INSERT(ExplorerText(L"menu.paste_files", L"在此粘贴文件", L"Paste files here"));
+            BG_INSERT(ExplorerText(L"menu.new_file", L"新建文件...", L"New file..."));
             // level 1 is a site's remote root; every level from there has a
             // current-site configuration. Directory metadata is shown when available.
             BG_INSERT(ExplorerText(L"menu.current_directory_properties", L"显示当前目录属性", L"Current directory properties"));
@@ -1563,6 +1865,8 @@ public:
                              : (!IS_INTRESOURCE(ci->lpVerb) && ci->lpVerb && 0 == lstrcmpiA(ci->lpVerb, "paste"));
         BOOL isNew = verbW ? (0 == lstrcmpiW(verbW, L"new"))
                            : (!IS_INTRESOURCE(ci->lpVerb) && ci->lpVerb && 0 == lstrcmpiA(ci->lpVerb, "new"));
+        BOOL isCopyAsPath = verbW ? (0 == lstrcmpiW(verbW, L"copyaspath"))
+                                  : (!IS_INTRESOURCE(ci->lpVerb) && ci->lpVerb && 0 == lstrcmpiA(ci->lpVerb, "copyaspath"));
         if (isNew && m_nLevel >= 1)
         {
             WCHAR nsite[64] = {}, nfolder[512] = {};
@@ -1573,6 +1877,19 @@ public:
             }
             ProbeLog(L"[BG] canonical verb new site='%s' folder='%s'", nsite, nfolder);
             NewFolderRemote(ci->hwnd, nsite, nfolder, m_pidl);
+            return S_OK;
+        }
+        if (isCopyAsPath && m_nLevel >= 1)
+        {
+            WCHAR csite[64] = {}, cfolder[512] = {};
+            if (m_pidl) {
+                PidlSite(m_pidl, csite, ARRAYSIZE(csite));
+                PidlPath(m_pidl, cfolder, ARRAYSIZE(cfolder));
+                ApplySiteStartPath(csite, cfolder, ARRAYSIZE(cfolder));
+            }
+            std::wstring text = L"erf:"; text += csite; text += L":"; text += cfolder;
+            ProbeLog(L"[BG] canonical verb copyaspath site='%s' folder='%s'", csite, cfolder);
+            CopyTextToClipboard(ci->hwnd, text.c_str());
             return S_OK;
         }
         if (isPaste)
@@ -1612,9 +1929,9 @@ public:
         }
         switch (k)
         {
-        case 0: { std::wstring t = site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
+        case 0: { std::wstring t = L"erf:"; t += site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
         case 1: NewFolderRemote(ci->hwnd, site, folder, m_pidl); break;
-        case 2: PasteClipboardToFolder(ci->hwnd, site, folder, m_pidl); break;
+        case 2: NewFileRemote(ci->hwnd, site, folder, m_pidl); break;
         case 3: ShowCurrentFolderProperties(ci->hwnd, site, folder); break;
         case 4: ShowCurrentSiteInfo(ci->hwnd, site); break;
         case 5:
@@ -1635,10 +1952,19 @@ public:
         if (m_pDefault && off < m_defaultCount)
             return m_pDefault->GetCommandString(off, type, r, s, c);
         // Canonical verb names let HOST commands reach our items. Explorer's
-        // native paste resolves the target folder's background menu for a
-        // "paste" verb; returning E_NOTIMPL here is why Ctrl+V / toolbar Paste
-        // silently did nothing. Item layout (level >= 1): k=0 copy path,
-        // k=1 new folder, k=2 paste.
+        // native commands resolve the target folder's background menu through
+        // canonical verbs. Item layout (level >= 1): k=0 copy path, k=1 new
+        // folder.  k=2 is visually "New file", but continues to publish the
+        // canonical paste verb: Explorer has no separate hidden-command API
+        // for a virtual namespace background menu.  Native Ctrl+V invokes it
+        // by verb, whereas a user click invokes the numeric menu id and opens
+        // NewFileRemote above.
+        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 0)
+        {
+            ProbeLog(L"[BG] GetCommandString copyaspath requested type=%u", type);
+            if (type == GCS_VERBW) return StringCchCopyW((PWSTR)s, c, L"copyaspath");
+            if (type == GCS_VERBA) return StringCchCopyA(s, c, "copyaspath");
+        }
         if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 2)
         {
             ProbeLog(L"[BG] GetCommandString paste-verb requested type=%u", type);
@@ -1649,6 +1975,7 @@ public:
         // shell's New command can reach us on the background.
         if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 1)
         {
+            ProbeLog(L"[BG] GetCommandString new-verb requested type=%u", type);
             if (type == GCS_VERBW) return StringCchCopyW((PWSTR)s, c, L"new");
             if (type == GCS_VERBA) return StringCchCopyA(s, c, "new");
         }

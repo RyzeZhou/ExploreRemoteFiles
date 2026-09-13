@@ -1,3 +1,7 @@
+using System.IO;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows;
 using System.Windows.Threading;
@@ -10,6 +14,9 @@ namespace RemoteFsClient;
 /// <summary>用户会话内的常驻控制中心：通知区入口、站点管理器，以及 Shell 本地桥接服务。</summary>
 public partial class App : System.Windows.Application
 {
+    private const string ErfScheme = "erf:";
+    private const string ExplorerRemoteFsClsid = "{C816CE0E-728C-4FC9-98E5-D0B35B384597}";
+    private static readonly Guid ShellWindowsClsid = new("9BA05972-F6A8-11CF-A442-00A0C90A8F39");
     private const string SingleInstanceName = @"Local\ExplorerRemoteFs.Client";
     private const string ShowManagerEventName = @"Local\ExplorerRemoteFs.ShowManager";
     private const string ShowTransfersEventName = @"Local\ExplorerRemoteFs.ShowTransfers";
@@ -22,6 +29,7 @@ public partial class App : System.Windows.Application
     private MainWindow? _manager;
     private RemoteBridgeService? _bridge;
     private TransferTaskService? _transfers;
+    private DeleteProgressService? _deleteProgress;
     private bool _isExiting;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -29,14 +37,53 @@ public partial class App : System.Windows.Application
         base.OnStartup(e);
         Ui.SetLanguage(AppSettings.Load().ServiceLanguage);
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
-        bool background = e.Args.Any(a => string.Equals(a, "--background", StringComparison.OrdinalIgnoreCase));
+        var erfAddress = GetArgumentValue(e.Args, "--open-erf");
+        ErfNavigationRequest? pendingErfNavigation = null;
+        if (erfAddress is not null)
+        {
+            var sourceWindow = GetAncestor(GetForegroundWindow(), GaRoot);
+            pendingErfNavigation = new ErfNavigationRequest(erfAddress, sourceWindow.ToInt64());
+            ErfLog($"protocol entry invoked; address='{erfAddress}'; source=0x{sourceWindow.ToInt64():X}");
+
+            // The normal path: hand work to the long-lived service and leave.
+            // This process is only a URL-protocol shim, never a second engine.
+            var forwardResult = TryForwardErfNavigation(pendingErfNavigation.Value, attempts: 1, out var forwardError);
+            if (forwardResult == ErfForwardResult.Queued)
+            {
+                Shutdown();
+                return;
+            }
+            if (forwardResult == ErfForwardResult.Rejected)
+            {
+                MessageBox.Show(forwardError ?? "The ERF navigation request was rejected.", "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Warning);
+                Shutdown();
+                return;
+            }
+        }
+        bool background = pendingErfNavigation is not null || e.Args.Any(a => string.Equals(a, "--background", StringComparison.OrdinalIgnoreCase));
         bool showRequested = e.Args.Any(a => string.Equals(a, "--show", StringComparison.OrdinalIgnoreCase));
         bool transfersRequested = e.Args.Any(a => string.Equals(a, "--transfers", StringComparison.OrdinalIgnoreCase));
 
         _singleInstance = new Mutex(true, SingleInstanceName, out bool isFirstInstance);
         if (!isFirstInstance)
         {
-            if (transfersRequested)
+            if (pendingErfNavigation is not null)
+            {
+                // The resident process may have the mutex before its pipe
+                // listeners are ready.  Briefly retry rather than losing the
+                // first ERF request during service startup.
+                var forwardResult = TryForwardErfNavigation(pendingErfNavigation.Value, attempts: 8, out var forwardError);
+                if (forwardResult != ErfForwardResult.Queued)
+                {
+                    ErfLog("resident service did not accept ERF navigation request");
+                    MessageBox.Show(
+                        forwardResult == ErfForwardResult.Rejected
+                            ? forwardError ?? "The ERF navigation request was rejected."
+                            : "The Explorer Remote FS service is starting but did not accept the ERF navigation request.",
+                        "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            }
+            else if (transfersRequested)
             {
                 try { EventWaitHandle.OpenExisting(ShowTransfersEventName).Set(); }
                 catch { }
@@ -57,16 +104,417 @@ public partial class App : System.Windows.Application
         _transfers.JobStarted += OnTransferJobStarted;
         _transfers.AllFinished += OnAllTransfersFinished;
         _transfers.Start();
+        _deleteProgress = new DeleteProgressService(Dispatcher);
         _manager = new MainWindow();
         _manager.AttachTasks(_transfers);
         _manager.Closing += OnManagerClosing;
         MainWindow = _manager;
         CreateTrayIcon();
-        _bridge = new RemoteBridgeService();
+        _bridge = new RemoteBridgeService(QueueErfNavigationAsync, _deleteProgress);
         _bridge.Start();
         ListenForShowRequests();
+        if (pendingErfNavigation is not null)
+        {
+            // The first ERF request also started this resident process.  Send
+            // it through our own pipe so it receives exactly the same cache
+            // preflight and validation as later protocol requests.
+            var firstRequest = pendingErfNavigation.Value;
+            _ = Task.Run(() =>
+            {
+                var forwardResult = TryForwardErfNavigation(firstRequest, attempts: 8, out var forwardError);
+                if (forwardResult == ErfForwardResult.Queued) return;
+                ErfLog("first resident ERF request was not accepted");
+                Dispatcher.BeginInvoke(() => MessageBox.Show(
+                    forwardResult == ErfForwardResult.Rejected
+                        ? forwardError ?? "The ERF navigation request was rejected."
+                        : "The Explorer Remote FS service did not accept the ERF navigation request.",
+                    "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Warning));
+            });
+        }
         if (transfersRequested) ShowTransfers();
         else if (!background || showRequested) ShowManager();
+    }
+
+    private static string? GetArgumentValue(IReadOnlyList<string> args, string option)
+    {
+        for (var i = 0; i + 1 < args.Count; i++)
+        {
+            if (string.Equals(args[i], option, StringComparison.OrdinalIgnoreCase)) return args[i + 1];
+        }
+        return null;
+    }
+
+    private Task QueueErfNavigationAsync(ErfNavigationRequest request)
+    {
+        ErfLog($"resident accepted ERF navigation; address='{request.Address}'; source=0x{request.SourceWindowHandle:X}");
+        Dispatcher.BeginInvoke(() => OpenErfAddress(request.Address, new IntPtr(request.SourceWindowHandle)));
+        return Task.CompletedTask;
+    }
+
+    private static ErfForwardResult TryForwardErfNavigation(ErfNavigationRequest request, int attempts, out string? error)
+    {
+        error = null;
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            try
+            {
+                using var pipe = new NamedPipeClientStream(".", RemoteBridgeService.PipeName, PipeDirection.InOut, PipeOptions.None);
+                pipe.Connect(250);
+                using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 4096, leaveOpen: true) { AutoFlush = true };
+                using var reader = new StreamReader(pipe, new UTF8Encoding(false), false, 4096, leaveOpen: true);
+                writer.WriteLine("ERF-NAVIGATE");
+                writer.WriteLine(request.SourceWindowHandle.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                writer.WriteLine(request.Address);
+                var response = reader.ReadLine();
+                if (string.Equals(response, "QUEUED", StringComparison.Ordinal))
+                {
+                    ErfLog($"ERF request forwarded to resident service on attempt {attempt + 1}");
+                    return ErfForwardResult.Queued;
+                }
+                if (!string.IsNullOrWhiteSpace(response) && response.StartsWith("FAIL:", StringComparison.Ordinal))
+                {
+                    error = response[5..].Trim();
+                    ErfLog($"ERF request rejected by resident service; {error}");
+                    return ErfForwardResult.Rejected;
+                }
+            }
+            catch (Exception ex)
+            {
+                ErfLog($"ERF handoff attempt {attempt + 1} failed; {ex.Message}");
+            }
+
+            if (attempt + 1 < attempts) Thread.Sleep(125);
+        }
+        return ErfForwardResult.Unavailable;
+    }
+
+    private enum ErfForwardResult { Queued, Unavailable, Rejected }
+
+    private static void OpenErfAddress(string address, IntPtr sourceWindow)
+    {
+        if (!TryBuildErfTarget(address, out var target))
+        {
+            ErfLog($"invalid address; address='{address}'");
+            MessageBox.Show(
+                "Invalid ERF address. Expected erf:<site>:/absolute/unix/path.",
+                "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        IntPtr rootPidl = IntPtr.Zero;
+        IntPtr relativePidl = IntPtr.Zero;
+        IntPtr folderPidl = IntPtr.Zero;
+        IntPtr folderUnknown = IntPtr.Zero;
+        IShellFolderNative? rootFolder = null;
+        try
+        {
+            ErfLog($"parsed public address; target='{target}'");
+            // ShellExecute can consume the private parsing name "::{CLSID}\\…",
+            // but IWebBrowser2.Navigate2 rejects it with E_INVALIDARG.  The
+            // browser automation contract expects the equivalent shell URL.
+            var parsingName = $"::{ExplorerRemoteFsClsid}\\{target}";
+            var browserAddress = $"shell:::{ExplorerRemoteFsClsid}\\{target}";
+            if (TryNavigateForegroundExplorer(browserAddress, sourceWindow))
+            {
+                ErfLog("navigated the foreground Explorer window");
+                return;
+            }
+
+            ErfLog("foreground Explorer window was unavailable; using new-window fallback");
+            // Resolve only the namespace root through the general Shell parser.
+            // A suffix such as "WSL:/home" is our extension's grammar, not a
+            // general Windows parsing name.  Feed that suffix directly to the
+            // root IShellFolder, whose ParseDisplayName already binds every
+            // Unix path component using the remote directory semantics.
+            var rootResult = SHParseDisplayName($"::{ExplorerRemoteFsClsid}", IntPtr.Zero, out rootPidl, 0, out _);
+            ErfLog($"resolve namespace root; hr=0x{rootResult:X8}; pidl=0x{rootPidl.ToInt64():X}");
+            if (rootResult < 0)
+            {
+                MessageBox.Show(
+                    $"Unable to find the Explorer Remote FS namespace (0x{rootResult:X8}).",
+                    "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            var shellFolderId = typeof(IShellFolderNative).GUID;
+            // A null parent means that rootPidl is absolute (relative to the
+            // desktop).  SHBindToObject's first parameter is the parent
+            // IShellFolder pointer, not the PIDL itself.
+            var bindResult = SHBindToObject(IntPtr.Zero, rootPidl, IntPtr.Zero, ref shellFolderId, out folderUnknown);
+            ErfLog($"bind namespace root; hr=0x{bindResult:X8}; unknown=0x{folderUnknown.ToInt64():X}");
+            if (bindResult < 0)
+            {
+                MessageBox.Show(
+                    $"Unable to bind the Explorer Remote FS namespace (0x{bindResult:X8}).",
+                    "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            rootFolder = (IShellFolderNative)Marshal.GetObjectForIUnknown(folderUnknown);
+            var attributes = 0u;
+            var targetResult = rootFolder.ParseDisplayName(IntPtr.Zero, IntPtr.Zero, target, out _, out relativePidl, ref attributes);
+            ErfLog($"resolve target through namespace; hr=0x{targetResult:X8}; relative=0x{relativePidl.ToInt64():X}");
+            if (targetResult < 0)
+            {
+                MessageBox.Show(
+                    $"Unable to resolve ERF address '{address}' (0x{targetResult:X8}).",
+                    "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            folderPidl = ILCombine(rootPidl, relativePidl);
+            ErfLog($"combine target PIDL; folder=0x{folderPidl.ToInt64():X}");
+            if (folderPidl == IntPtr.Zero)
+            {
+                MessageBox.Show("Unable to prepare the ERF folder location.", "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            // SHOpenFolderAndSelectItems(folderPidl, 0, ...) opens the PARENT
+            // and merely selects folderPidl, which is not navigation.  Execute
+            // the virtual folder's normal Shell verb against its fully resolved
+            // PIDL so Explorer opens the folder itself.
+            var executeInfo = new ShellExecuteInfo
+            {
+                cbSize = Marshal.SizeOf<ShellExecuteInfo>(),
+                fMask = SeeMaskIdList,
+                lpVerb = "open",
+                lpIDList = folderPidl,
+                nShow = 1, // SW_SHOWNORMAL
+            };
+            var shellExecuted = ShellExecuteEx(ref executeInfo);
+            ErfLog($"shell open; result={shellExecuted}; win32={Marshal.GetLastWin32Error()}; instance=0x{executeInfo.hInstApp.ToInt64():X}");
+            if (!shellExecuted)
+            {
+                var error = Marshal.GetLastWin32Error();
+                MessageBox.Show(
+                    $"Unable to open ERF address (Win32 error {error}).",
+                    "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+        catch (Exception ex)
+        {
+            ErfLog($"unhandled exception; {ex}");
+            MessageBox.Show(ex.Message, "Explorer Remote FS", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            if (rootFolder is not null) Marshal.ReleaseComObject(rootFolder);
+            if (folderUnknown != IntPtr.Zero) Marshal.Release(folderUnknown);
+            if (folderPidl != IntPtr.Zero) Marshal.FreeCoTaskMem(folderPidl);
+            if (relativePidl != IntPtr.Zero) Marshal.FreeCoTaskMem(relativePidl);
+            if (rootPidl != IntPtr.Zero) Marshal.FreeCoTaskMem(rootPidl);
+        }
+    }
+
+    private static void ErfLog(string message)
+    {
+        try
+        {
+            File.AppendAllText(
+                Path.Combine(Path.GetTempPath(), "remotefs-erf.log"),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] pid={Environment.ProcessId} {message}{Environment.NewLine}");
+        }
+        catch
+        {
+            // ERF navigation must remain usable when the temporary log cannot be written.
+        }
+    }
+
+    private static bool TryNavigateForegroundExplorer(string parsingName, IntPtr sourceWindow)
+    {
+        // A URI protocol handler is launched out-of-process.  By the time the
+        // resident service has warmed the remote path, Explorer may have
+        // changed foreground ownership, even though the HWND captured by the
+        // short-lived protocol shim is still the correct source browser.
+        // Prefer that original HWND, but also consider the Explorer window
+        // currently in the foreground.  Do not use only one of them: doing so
+        // was the reason a valid request fell through to ShellExecuteEx and
+        // opened a second Explorer window.
+        var candidates = new HashSet<IntPtr>();
+        var original = sourceWindow == IntPtr.Zero ? IntPtr.Zero : GetAncestor(sourceWindow, GaRoot);
+        var current = GetAncestor(GetForegroundWindow(), GaRoot);
+        if (original != IntPtr.Zero) candidates.Add(original);
+        if (current != IntPtr.Zero) candidates.Add(current);
+        if (candidates.Count == 0)
+        {
+            ErfLog("no source or foreground window available for in-place navigation");
+            return false;
+        }
+
+        ErfLog($"in-place navigation candidates: source=0x{original.ToInt64():X}; current=0x{current.ToInt64():X}");
+
+        object? shellWindows = null;
+        try
+        {
+            var type = Type.GetTypeFromCLSID(ShellWindowsClsid);
+            if (type is null) return false;
+            shellWindows = Activator.CreateInstance(type);
+            if (shellWindows is null) return false;
+
+            var count = Convert.ToInt32(shellWindows.GetType().InvokeMember(
+                "Count",
+                System.Reflection.BindingFlags.GetProperty,
+                null,
+                shellWindows,
+                null));
+            ErfLog($"enumerating ShellWindows; count={count}");
+            for (var index = 0; index < count; index++)
+            {
+                object? browserObject = null;
+                try
+                {
+                    // Do not invoke IShellWindows::Item through the C# dynamic
+                    // COM binder.  On current Explorer it marshals the VARIANT
+                    // index incorrectly and returns E_INVALIDARG ("Value does
+                    // not fall within the expected range").  IDispatch
+                    // InvokeMember uses the same ordinary value invocation as
+                    // PowerShell's Shell.Application.Windows().Item(index).
+                    browserObject = shellWindows.GetType().InvokeMember(
+                        "Item",
+                        System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.GetProperty,
+                        null,
+                        shellWindows,
+                        [index]);
+                    if (browserObject is null) continue;
+                    var browserHandle = Convert.ToInt64(browserObject.GetType().InvokeMember(
+                        "HWND",
+                        System.Reflection.BindingFlags.GetProperty,
+                        null,
+                        browserObject,
+                        null));
+                    var browserWindow = GetAncestor(new IntPtr(browserHandle), GaRoot);
+                    var matched = candidates.Contains(browserWindow);
+                    ErfLog($"ShellWindows[{index}] hwnd=0x{browserWindow.ToInt64():X}; matched={matched}");
+                    if (!matched) continue;
+
+                    // Navigate2 accepts Shell parsing names and keeps the
+                    // matched browser window/tab rather than ShellExecuteEx
+                    // creating a new Explorer window.  Invoke it exactly as
+                    // Shell.Application automation does: pass only the URL and
+                    // let COM supply the optional VARIANT arguments.  Explicit
+                    // Type.Missing values are rejected by this Explorer host.
+                    browserObject.GetType().InvokeMember(
+                        "Navigate2",
+                        System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.OptionalParamBinding,
+                        null,
+                        browserObject,
+                        [parsingName]);
+                    ErfLog($"requested in-place navigation; hwnd=0x{browserWindow.ToInt64():X}; target='{parsingName}'");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    // A collection entry may vanish while Explorer is opening
+                    // or closing.  It must not prevent us from checking the
+                    // remaining Explorer windows.
+                    var detail = ex is System.Reflection.TargetInvocationException { InnerException: not null }
+                        ? ex.InnerException.ToString()
+                        : ex.ToString();
+                    ErfLog($"ShellWindows[{index}] skipped; {detail}");
+                }
+                finally
+                {
+                    if (browserObject is not null && Marshal.IsComObject(browserObject))
+                        Marshal.FinalReleaseComObject(browserObject);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            ErfLog($"foreground Explorer navigation failed; {ex.Message}");
+        }
+        finally
+        {
+            if (shellWindows is not null && Marshal.IsComObject(shellWindows))
+                Marshal.FinalReleaseComObject(shellWindows);
+        }
+
+        return false;
+    }
+
+    private static bool TryBuildErfTarget(string address, out string target)
+    {
+        target = string.Empty;
+        if (!address.StartsWith(ErfScheme, StringComparison.OrdinalIgnoreCase)) return false;
+
+        var addressTarget = address[ErfScheme.Length..];
+        var separator = addressTarget.IndexOf(':');
+        if (separator <= 0 || separator == addressTarget.Length - 1) return false;
+
+        var site = Uri.UnescapeDataString(addressTarget[..separator]);
+        var remotePath = Uri.UnescapeDataString(addressTarget[(separator + 1)..]);
+        if (site.IndexOfAny(['/', '\\', ':']) >= 0 || !remotePath.StartsWith('/') || remotePath.Contains('\\')) return false;
+
+        target = $"{site}:{remotePath}";
+        return true;
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SHParseDisplayName(
+        string name,
+        IntPtr bindingContext,
+        out IntPtr pidl,
+        uint attributes,
+        out uint attributesOut);
+
+    [DllImport("shell32.dll")]
+    private static extern int SHBindToObject(
+        IntPtr parentShellFolder,
+        IntPtr relativeOrAbsolutePidl,
+        IntPtr bindingContext,
+        ref Guid interfaceId,
+        out IntPtr result);
+
+    [DllImport("shell32.dll")]
+    private static extern IntPtr ILCombine(IntPtr parentPidl, IntPtr childPidl);
+
+    private const uint SeeMaskIdList = 0x00000004;
+    private const uint GaRoot = 2;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr window, uint flags);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShellExecuteEx(ref ShellExecuteInfo executeInfo);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ShellExecuteInfo
+    {
+        public int cbSize;
+        public uint fMask;
+        public IntPtr hwnd;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? lpVerb;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? lpFile;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? lpParameters;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? lpDirectory;
+        public int nShow;
+        public IntPtr hInstApp;
+        public IntPtr lpIDList;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? lpClass;
+        public IntPtr hkeyClass;
+        public uint dwHotKey;
+        public IntPtr hIconOrMonitor;
+        public IntPtr hProcess;
+    }
+
+    [ComImport]
+    [Guid("000214E6-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellFolderNative
+    {
+        [PreserveSig]
+        int ParseDisplayName(
+            IntPtr hwnd,
+            IntPtr bindingContext,
+            [MarshalAs(UnmanagedType.LPWStr)] string displayName,
+            out uint eaten,
+            out IntPtr relativePidl,
+            ref uint attributes);
     }
 
     private void CreateTrayIcon()

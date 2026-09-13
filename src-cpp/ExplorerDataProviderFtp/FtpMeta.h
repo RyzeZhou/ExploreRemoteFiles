@@ -273,6 +273,58 @@ inline BOOL FtpBridgeList(PCWSTR site, PCWSTR path, std::string &text)
     return sent && complete;
 }
 
+// Synchronous mutation request to the resident service.  This is used from
+// ITransferSource, where Explorer's IFileOperation must not receive success
+// until the remote deletion is actually complete.  The service owns the
+// provider/session and its task queue; this DLL only waits for its final OK or
+// FAIL line while Explorer displays the native progress UI.
+inline BOOL FtpBridgeDelete(PCWSTR site, PCWSTR path, BOOL recursive, std::string &response)
+{
+    response.clear();
+    const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    DWORD lastError = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (pipe != INVALID_HANDLE_VALUE) break;
+        lastError = GetLastError();
+        if (lastError != ERROR_PIPE_BUSY || !WaitNamedPipeW(pipeName, 5000)) break;
+    }
+    if (pipe == INVALID_HANDLE_VALUE)
+    {
+        ProbeLog(L"[XFER] resident delete bridge unavailable site='%s' path='%s' err=%lu", site ? site : L"", path ? path : L"", lastError);
+        return FALSE;
+    }
+
+    BOOL sent = FtpBridgeWriteLine(pipe, L"DELETE") &&
+                FtpBridgeWriteLine(pipe, site ? site : L"") &&
+                FtpBridgeWriteLine(pipe, path ? path : L"/") &&
+                FtpBridgeWriteLine(pipe, recursive ? L"1" : L"0");
+    const ULONGLONG deadline = GetTickCount64() + 15ull * 60ull * 1000ull;
+    if (sent)
+    {
+        while (GetTickCount64() < deadline)
+        {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) break;
+            if (avail > 0)
+            {
+                char buf[1024]; DWORD got = 0;
+                if (!ReadFile(pipe, buf, sizeof(buf), &got, NULL) || got == 0) break;
+                response.append(buf, got);
+                if (response.find('\n') != std::string::npos) break;
+            }
+            else Sleep(25);
+        }
+    }
+    CloseHandle(pipe);
+    BOOL ok = sent && response.rfind("OK", 0) == 0;
+    ProbeLog(L"[XFER] resident delete bridge site='%s' path='%s' recursive=%d sent=%d ok=%d reply='%hs'",
+             site ? site : L"", path ? path : L"", recursive, sent, ok, response.c_str());
+    return ok;
+}
+
 // Tell the resident bridge service to drop its listing cache for one site
 // ("*" = all). Best effort and FIRE-AND-FORGET: if the service is not running
 // this is a no-op, and no reply is ever awaited — the bridge LIST cache TTL is

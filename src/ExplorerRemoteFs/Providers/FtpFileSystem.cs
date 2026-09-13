@@ -117,11 +117,18 @@ public sealed class FtpFileSystem : IRemoteFileSystem
     {
         EnsureConnected();
         if (_client is null) return;
-        if (_client.DirectoryExists(path))
-            _client.DeleteDirectory(path);
-        else
-            _client.DeleteFile(path);
-        Utils.ShellLog.Write($"FTP deleted: {path}");
+        // Idempotent delete: Explorer deletes a directory recursively (single
+        // DELETE recursive=1) and THEN, as a side channel of IFileOperation,
+        // removes each child individually.  By the time those per-child requests
+        // arrive, the entry is already gone — FluentFTP's DeleteFile would throw
+        // a 550 and surface as a bogus "file delete failed" dialog.  A missing
+        // target on a delete is "already deleted", i.e. success.  Only propagate
+        // a real error (auth / permission / IO), never the already-gone case.
+        // Files are probed first: the post-recursive-delete per-child payloads
+        // queued by IFileOperation are overwhelmingly individual files.
+        if (_client.FileExists(path)) { _client.DeleteFile(path); Utils.ShellLog.Write($"FTP deleted: {path}"); return; }
+        if (_client.DirectoryExists(path)) { _client.DeleteDirectory(path); Utils.ShellLog.Write($"FTP deleted: {path}"); return; }
+        Utils.ShellLog.Write($"FTP delete: already gone, treated as success: {path}");
     }
 
     public void Rename(string from, string to)
@@ -138,6 +145,30 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         if (_client is null) return;
         _client.CreateDirectory(path);
         Utils.ShellLog.Write($"FTP mkdir: {path}");
+    }
+
+    public void CreateEmptyFile(string path)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        // FTP has no O_EXCL equivalent.  FluentFTP's Skip mode performs the
+        // best available no-overwrite operation; a simultaneous competing
+        // creator still wins safely because we never request Overwrite.
+        var local = Path.GetTempFileName();
+        try
+        {
+            // UploadFile has the stable FtpStatus return contract across the
+            // FluentFTP version used by this product; UploadStream's return
+            // type changed between major releases.
+            var result = _client.UploadFile(local, path, FtpRemoteExists.Skip, true, FtpVerify.None, null);
+            if (result != FtpStatus.Success)
+                throw new InvalidOperationException($"Remote file already exists or could not be created: {path}");
+            Utils.ShellLog.Write($"FTP touch: {path}");
+        }
+        finally
+        {
+            try { File.Delete(local); } catch { }
+        }
     }
 
     public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false)
