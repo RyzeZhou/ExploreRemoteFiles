@@ -464,7 +464,13 @@ public:
         CFolderFetch *fetch = nullptr;   // non-null for items inside a top-level folder
     };
 
-    static const size_t kMaxItems = 5000;
+    // Hard ceiling on the flattened tree we publish. FILEDESCRIPTORW is ~592 B,
+    // so 100 000 entries cost one ~59 MB movable HGLOBAL -- acceptable for a
+    // clipboard payload, and it is what makes the lab's 100 000-file folders copy
+    // COMPLETELY (the old 5000 silently truncated them; see docs/
+    // UI_THREAD_FREEZE_AND_DATAOBJECT_2026-09-14.md §6.1). Exceeding the ceiling
+    // now REFUSES the formats instead of publishing a partial tree.
+    static const size_t kMaxItems = 200000;
     // How long after being born inside a probe window a query still counts as the
     // shell's own follow-up probing rather than a user-initiated transfer.
     static const DWORD kProbeGraceMs = 1500;
@@ -564,11 +570,25 @@ public:
             for (size_t i = 0; i < fetches.size(); i++) fetches[i]->Release();
             return FALSE;
         }
+        if (items.size() >= kMaxItems)
+        {
+            // Hitting the cap means the tree we would publish is MISSING entries.
+            // Publishing it is exactly how a copy silently loses files: measured
+            // with the old 5000 limit, a 100 000-file folder produced precisely
+            // 5000 GetData contents requests, one "capped" line -- and a SUCCESS
+            // report. Refuse instead, so the user gets an error rather than a
+            // half-populated destination folder.
+            for (size_t i = 0; i < items.size(); i++) items[i].fetch = nullptr;
+            for (size_t i = 0; i < fetches.size(); i++) fetches[i]->Release();
+            ProbeLog(L"[DATAOBJ] tree hits cap=%u -> refuse (would silently copy a partial tree)",
+                     (UINT)kMaxItems);
+            return FALSE;
+        }
         _items.swap(items);
         for (size_t i = 0; i < fetches.size(); i++) _fetches.push_back(fetches[i]);
         _expanded = TRUE;
-        ProbeLog(L"[DATAOBJ] expanded tops=%u items=%u cacheOnly=%d%s", (UINT)_tops.size(),
-                 (UINT)_items.size(), (int)cacheOnly, _items.size() >= kMaxItems ? L" (capped)" : L"");
+        ProbeLog(L"[DATAOBJ] expanded tops=%u items=%u cacheOnly=%d", (UINT)_tops.size(),
+                 (UINT)_items.size(), (int)cacheOnly);
         return TRUE;
     }
 
@@ -668,6 +688,20 @@ public:
             for (size_t i = 0; i < _items.size(); i++)
             {
                 FILEDESCRIPTORW &fd = fgd->fgd[i];
+                if (_items[i].relPath.size() >= ARRAYSIZE(fd.cFileName))
+                {
+                    // FileGroupDescriptorW's cFileName is WCHAR[MAX_PATH]: the
+                    // clipboard drop protocol physically cannot express a deeper
+                    // relative path. Guarding here beats StringCchCopyW refusing to
+                    // copy and handing Explorer an entry with an EMPTY name (silent
+                    // junk instead of an error). Deep trees must go through our own
+                    // transfer engine -- see docs/ERF_PROTOCOL_PLAN.md §8.
+                    GlobalUnlock(h);
+                    GlobalFree(h);
+                    ProbeLog(L"[DATAOBJ] rel path '%s' (%u chars) exceeds FileGroupDescriptor limit -> refuse",
+                             _items[i].relPath.c_str(), (UINT)_items[i].relPath.size());
+                    return DV_E_FORMATETC;
+                }
                 fd.dwFlags = FD_FILESIZE | FD_ATTRIBUTES | FD_WRITESTIME;
                 fd.nFileSizeLow = (DWORD)(_items[i].size & 0xFFFFFFFF);
                 fd.nFileSizeHigh = (DWORD)(_items[i].size >> 32);
