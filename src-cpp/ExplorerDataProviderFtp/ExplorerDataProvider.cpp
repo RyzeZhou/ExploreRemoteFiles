@@ -541,6 +541,13 @@ public:
 
     HRESULT Initialize();
 
+    // Pre-seed the enumerator with an already-materialized cache snapshot so
+    // Initialize() does NOT re-fetch the listing (which could block the shell
+    // UI thread on a cold multi-second pipe read). Used by EnumObjects' async
+    // path: on a cache hit we seed here and skip the fetch; on a miss we leave
+    // it empty and populate through FtpPrefetchQuiet + SHCNE_UPDATEDIR.
+    void SeedData(std::vector<ITEMDATA> &&data);
+
 private:
     ~CFolderViewImplEnumIDList();
 
@@ -549,6 +556,7 @@ private:
     int m_nItem;
     int m_nLevel;
     std::vector<ITEMDATA> m_aData;
+    BOOL m_fSeeded;
     WCHAR m_szPath[512];
     WCHAR m_szSite[64];
 
@@ -826,17 +834,73 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
     *ppenumIDList = NULL;
     ProbeLog(L"[ENUM] level=%d site='%s' path='%s' flags=0x%X", m_nLevel, m_szSiteName, m_szRemotePath, grfFlags);
     const ULONGLONG tEnum = GetTickCount64();
-    // Refresh the identity snapshot used by ParseDisplayName round-trips.
+
+    // For remote folder children (level >= 1) NEVER block the shell UI thread
+    // on a cold listing: a cold 100k-dir directory is a ~5-9MB / multi-second
+    // synchronous pipe read (FtpBridgeList inside FtpListCachedAll) that froze
+    // Explorer both while browsing large folders and during the delete pre-count
+    // ("[BRIDGE] ... bytes=9188907 elapsed=5625"). Instead:
+    //   * cache hit  -> materialize the enumerator from memory (fast, as before);
+    //   * cache miss -> return an EMPTY enumerator immediately and fill the cache
+    //                    in the background (FtpPrefetchQuiet) + SHCNE_UPDATEDIR
+    //                    so the view repopulates when the listing is ready. The
+    //                    user-measurable tradeoff is a brief blank window while
+    //                    browsing a large COLD directory (== the bridge list
+    //                    time), in exchange for Instant delete pre-scans.
+    std::vector<FTPENTRY> snapshot;
+    if (m_nLevel >= 1)
     {
-        std::vector<FTPENTRY> snapshot;
-        if (FtpListCachedAll(m_szSiteName, m_szRemotePath, snapshot))
+        if (FtpCachePeekAll(m_szSiteName, m_szRemotePath, snapshot))
         {
+            // Warm cache: refresh the ParseDisplayName identity snapshot and
+            // pre-seed the enumerator so Initialize() does not re-fetch.
             m_recentItems.clear();
             m_recentItems.reserve(snapshot.size());
+            std::vector<ITEMDATA> data;
+            data.reserve(snapshot.size());
             for (auto const &it : snapshot)
+            {
                 m_recentItems.emplace_back(std::wstring(it.szName), it.fIsFolder);
+                ITEMDATA item = {};
+                item.nLevel = m_nLevel + 1;
+                item.dwMode = it.dwMode;
+                item.dwMtime = it.dwMtime;
+                item.dwSize = it.dwSize;
+                item.dwUid = it.dwUid;
+                item.dwGid = it.dwGid;
+                item.fIsFolder = it.fIsFolder;
+                item.fIsSymlink = it.fIsSymlink;
+                StringCchCopy(item.szOwner, ARRAYSIZE(item.szOwner), it.szOwner);
+                StringCchCopy(item.szGroup, ARRAYSIZE(item.szGroup), it.szGroup);
+                StringCchCopy(item.szName, ARRAYSIZE(item.szName), it.szName);
+                data.push_back(item);
+            }
+            CFolderViewImplEnumIDList *penumWarm = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
+            if (penumWarm)
+            {
+                penumWarm->SeedData(std::move(data));
+                HRESULT hrWarm = penumWarm->Initialize();
+                if (SUCCEEDED(hrWarm))
+                {
+                    hrWarm = penumWarm->QueryInterface(IID_PPV_ARGS(ppenumIDList));
+                    ProbeLog(L"[ENUM] prepared(warm-cache) in %llu ms level=%d path='%s' n=%u", GetTickCount64() - tEnum, m_nLevel, m_szRemotePath, (UINT)snapshot.size());
+                }
+                penumWarm->Release();
+                return hrWarm;
+            }
+            return S_OK; // out-of-memory: empty enumeration, UPDATEDIR will follow
         }
+        // Cold / uncached directory: do not touch the network on the UI thread.
+        ProbeLog(L"[ENUM] async-empty miss site='%s' path='%s'", m_szSiteName, m_szRemotePath);
+        FtpPrefetchQuiet(m_szSiteName, m_szRemotePath, m_pidl);
     }
+    else
+    {
+        // Site picker (level 0): enumeration is the local configured-site list
+        // built by Initialize(); nothing remote to prefetch.
+        m_recentItems.clear();
+    }
+
     CFolderViewImplEnumIDList *penum = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
     HRESULT hr = penum ? S_OK : E_OUTOFMEMORY;
     if (SUCCEEDED(hr))
@@ -2322,11 +2386,17 @@ HRESULT CFolderViewImplFolder::CreateChildID(PCWSTR pszName, int nLevel, int nSi
 
 
 CFolderViewImplEnumIDList::CFolderViewImplEnumIDList(DWORD grfFlags, int nLevel, PCWSTR pszSite, PCWSTR pszPath, CFolderViewImplFolder *pFolderViewImplShellFolder) :
-    m_cRef(1), m_grfFlags(grfFlags), m_nLevel(nLevel), m_nItem(0), m_pFolder(pFolderViewImplShellFolder)
+    m_cRef(1), m_grfFlags(grfFlags), m_nLevel(nLevel), m_nItem(0), m_fSeeded(FALSE), m_pFolder(pFolderViewImplShellFolder)
 {
     m_pFolder->AddRef();
     StringCchCopy(m_szSite, ARRAYSIZE(m_szSite), pszSite ? pszSite : L"");
     StringCchCopy(m_szPath, ARRAYSIZE(m_szPath), pszPath ? pszPath : L"/");
+}
+
+void CFolderViewImplEnumIDList::SeedData(std::vector<ITEMDATA> &&data)
+{
+    m_aData = std::move(data);
+    m_fSeeded = TRUE;
 }
 
 CFolderViewImplEnumIDList::~CFolderViewImplEnumIDList()
@@ -2381,6 +2451,13 @@ static void SortItems(ITEMDATA *a, int maxItems)
 
 HRESULT CFolderViewImplEnumIDList::Initialize()
 {
+    if (m_fSeeded)
+    {
+        // Data was already materialized from the cache by EnumObjects (async
+        // path). Never re-fetch; SortItems here matches the unseeded path.
+        SortItems(m_aData.data(), (int)m_aData.size());
+        return S_OK;
+    }
     m_aData.clear();
     if (m_nLevel == 1)
     {
@@ -2429,7 +2506,12 @@ HRESULT CFolderViewImplEnumIDList::Initialize()
 // by the number of items retrieved.
 HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG *pceltFetched)
 {
-    ProbeLog(L"[ENUM] Next celt=%u", celt);
+    // NOTE (2026-??): the per-call "[ENUM] Next celt=" probe was also removed.
+    // Explorer enumerates with celt=1 (one item per Next), so a 100k dir fired
+    // 100k synchronous disk flushes here too — same log-storm cost as the
+    // per-item probe that was removed above. Next() is now fully silent on the
+    // hot path; the EnumObjects-level "[ENUM] prepared in X ms" line records
+    // one log write per folder enumeration.
     ULONG celtFetched = 0;
 
     HRESULT hr = (pceltFetched || celt <= 1) ? S_OK : E_INVALIDARG;
@@ -2438,7 +2520,14 @@ HRESULT CFolderViewImplEnumIDList::Next(ULONG celt, PITEMID_CHILD *rgelt, ULONG 
         ULONG i = 0;
         while (SUCCEEDED(hr) && i < celt && m_nItem < (int)m_aData.size())
         {
-            ProbeLog(L"[ENUM] item='%s' folder=%d flags=0x%X", m_aData[m_nItem].szName, m_aData[m_nItem].fIsFolder, m_grfFlags);
+            // NOTE (2026-??): per-item "[ENUM] item=" probe deliberately removed.
+            // Explorer's delete pre-count calls EnumObjects+Next over the whole
+            // directory to count items, so a 100k-file folder fired 100k
+            // synchronous fflush disk writes (ProbeLog) on the UI thread —
+            // that log storm, not the enumeration itself, made the native
+            // "scanning N items" window take seconds and scale linearly worse
+            // with N. Enumeration is now silent in Next(); the EnumObjects-level
+            // "[ENUM] prepared in X ms" probe still records one line per folder.
             BOOL fSkip = FALSE;
             // Dotfiles remain in the enumeration. Explorer filters them after
             // GetAttributesOf reports SFGAO_HIDDEN for the individual item.

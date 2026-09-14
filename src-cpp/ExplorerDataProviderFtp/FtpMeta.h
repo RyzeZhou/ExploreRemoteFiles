@@ -602,6 +602,35 @@ inline BOOL FtpCacheFindOne(PCWSTR site, PCWSTR folder, PCWSTR name, FTPENTRY *o
     return FALSE;
 }
 
+// Pure in-memory cache peek (NO disk-cache fallback, NO network/pipe fetch).
+// Returns TRUE and deep-copies the FULL listing if the directory is currently
+// cached (within TTL, i.e. the in-memory contents are the real remote listing).
+// Returns FALSE when the directory is not in memory — the caller must NOT then
+// do a synchronous FtpListCachedAll on the shell UI thread (a cold 100k-dir
+// listing is a ~5-9MB / multi-second pipe read that freezes Explorer, which is
+// exactly what Explorer's delete pre-count and a large-dir navigation hit).
+// Callers that get FALSE should enumerate EMPTY and let FtpPrefetchQuiet fill
+// the cache asynchronously + SHChangeNotify refresh the view.
+inline BOOL FtpCachePeekAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out)
+{
+    out.clear();
+    if (!site || !site[0]) return FALSE;
+    PCWSTR key = (path && path[0]) ? path : L"/";
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockShared(&FtpCacheLock());
+    for (auto const &entry : FtpCacheEntries())
+    {
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, 30000))
+        {
+            out = entry.items;
+            ReleaseSRWLockShared(&FtpCacheLock());
+            return TRUE;
+        }
+    }
+    ReleaseSRWLockShared(&FtpCacheLock());
+    return FALSE;
+}
+
 // Immediate view notify (background). The patched cache entry already exists,
 // so the re-enumeration shows the change at once (no network involved).
 inline void FtpNotifyUpdateDir(PIDLIST_ABSOLUTE notifyPidl)
@@ -620,12 +649,16 @@ inline void FtpNotifyUpdateDir(PIDLIST_ABSOLUTE notifyPidl)
     if (h) CloseHandle(h);
 }
 
-// Quiet background prefetch: replace the patched cache with the real listing
-// (accurate metadata) WITHOUT notifying. Runs entirely off the caller's thread.
+// Background prefetch: replace the (possibly stale or empty) cache with the
+// real listing (accurate metadata). Runs entirely off the caller's thread.
+// When `notifyPidl` is non-NULL, fires SHCNE_UPDATEDIR after a successful fill
+// so an empty view that was returned while the cache was cold repopulates as
+// soon as the listing is ready (e.g. async enumeration of a big directory).
 struct FtpPrefetchCtx
 {
     WCHAR site[64];
     WCHAR folder[600];
+    PIDLIST_ABSOLUTE notifyPidl;   // cloned by FtpPrefetchQuiet, freed here
 };
 static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
 {
@@ -640,18 +673,24 @@ static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
         FtpListCachedAll(c->site, c->folder, warm);
     }
     ProbeLog(L"[MUT] quiet prefetch site='%s' path='%s' n=%u", c->site, c->folder, (UINT)warm.size());
+    if (c->notifyPidl)
+    {
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, c->notifyPidl, NULL);
+        ILFree(c->notifyPidl);
+    }
     delete c;
     return 0;
 }
-inline void FtpPrefetchQuiet(PCWSTR site, PCWSTR folder)
+inline void FtpPrefetchQuiet(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl = NULL)
 {
     FtpPrefetchCtx *c = new (std::nothrow) FtpPrefetchCtx{};
     if (!c) return;
     StringCchCopy(c->site, ARRAYSIZE(c->site), site ? site : L"");
     StringCchCopy(c->folder, ARRAYSIZE(c->folder), (folder && folder[0]) ? folder : L"/");
+    c->notifyPidl = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
     HANDLE h = CreateThread(NULL, 0, FtpPrefetchThreadProc, c, 0, NULL);
     if (h) CloseHandle(h);
-    else delete c;
+    else { if (c->notifyPidl) ILFree(c->notifyPidl); delete c; }
 }
 
 // Returns count of cached entries for site+path (0 = miss/expired).
