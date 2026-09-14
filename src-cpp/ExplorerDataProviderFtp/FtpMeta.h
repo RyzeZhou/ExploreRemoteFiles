@@ -631,6 +631,37 @@ inline BOOL FtpCachePeekAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out
     return FALSE;
 }
 
+// ---------------------------------------------------------------------------
+// UI-thread fetch suppression window.
+//
+// Explorer builds the *default* context menu (and through it the Delete /
+// Properties command-bar verbs) by calling GetUIObjectOf(IID_IContextMenu) ->
+// SHCreateDefaultContextMenu, which queries our attached IDataObject. That query
+// reaches CRemoteDataObject::ExpandIfNeeded -> ExpandInto -> FtpListCachedAll,
+// which on a COLD directory is a synchronous ~5-9MB / multi-second pipe read on
+// the shell UI thread (log: "[BRIDGE] path=.../big-5 bytes=9188907
+// elapsed=6875" fired inside the IContextMenu build). That is the "转圈圈很久"
+// before the Delete / Properties / right-click UI appears.
+//
+// While this counter is > 0 the data object must NOT start a network/pipe fetch;
+// it reads the cache only and lets the background prefetch warm it. Ctrl+C copy
+// does NOT go through the context menu, so it is unaffected and keeps its full
+// eager expansion (copy needs the complete file list).
+inline volatile LONG *UiFetchSuppressCounter()
+{
+    static volatile LONG c = 0;
+    return &c;
+}
+inline BOOL UiFetchSuppressed()
+{
+    return *UiFetchSuppressCounter() > 0;
+}
+struct UiFetchSuppressGuard
+{
+    UiFetchSuppressGuard() { InterlockedIncrement(UiFetchSuppressCounter()); }
+    ~UiFetchSuppressGuard() { InterlockedDecrement(UiFetchSuppressCounter()); }
+};
+
 // Immediate view notify (background). The patched cache entry already exists,
 // so the re-enumeration shows the change at once (no network involved).
 inline void FtpNotifyUpdateDir(PIDLIST_ABSOLUTE notifyPidl)
@@ -658,8 +689,43 @@ struct FtpPrefetchCtx
 {
     WCHAR site[64];
     WCHAR folder[600];
+    WCHAR key[700];                // "site|folder", removed from the in-flight set on exit
     PIDLIST_ABSOLUTE notifyPidl;   // cloned by FtpPrefetchQuiet, freed here
 };
+
+// In-flight prefetch set: many cold GetItemMeta calls (per rendered item / per
+// sort comparison / per Details cell) must not spawn one thread each.
+inline SRWLOCK &FtpPrefetchLock()
+{
+    static SRWLOCK l = SRWLOCK_INIT;
+    return l;
+}
+inline std::vector<std::wstring> &FtpPrefetchInFlight()
+{
+    static std::vector<std::wstring> v;
+    return v;
+}
+inline BOOL FtpPrefetchBegin(PCWSTR key)
+{
+    AcquireSRWLockExclusive(&FtpPrefetchLock());
+    std::vector<std::wstring> &v = FtpPrefetchInFlight();
+    if (std::find(v.begin(), v.end(), key) != v.end())
+    {
+        ReleaseSRWLockExclusive(&FtpPrefetchLock());
+        return FALSE;
+    }
+    v.push_back(key);
+    ReleaseSRWLockExclusive(&FtpPrefetchLock());
+    return TRUE;
+}
+inline void FtpPrefetchEnd(PCWSTR key)
+{
+    AcquireSRWLockExclusive(&FtpPrefetchLock());
+    std::vector<std::wstring> &v = FtpPrefetchInFlight();
+    v.erase(std::remove(v.begin(), v.end(), std::wstring(key)), v.end());
+    ReleaseSRWLockExclusive(&FtpPrefetchLock());
+}
+
 static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
 {
     FtpPrefetchCtx *c = static_cast<FtpPrefetchCtx *>(p);
@@ -678,19 +744,31 @@ static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
         SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, c->notifyPidl, NULL);
         ILFree(c->notifyPidl);
     }
+    FtpPrefetchEnd(c->key);
     delete c;
     return 0;
 }
 inline void FtpPrefetchQuiet(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl = NULL)
 {
+    if (!site || !site[0]) return;
+    PCWSTR dir = (folder && folder[0]) ? folder : L"/";
+    WCHAR key[700] = {};
+    StringCchPrintf(key, ARRAYSIZE(key), L"%s|%s", site, dir);
+    if (!FtpPrefetchBegin(key)) return;   // already being fetched
     FtpPrefetchCtx *c = new (std::nothrow) FtpPrefetchCtx{};
-    if (!c) return;
-    StringCchCopy(c->site, ARRAYSIZE(c->site), site ? site : L"");
-    StringCchCopy(c->folder, ARRAYSIZE(c->folder), (folder && folder[0]) ? folder : L"/");
+    if (!c) { FtpPrefetchEnd(key); return; }
+    StringCchCopy(c->site, ARRAYSIZE(c->site), site);
+    StringCchCopy(c->folder, ARRAYSIZE(c->folder), dir);
+    StringCchCopy(c->key, ARRAYSIZE(c->key), key);
     c->notifyPidl = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
     HANDLE h = CreateThread(NULL, 0, FtpPrefetchThreadProc, c, 0, NULL);
     if (h) CloseHandle(h);
-    else { if (c->notifyPidl) ILFree(c->notifyPidl); delete c; }
+    else
+    {
+        if (c->notifyPidl) ILFree(c->notifyPidl);
+        FtpPrefetchEnd(key);
+        delete c;
+    }
 }
 
 // Returns count of cached entries for site+path (0 = miss/expired).

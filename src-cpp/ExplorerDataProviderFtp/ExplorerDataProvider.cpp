@@ -228,6 +228,8 @@ static int RunFtpOperation(PCWSTR site, PCWSTR verb, PCWSTR path1, PCWSTR path2)
 }
 static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
 {
+    if (!out) return FALSE;
+    ZeroMemory(out, sizeof(*out));
     if (!name || !name[0]) return FALSE;
     if (!site || !site[0]) ProbeLog(L"[WARN] GetItemMeta EMPTY-SITE path='%s' name='%s'", path ? path : L"/", name);
     PCWSTR full = (path && path[0]) ? path : L"/";
@@ -237,26 +239,16 @@ static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
     // query would make large directories unusable (2026-09-04).
     if (!FtpCacheFindOne(site, full, name, &found))
     {
-        const ULONGLONG tM = GetTickCount64();
-        std::vector<FTPENTRY> items;
-        if (!FtpListCachedAll(site, full, items))
-        {
-            // A FAILED metadata lookup blanks the column cell; log every miss
-            // so a "Back shows empty columns" report can be pinned to data vs
-            // parameters (2026-09-06 investigation).
-            ProbeLog(L"[MISS] GetItemMeta FAIL site='%s' path='%s' name='%s'", site ? site : L"", full, name);
-            return FALSE;
-        }
-        const ULONGLONG dtM = GetTickCount64() - tM;
-        if (dtM > 40) ProbeLog(L"[PERF] GetItemMeta cold-fill site='%s' path='%s' name='%s' took %llu ms", site ? site : L"", full, name, dtM);
-        if (!FtpCacheFindOne(site, full, name, &found))
-        {
-            // Listing loaded fine but the item name was not found in it.
-            ProbeLog(L"[MISS] GetItemMeta item-not-found site='%s' path='%s' name='%s' items=%u", site ? site : L"", full, name, (UINT)items.size());
-            return FALSE;
-        }
+        // Cold item: the directory listing for this item is not in memory.
+        // NEVER do a synchronous fetch here — this runs on the shell UI thread
+        // (per rendered item: icon + every Details cell, plus the sort
+        // comparison). Warm the cache in the background and blank the value for
+        // now; the UPDATEDIR notify re-reads it once the listing lands.
+        ProbeLog(L"[MISS] GetItemMeta deferred(cold) site='%s' path='%s' name='%s'",
+                 site ? site : L"", full, name);
+        if (site && site[0]) FtpPrefetchQuiet(site, full);
+        return FALSE;
     }
-    ZeroMemory(out, sizeof(*out));
     out->dwMode = found.dwMode; out->dwMtime = found.dwMtime; out->dwSize = found.dwSize;
     out->dwUid = found.dwUid; out->dwGid = found.dwGid;
     out->fIsFolder = found.fIsFolder; out->fIsSymlink = found.fIsSymlink;
@@ -893,6 +885,18 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
         // Cold / uncached directory: do not touch the network on the UI thread.
         ProbeLog(L"[ENUM] async-empty miss site='%s' path='%s'", m_szSiteName, m_szRemotePath);
         FtpPrefetchQuiet(m_szSiteName, m_szRemotePath, m_pidl);
+        // Return an EMPTY enumerator NOW. It must be *seeded* (m_fSeeded), because
+        // the unseeded Initialize() below does a synchronous FtpListCachedAll —
+        // that was the remaining multi-second UI-thread fetch. The prefetch above
+        // fills the cache and fires SHCNE_UPDATEDIR, which makes Explorer
+        // re-enumerate and then take the warm branch.
+        CFolderViewImplEnumIDList *penumEmpty = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
+        if (!penumEmpty) return E_OUTOFMEMORY;
+        penumEmpty->SeedData(std::vector<ITEMDATA>());
+        HRESULT hrEmpty = penumEmpty->Initialize();
+        if (SUCCEEDED(hrEmpty)) hrEmpty = penumEmpty->QueryInterface(IID_PPV_ARGS(ppenumIDList));
+        penumEmpty->Release();
+        return hrEmpty;
     }
     else
     {
@@ -1424,7 +1428,10 @@ HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **p
         // (show hidden files, copy current path, new folder, paste files, custom).
         DEFCONTEXTMENU dcm = { hwnd, NULL, m_pidl, static_cast<IShellFolder2 *>(this), 0, NULL, NULL, 0, NULL };
         IContextMenu *pDef = NULL;
-        hr = SHCreateDefaultContextMenu(&dcm, IID_PPV_ARGS(&pDef));
+        {
+            UiFetchSuppressGuard suppressProbe;   // see the selection-menu branch below
+            hr = SHCreateDefaultContextMenu(&dcm, IID_PPV_ARGS(&pDef));
+        }
         if (SUCCEEDED(hr))
         {
             hr = CFolderViewImplBgMenu_Create(pDef, m_pidl, m_nLevel, riid, ppv);
@@ -1504,7 +1511,16 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
         ProbeLog(L"[MENU] GetUIObjectOf IContextMenu cidl=%u level=%d enter", cidl, m_nLevel);
         DEFCONTEXTMENU const dcm = { hwnd, NULL, m_pidl, static_cast<IShellFolder2 *>(this),
                                cidl, apidl, NULL, 0, NULL };
-        hr = SHCreateDefaultContextMenu(&dcm, riid, ppv);
+        {
+            // While the shell builds the default menu it probes this folder for
+            // an IDataObject (GetUIObjectOf(IID_IDataObject), nested inside this
+            // call). Any data object handed out here must NEVER start a
+            // synchronous pipe fetch later, because the shell may call GetData on
+            // it long after this call returned — that is the multi-second
+            // "转圈圈" before the Delete / Properties / right-click UI appears.
+            UiFetchSuppressGuard suppressProbe;
+            hr = SHCreateDefaultContextMenu(&dcm, riid, ppv);
+        }
         ProbeLog(L"[MENU] GetUIObjectOf IContextMenu exit hr=0x%08X", hr);
     }
     else if (riid == IID_IExtractIconW)
@@ -1552,6 +1568,21 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
         {
             hr = SHCreateDataObject(m_pidl, cidl, apidl, NULL, riid, ppv);
         }
+        else if (UiFetchSuppressed())
+        {
+            // The shell is only PROBING us (it is building the default context
+            // menu / command-bar verbs and wants to know "what is selected",
+            // which it identifies through CFSTR_SHELLIDLIST -- see
+            // CollectSelection). Our virtual-file object carries no IDList
+            // format, and handing it out here made the shell see an unusable
+            // selection and dismiss the menu it had just opened. So during a
+            // probe hand back the plain SHELL data object: it is exactly what
+            // the caller wants, it can never flatten a tree and therefore can
+            // never start the synchronous multi-second pipe fetch either.
+            hr = SHCreateDataObject(m_pidl, cidl, apidl, NULL, riid, ppv);
+            ProbeLog(L"[DATAOBJ] probe -> shell data object cidl=%u path='%s' hr=0x%08X",
+                     cidl, m_szRemotePath, hr);
+        }
         else
         {
             IDataObject *inner = NULL;
@@ -1579,7 +1610,7 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
                 }
                 hr = SHCreateDataObject(m_pidl, cidl, apidl, inner, riid, ppv);
                 inner->Release();
-                ProbeLog(L"[DATAOBJ] attached inner cidl=%u site='%s' path='%s' hr=0x%08X",
+                ProbeLog(L"[DATAOBJ] attached inner cidl=%u site='%s' path='%s' hr=0x%08X probe=0",
                          cidl, m_szSiteName, m_szRemotePath, hr);
             }
         }

@@ -490,6 +490,15 @@ public:
         _tops.push_back(it);
     }
 
+    // True while this object must not touch the network. A copy object is
+    // normally created OUTSIDE the shell's menu-probe window and keeps its full
+    // eager expansion; the second term is a belt-and-braces guard for objects
+    // that are nevertheless created or handled inside that window. (The probe
+    // path now hands back the plain SHELL data object instead of this class, so
+    // this is mostly defensive.)
+    void SuppressFetch() { _noFetch = TRUE; }
+    BOOL FetchSuppressed() const { return _noFetch || UiFetchSuppressed(); }
+
     STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
     {
         if (!ppv) return E_POINTER;
@@ -513,8 +522,14 @@ public:
     void ExpandIfNeeded()
     {
         if (_expanded) return;
-        _expanded = TRUE;
-        _items.clear();
+
+        // Build into temporaries. A *suppressed* (context-menu) expansion of a
+        // cold tree is intentionally incomplete and must NOT be cached, so that
+        // a later real GetData (Ctrl+C copy needs the full file list) re-expands
+        // with all children.
+        std::vector<Item> items;
+        std::vector<CFolderFetch *> fetches;
+        BOOL complete = TRUE;
         for (size_t i = 0; i < _tops.size(); i++)
         {
             CFolderFetch *fetch = nullptr;
@@ -524,20 +539,38 @@ public:
                 if (!full.empty() && full[full.size() - 1] != L'/') full += L'/';
                 full += _tops[i].name;
                 fetch = new (std::nothrow) CFolderFetch(_tops[i].site.c_str(), full.c_str());
-                if (fetch) _fetches.push_back(fetch);
+                if (fetch) fetches.push_back(fetch);
             }
-            ExpandInto(_tops[i], fetch);
+            ExpandInto(items, complete, _tops[i], fetch);
         }
+
+        if (!complete && FetchSuppressed())
+        {
+            // Shell is only probing us while it builds the default context menu
+            // (right-click / Delete / Properties command-bar verbs). Hand back
+            // the selection cheaply (top-level entries only), drop the partial
+            // tree so a real copy re-expands, and let the prefetch warm the
+            // cache for the next look.
+            for (size_t i = 0; i < items.size(); i++) items[i].fetch = nullptr;  // released just below: must not dangle
+            for (size_t i = 0; i < fetches.size(); i++) fetches[i]->Release();
+            _items = items;          // top-level items only; NOT cached (_expanded stays FALSE)
+            ProbeLog(L"[DATAOBJ] expand suppressed (cold) tops=%u -> defer", (UINT)_tops.size());
+            return;
+        }
+
+        _items.swap(items);
+        for (size_t i = 0; i < fetches.size(); i++) _fetches.push_back(fetches[i]);
+        _expanded = TRUE;
         ProbeLog(L"[DATAOBJ] expanded tops=%u items=%u%s", (UINT)_tops.size(), (UINT)_items.size(),
                  _items.size() >= kMaxItems ? L" (truncated)" : L"");
     }
 
-    void ExpandInto(const Item &dir, CFolderFetch *fetch)
+    void ExpandInto(std::vector<Item> &out, BOOL &complete, const Item &dir, CFolderFetch *fetch)
     {
-        if (_items.size() >= kMaxItems) return;
+        if (out.size() >= kMaxItems) { complete = FALSE; return; }
         Item it = dir;
         it.fetch = fetch;
-        _items.push_back(it);
+        out.push_back(it);
         if (!dir.isFolder) return;
 
         std::wstring full = dir.folder;
@@ -545,14 +578,34 @@ public:
         full += dir.name;
 
         std::vector<FTPENTRY> kids;
-        if (!FtpListCachedAll(dir.site.c_str(), full.c_str(), kids))
+        BOOL have = FALSE;
+        if (FetchSuppressed())
+        {
+            // Context-menu build on the shell UI thread: cache-only. A cold
+            // directory must NOT trigger the synchronous multi-second pipe
+            // fetch here; warm it in the background instead.
+            have = FtpCachePeekAll(dir.site.c_str(), full.c_str(), kids);
+            if (!have)
+            {
+                complete = FALSE;
+                FtpPrefetchQuiet(dir.site.c_str(), full.c_str());
+                ProbeLog(L"[DATAOBJ] suppressed cold '%s'", full.c_str());
+                return;
+            }
+        }
+        else
+        {
+            have = FtpListCachedAll(dir.site.c_str(), full.c_str(), kids);
+        }
+        if (!have)
         {
             ProbeLog(L"[DATAOBJ] list failed '%s'", full.c_str());
+            complete = FALSE;
             return;
         }
         for (size_t k = 0; k < kids.size(); k++)
         {
-            if (_items.size() >= kMaxItems) return;
+            if (out.size() >= kMaxItems) { complete = FALSE; return; }
             Item it2;
             it2.site = dir.site;
             it2.folder = full;
@@ -562,19 +615,34 @@ public:
             it2.mtime = kids[k].dwMtime;
             it2.isFolder = kids[k].fIsFolder;
             it2.fetch = fetch;       // inherit the folder's fetch context
-            ExpandInto(it2, fetch);
+            ExpandInto(out, complete, it2, fetch);
         }
     }
 
     STDMETHODIMP GetData(FORMATETC *fmt, STGMEDIUM *medium) override
     {
         if (!fmt || !medium) return E_INVALIDARG;
-        ExpandIfNeeded();
         ZeroMemory(medium, sizeof(*medium));
         CLIPFORMAT cfDesc = (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
         CLIPFORMAT cfContents = (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_FILECONTENTS);
 
-        if (fmt->cfFormat == cfDesc)
+        // Only the two formats we actually serve may trigger the tree walk.
+        // ExpandIfNeeded used to run FIRST for ANY format, so an unrelated probe
+        // (CF_HDROP / "Shell IDList Array", which we do not support at all) paid
+        // for a full synchronous enumeration of every selected folder -- that is
+        // where the multi-second UI-thread pipe fetch actually came from.
+        const BOOL wantDesc = (fmt->cfFormat == cfDesc);
+        const BOOL wantContents = (fmt->cfFormat == cfContents && fmt->lindex >= 0);
+        if (!wantDesc && !wantContents) return DV_E_FORMATETC;
+
+        // Probe only the descriptor query (lindex == -1); per-file contents
+        // queries (lindex >= 0) would storm the log during a copy.
+        if (fmt->lindex < 0)
+            ProbeLog(L"[DATAOBJ] GetData enter fmt=0x%04X suppressed=%d",
+                     (UINT)fmt->cfFormat, (int)FetchSuppressed());
+        ExpandIfNeeded();
+
+        if (wantDesc)
         {
             SIZE_T bytes = sizeof(FILEGROUPDESCRIPTORW) + (SIZE_T)(_items.size() ? _items.size() - 1 : 0) * sizeof(FILEDESCRIPTORW);
             HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
@@ -689,4 +757,5 @@ private:
     std::vector<Item> _items;       // flattened tree (built on first GetData)
     std::vector<CFolderFetch *> _fetches;   // top-level folder contexts (owned)
     BOOL _expanded = FALSE;
+    BOOL _noFetch = FALSE;          // created during a shell menu probe: never fetch
 };
