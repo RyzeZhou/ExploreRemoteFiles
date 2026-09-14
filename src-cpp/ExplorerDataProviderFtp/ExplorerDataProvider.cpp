@@ -842,7 +842,28 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
     std::vector<FTPENTRY> snapshot;
     if (m_nLevel >= 1)
     {
-        if (FtpCachePeekAll(m_szSiteName, m_szRemotePath, snapshot))
+        // Any cold enumeration -- view (flags=0xC0E0 with SHCONTF_ENABLE_ASYNC) or
+        // transfer/storage (flags=0x860 with SHCONTF_STORAGE, used by the delete
+        // pre-count walk) -- answers EMPTY and fills in the background. Copy does
+        // NOT depend on this enumeration (it reads the clipboard's
+        // FileGroupDescriptor/FileContents), so the earlier experiment of serving
+        // the real children to STORAGE enumerations bought nothing but the
+        // multi-second pre-count and the native transfer window (2026-09-06).
+        BOOL haveSnap = FtpCachePeekAll(m_szSiteName, m_szRemotePath, snapshot);
+        if (!haveSnap)
+        {
+            // Cold: never touch the network on the shell UI thread.
+            ProbeLog(L"[ENUM] async-empty miss site='%s' path='%s'", m_szSiteName, m_szRemotePath);
+            FtpPrefetchQuiet(m_szSiteName, m_szRemotePath, m_pidl);
+            CFolderViewImplEnumIDList *penumEmpty = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
+            if (!penumEmpty) return E_OUTOFMEMORY;
+            penumEmpty->SeedData(std::vector<ITEMDATA>());
+            HRESULT hrEmpty = penumEmpty->Initialize();
+            if (SUCCEEDED(hrEmpty)) hrEmpty = penumEmpty->QueryInterface(IID_PPV_ARGS(ppenumIDList));
+            penumEmpty->Release();
+            return hrEmpty;
+        }
+        if (haveSnap)
         {
             // Warm cache: refresh the ParseDisplayName identity snapshot and
             // pre-seed the enumerator so Initialize() does not re-fetch.
@@ -882,21 +903,12 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
             }
             return S_OK; // out-of-memory: empty enumeration, UPDATEDIR will follow
         }
-        // Cold / uncached directory: do not touch the network on the UI thread.
-        ProbeLog(L"[ENUM] async-empty miss site='%s' path='%s'", m_szSiteName, m_szRemotePath);
-        FtpPrefetchQuiet(m_szSiteName, m_szRemotePath, m_pidl);
-        // Return an EMPTY enumerator NOW. It must be *seeded* (m_fSeeded), because
-        // the unseeded Initialize() below does a synchronous FtpListCachedAll —
-        // that was the remaining multi-second UI-thread fetch. The prefetch above
-        // fills the cache and fires SHCNE_UPDATEDIR, which makes Explorer
-        // re-enumerate and then take the warm branch.
-        CFolderViewImplEnumIDList *penumEmpty = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
-        if (!penumEmpty) return E_OUTOFMEMORY;
-        penumEmpty->SeedData(std::vector<ITEMDATA>());
-        HRESULT hrEmpty = penumEmpty->Initialize();
-        if (SUCCEEDED(hrEmpty)) hrEmpty = penumEmpty->QueryInterface(IID_PPV_ARGS(ppenumIDList));
-        penumEmpty->Release();
-        return hrEmpty;
+        // Cold + transfer/storage enumeration (SHCONTF_STORAGE, no ENABLE_ASYNC):
+        // fall through to the unseeded enumerator below, whose Initialize() does
+        // the blocking FtpListCachedAll. The copy/drag/delete engine must receive
+        // the real children; Explorer runs this inside the transfer with its own
+        // progress UI, so correctness beats an instant reply here.
+        ProbeLog(L"[ENUM] sync-list(transfer/storage) flags=0x%X path='%s'", grfFlags, m_szRemotePath);
     }
     else
     {
@@ -1322,7 +1334,18 @@ public:
         return S_OK;
     }
     IFACEMETHODIMP SetProperties(IPropertyChangeArray *) { return E_NOTIMPL; }
-    IFACEMETHODIMP OpenItem(IShellItem *, TRANSFER_SOURCE_FLAGS, REFIID, void **) { return E_NOTIMPL; }
+    IFACEMETHODIMP OpenItem(IShellItem *psi, TRANSFER_SOURCE_FLAGS, REFIID riid, void **ppv)
+    {
+        // Tripwire: we have no way to hand out a source item's storage, so this
+        // E_NOTIMPL surfaces as "执行磁盘操作时出错" (0x80004001). The copy engine
+        // only ends up here when the clipboard object is missing
+        // FileGroupDescriptorW/FileContents -- i.e. when our inner data object was
+        // not attached. Logged (no GetDisplayName: never re-enter the shell from
+        // here) so that never goes silently wrong again.
+        ProbeLog(L"[XFER] OpenItem UNSUPPORTED site='%s' folder='%s' psi=%p riid=%08X hr=E_NOTIMPL",
+                 m_site, m_folder, psi, riid.Data1);
+        return E_NOTIMPL;
+    }
     IFACEMETHODIMP MoveItem(IShellItem *, IShellItem *, LPCWSTR, TRANSFER_SOURCE_FLAGS, IShellItem **) { return E_NOTIMPL; }
     IFACEMETHODIMP RecycleItem(IShellItem *psiSource, IShellItem *, TRANSFER_SOURCE_FLAGS flags, IShellItem **ppsiNewDest)
     {
@@ -1568,21 +1591,6 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
         {
             hr = SHCreateDataObject(m_pidl, cidl, apidl, NULL, riid, ppv);
         }
-        else if (UiFetchSuppressed())
-        {
-            // The shell is only PROBING us (it is building the default context
-            // menu / command-bar verbs and wants to know "what is selected",
-            // which it identifies through CFSTR_SHELLIDLIST -- see
-            // CollectSelection). Our virtual-file object carries no IDList
-            // format, and handing it out here made the shell see an unusable
-            // selection and dismiss the menu it had just opened. So during a
-            // probe hand back the plain SHELL data object: it is exactly what
-            // the caller wants, it can never flatten a tree and therefore can
-            // never start the synchronous multi-second pipe fetch either.
-            hr = SHCreateDataObject(m_pidl, cidl, apidl, NULL, riid, ppv);
-            ProbeLog(L"[DATAOBJ] probe -> shell data object cidl=%u path='%s' hr=0x%08X",
-                     cidl, m_szRemotePath, hr);
-        }
         else
         {
             IDataObject *inner = NULL;
@@ -1590,6 +1598,16 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
             if (SUCCEEDED(hr) && inner)
             {
                 CRemoteDataObject *obj = static_cast<CRemoteDataObject *>(inner);
+                // Keep our object ATTACHED in every case -- the shell's own
+                // SHCreateDataObject composite is what lands on the clipboard, and
+                // dropping our inner object (tried 2026-09-06) removes
+                // FileGroupDescriptorW/FileContents from it, so a later paste has
+                // nothing to read and fails with E_NOTIMPL (0x80004001).
+                // Instead an object born inside a menu/drag probe is marked so its
+                // cold answers REFUSE the virtual-file formats instead of blocking
+                // the UI thread or reporting a half-built tree.
+                BOOL probing = UiFetchSuppressed();
+                if (probing) obj->SuppressFetch();
                 for (UINT i = 0; i < cidl; i++)
                 {
                     WCHAR name[MAX_PATH] = {};
@@ -1610,8 +1628,8 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
                 }
                 hr = SHCreateDataObject(m_pidl, cidl, apidl, inner, riid, ppv);
                 inner->Release();
-                ProbeLog(L"[DATAOBJ] attached inner cidl=%u site='%s' path='%s' hr=0x%08X probe=0",
-                         cidl, m_szSiteName, m_szRemotePath, hr);
+                ProbeLog(L"[DATAOBJ] attached inner cidl=%u site='%s' path='%s' hr=0x%08X probe=%d",
+                         cidl, m_szSiteName, m_szRemotePath, hr, (int)probing);
             }
         }
     }

@@ -465,6 +465,9 @@ public:
     };
 
     static const size_t kMaxItems = 5000;
+    // How long after being born inside a probe window a query still counts as the
+    // shell's own follow-up probing rather than a user-initiated transfer.
+    static const DWORD kProbeGraceMs = 1500;
 
     static HRESULT Create(REFIID riid, void **ppv)
     {
@@ -490,14 +493,23 @@ public:
         _tops.push_back(it);
     }
 
-    // True while this object must not touch the network. A copy object is
-    // normally created OUTSIDE the shell's menu-probe window and keeps its full
-    // eager expansion; the second term is a belt-and-braces guard for objects
-    // that are nevertheless created or handled inside that window. (The probe
-    // path now hands back the plain SHELL data object instead of this class, so
-    // this is mostly defensive.)
-    void SuppressFetch() { _noFetch = TRUE; }
-    BOOL FetchSuppressed() const { return _noFetch || UiFetchSuppressed(); }
+    // Born inside a shell probe window (default context menu / command-bar verbs
+    // / drag preparation). While that probe is live this object must never block
+    // the UI thread -- but it may well be the very object that ends up on the
+    // clipboard, so afterwards it has to answer for real.
+    void SuppressFetch() { _probeBorn = TRUE; _probeTick = GetTickCount(); }
+
+    // Still being probed? True inside the guard window, and for a short grace
+    // period after it: the shell's own follow-up query lands milliseconds after
+    // SHCreateDefaultContextMenu returned (measured: the drag-preparation GetData
+    // came 78 ms after [MENU] exit). Blocking there is the "右键/删除 转圈几秒"
+    // freeze; a real copy or paste asks much later, once the user clicked.
+    BOOL BeingProbed() const
+    {
+        if (UiFetchSuppressed()) return TRUE;
+        if (!_probeBorn) return FALSE;
+        return (DWORD)(GetTickCount() - _probeTick) < kProbeGraceMs;
+    }
 
     STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
     {
@@ -519,17 +531,18 @@ public:
         return n;
     }
 
-    void ExpandIfNeeded()
+    // Flatten the selected tree. cacheOnly=TRUE answers from the in-memory /
+    // on-disk listing cache only and is instant; cacheOnly=FALSE is allowed to
+    // pay for one synchronous listing fetch. Returns FALSE when some directory
+    // could not be listed -- the caller must then REFUSE the virtual-file
+    // formats, never publish a half-built tree (Explorer would create a folder
+    // that is silently missing files, or hand the copy engine a list whose
+    // indices no longer mean anything).
+    BOOL TryExpand(BOOL cacheOnly)
     {
-        if (_expanded) return;
-
-        // Build into temporaries. A *suppressed* (context-menu) expansion of a
-        // cold tree is intentionally incomplete and must NOT be cached, so that
-        // a later real GetData (Ctrl+C copy needs the full file list) re-expands
-        // with all children.
         std::vector<Item> items;
         std::vector<CFolderFetch *> fetches;
-        BOOL complete = TRUE;
+        BOOL cold = FALSE;
         for (size_t i = 0; i < _tops.size(); i++)
         {
             CFolderFetch *fetch = nullptr;
@@ -541,33 +554,50 @@ public:
                 fetch = new (std::nothrow) CFolderFetch(_tops[i].site.c_str(), full.c_str());
                 if (fetch) fetches.push_back(fetch);
             }
-            ExpandInto(items, complete, _tops[i], fetch);
+            ExpandInto(items, cold, _tops[i], fetch, cacheOnly);
         }
-
-        if (!complete && FetchSuppressed())
+        if (cold)
         {
-            // Shell is only probing us while it builds the default context menu
-            // (right-click / Delete / Properties command-bar verbs). Hand back
-            // the selection cheaply (top-level entries only), drop the partial
-            // tree so a real copy re-expands, and let the prefetch warm the
-            // cache for the next look.
-            for (size_t i = 0; i < items.size(); i++) items[i].fetch = nullptr;  // released just below: must not dangle
+            // The fetch contexts belong to a tree we are throwing away: clear the
+            // pointers before releasing, so nothing can dereference them later.
+            for (size_t i = 0; i < items.size(); i++) items[i].fetch = nullptr;
             for (size_t i = 0; i < fetches.size(); i++) fetches[i]->Release();
-            _items = items;          // top-level items only; NOT cached (_expanded stays FALSE)
-            ProbeLog(L"[DATAOBJ] expand suppressed (cold) tops=%u -> defer", (UINT)_tops.size());
-            return;
+            return FALSE;
         }
-
         _items.swap(items);
         for (size_t i = 0; i < fetches.size(); i++) _fetches.push_back(fetches[i]);
         _expanded = TRUE;
-        ProbeLog(L"[DATAOBJ] expanded tops=%u items=%u%s", (UINT)_tops.size(), (UINT)_items.size(),
-                 _items.size() >= kMaxItems ? L" (truncated)" : L"");
+        ProbeLog(L"[DATAOBJ] expanded tops=%u items=%u cacheOnly=%d%s", (UINT)_tops.size(),
+                 (UINT)_items.size(), (int)cacheOnly, _items.size() >= kMaxItems ? L" (capped)" : L"");
+        return TRUE;
     }
 
-    void ExpandInto(std::vector<Item> &out, BOOL &complete, const Item &dir, CFolderFetch *fetch)
+    void ExpandIfNeeded()
     {
-        if (out.size() >= kMaxItems) { complete = FALSE; return; }
+        if (_expanded) return;
+        if (TryExpand(TRUE)) return;             // warm: answered without blocking
+
+        if (BeingProbed())
+        {
+            // The shell is only asking "what is selected" while it builds the
+            // default context menu / command-bar verbs or prepares a drag. Those
+            // callers also hold CFSTR_SHELLIDLIST from the outer object, so
+            // refusing our two formats costs them nothing, and we never start the
+            // multi-second listing fetch on the UI thread. The prefetch that
+            // TryExpand started fills the cache; the next query answers for real.
+            ProbeLog(L"[DATAOBJ] cold while probing -> refuse formats tops=%u", (UINT)_tops.size());
+            return;                               // _expanded stays FALSE -> GetData refuses
+        }
+
+        // A real consumer (copy / paste / drop) is waiting for the file list.
+        // Correctness beats an instant answer here, so pay for the fetch.
+        if (TryExpand(FALSE)) return;
+        ProbeLog(L"[DATAOBJ] listing fetch failed -> refuse formats tops=%u", (UINT)_tops.size());
+    }
+
+    void ExpandInto(std::vector<Item> &out, BOOL &cold, const Item &dir, CFolderFetch *fetch, BOOL cacheOnly)
+    {
+        if (out.size() >= kMaxItems) return;     // capped, but still a valid tree
         Item it = dir;
         it.fetch = fetch;
         out.push_back(it);
@@ -578,34 +608,18 @@ public:
         full += dir.name;
 
         std::vector<FTPENTRY> kids;
-        BOOL have = FALSE;
-        if (FetchSuppressed())
-        {
-            // Context-menu build on the shell UI thread: cache-only. A cold
-            // directory must NOT trigger the synchronous multi-second pipe
-            // fetch here; warm it in the background instead.
-            have = FtpCachePeekAll(dir.site.c_str(), full.c_str(), kids);
-            if (!have)
-            {
-                complete = FALSE;
-                FtpPrefetchQuiet(dir.site.c_str(), full.c_str());
-                ProbeLog(L"[DATAOBJ] suppressed cold '%s'", full.c_str());
-                return;
-            }
-        }
-        else
-        {
-            have = FtpListCachedAll(dir.site.c_str(), full.c_str(), kids);
-        }
+        BOOL have = cacheOnly ? FtpCachePeekAll(dir.site.c_str(), full.c_str(), kids)
+                              : FtpListCachedAll(dir.site.c_str(), full.c_str(), kids);
         if (!have)
         {
-            ProbeLog(L"[DATAOBJ] list failed '%s'", full.c_str());
-            complete = FALSE;
+            cold = TRUE;
+            if (cacheOnly) FtpPrefetchQuiet(dir.site.c_str(), full.c_str());
+            ProbeLog(L"[DATAOBJ] %s '%s'", cacheOnly ? L"cold" : L"list failed", full.c_str());
             return;
         }
         for (size_t k = 0; k < kids.size(); k++)
         {
-            if (out.size() >= kMaxItems) { complete = FALSE; return; }
+            if (out.size() >= kMaxItems) return;
             Item it2;
             it2.site = dir.site;
             it2.folder = full;
@@ -615,7 +629,7 @@ public:
             it2.mtime = kids[k].dwMtime;
             it2.isFolder = kids[k].fIsFolder;
             it2.fetch = fetch;       // inherit the folder's fetch context
-            ExpandInto(out, complete, it2, fetch);
+            ExpandInto(out, cold, it2, fetch, cacheOnly);
         }
     }
 
@@ -639,8 +653,9 @@ public:
         // queries (lindex >= 0) would storm the log during a copy.
         if (fmt->lindex < 0)
             ProbeLog(L"[DATAOBJ] GetData enter fmt=0x%04X suppressed=%d",
-                     (UINT)fmt->cfFormat, (int)FetchSuppressed());
+                     (UINT)fmt->cfFormat, (int)BeingProbed());
         ExpandIfNeeded();
+        if (!_expanded) return DV_E_FORMATETC;   // cold tree while the shell probes us
 
         if (wantDesc)
         {
@@ -757,5 +772,6 @@ private:
     std::vector<Item> _items;       // flattened tree (built on first GetData)
     std::vector<CFolderFetch *> _fetches;   // top-level folder contexts (owned)
     BOOL _expanded = FALSE;
-    BOOL _noFetch = FALSE;          // created during a shell menu probe: never fetch
+    BOOL _probeBorn = FALSE;        // created inside a shell menu/drag probe window
+    DWORD _probeTick = 0;           // and when that happened (see BeingProbed)
 };
