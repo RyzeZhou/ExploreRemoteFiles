@@ -21,6 +21,9 @@ public interface IRemoteFileSystem : IDisposable
     /// <summary>创建目录（远程）。</summary>
     void CreateDirectory(string path);
 
+    /// <summary>创建一个零字节文件；目标已存在时必须失败，不得覆盖。</summary>
+    void CreateEmptyFile(string path);
+
     /// <summary>下载远程文件到本地路径。progress(已传字节, 总字节) 可选；resume 时从断点续传。</summary>
     void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false);
 

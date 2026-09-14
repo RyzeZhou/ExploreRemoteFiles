@@ -11,6 +11,7 @@ $folder='{C816CE0E-728C-4FC9-98E5-D0B35B384597}'
 $ctx='{CB8F539D-3B97-4473-9E07-C8248C53248E}'
 $props='{5DD84779-FEF1-46A3-8FCF-9F1A9603BB8F}'
 $hk='HKCU:\Software\Classes'
+$erfProtocol="$hk\erf"
 
 $explorerWasRunning = $null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue)
 try {
@@ -26,6 +27,10 @@ Start-Sleep -Milliseconds 800
 # context menu + property sheet handlers
 Remove-Item "$hk\RemoteFsMicrosoftCoreType" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$hk\RemoteFsFileType" -Recurse -Force -ErrorAction SilentlyContinue
+# Remove the ERF URI protocol only when this installation registered it.
+if ((Get-ItemProperty -LiteralPath $erfProtocol -ErrorAction SilentlyContinue).'ERF.HandlerOwner' -eq 'ExplorerRemoteFs') {
+    Remove-Item -LiteralPath $erfProtocol -Recurse -Force -ErrorAction SilentlyContinue
+}
 # CLSIDs
 Remove-Item "$hk\CLSID\$folder" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$hk\CLSID\$ctx"    -Recurse -Force -ErrorAction SilentlyContinue

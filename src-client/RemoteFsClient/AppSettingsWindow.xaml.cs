@@ -20,6 +20,7 @@ public partial class AppSettingsWindow : Window
         WinScpPathBox.Text = Settings.WinScpPath;
         MetadataCachePathBox.Text = Settings.MetadataCachePath;
         FileCachePathBox.Text = Settings.FileCachePath;
+        EditorPathBox.Text = Settings.EditorPath;
         ExplorerLanguageBox.SelectedValue = Settings.ExplorerLanguage;
         ServiceLanguageBox.SelectedValue = Settings.ServiceLanguage;
         DefaultViewBox.SelectedValue = Settings.DefaultViewMode;
@@ -33,6 +34,7 @@ public partial class AppSettingsWindow : Window
         WinScpPathLabel.Text = Ui.T("WinScpPath"); BrowseButton.Content = Ui.T("Browse");
         MetadataCachePathLabel.Text = Ui.T("MetadataCachePath"); FileCachePathLabel.Text = Ui.T("FileCachePath");
         BrowseMetadataCacheButton.Content = Ui.T("Browse"); BrowseFileCacheButton.Content = Ui.T("Browse");
+        DefaultEditorLabel.Text = Ui.T("DefaultEditor"); BrowseEditorButton.Content = Ui.T("Browse");
         ExplorerLanguageLabel.Text = Ui.T("ExplorerLanguage"); ServiceLanguageLabel.Text = Ui.T("ServiceLanguage");
         DefaultViewLabel.Text = Ui.IsEnglish ? "Default view" : "默认视图";
         var viewNames = Ui.IsEnglish
@@ -63,6 +65,16 @@ public partial class AppSettingsWindow : Window
 
     private void OnBrowseMetadataCache(object sender, RoutedEventArgs e) => BrowseFolder(MetadataCachePathBox);
     private void OnBrowseFileCache(object sender, RoutedEventArgs e) => BrowseFolder(FileCachePathBox);
+    private void OnBrowseEditor(object sender, RoutedEventArgs e)
+    {
+        var dlg = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = Ui.IsEnglish ? "Select an editor executable" : "选择编辑器程序",
+            Filter = Ui.IsEnglish ? "Programs|*.exe|All files|*.*" : "程序|*.exe|所有文件|*.*",
+            FileName = EditorPathBox.Text.Trim(), CheckFileExists = true,
+        };
+        if (dlg.ShowDialog(this) == true) EditorPathBox.Text = dlg.FileName;
+    }
 
     private void BrowseFolder(System.Windows.Controls.TextBox target)
     {
@@ -79,6 +91,7 @@ public partial class AppSettingsWindow : Window
         Settings.WinScpPath = WinScpPathBox.Text.Trim();
         Settings.MetadataCachePath = MetadataCachePathBox.Text.Trim();
         Settings.FileCachePath = FileCachePathBox.Text.Trim();
+        Settings.EditorPath = EditorPathBox.Text.Trim();
         Settings.ExplorerLanguage = (ExplorerLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.ServiceLanguage = (ServiceLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.DefaultViewMode = (DefaultViewBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "details";

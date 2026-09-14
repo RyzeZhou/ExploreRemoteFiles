@@ -36,11 +36,19 @@ public sealed class TransferTask : INotifyPropertyChanged
     private void Raise([CallerMemberName] string? name = null)
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
-    public string DirectionLabel => Direction == "download" ? "↓ 下载" : "↑ 上传";
+    public string DirectionLabel => Direction switch
+    {
+        "download" => "↓ 下载",
+        "upload" => "↑ 上传",
+        "delete" => Ui.IsEnglish ? "⌫ Delete" : "⌫ 删除",
+        _ => Direction,
+    };
     public string TargetText => Direction == "download" ? LocalPath : RemotePath;
     public bool IsFinished => _status is "done" or "fail" or "cancel";
     public bool IsFailed => _status == "fail";
     public bool IsPaused => _paused;
+    public bool IsCancelRequested => _cancelRequested;
+    private bool _cancelRequested;
 
     /// <summary>For a multi-file (batch) job, the file currently being transferred. Empty for single-file jobs and after completion.</summary>
     public string CurrentFile
@@ -71,20 +79,31 @@ public sealed class TransferTask : INotifyPropertyChanged
         Raise(nameof(StatusText));
     }
 
+    public void MarkCancelRequested()
+    {
+        _cancelRequested = true;
+        Raise(nameof(IsCancelRequested));
+        Raise(nameof(StatusText));
+    }
+
     public double Percent => _total > 0
         ? (_done >= _total ? 100.0 : Math.Max(0, _done * 100.0 / _total))
         : (IsFinished ? 100.0 : 0.0);
 
-    public string ProgressText => _total > 0 ? $"{Format(_done)} / {Format(_total)}" : Format(_done);
+    public string ProgressText => Direction == "delete"
+        ? (_total > 0 ? $"{_done} / {_total}" : $"{_done}") + (Ui.IsEnglish ? " items" : " 项")
+        : (_total > 0 ? $"{Format(_done)} / {Format(_total)}" : Format(_done));
 
-    public string SpeedText => _status == "running" && _speed > 1 ? Format((long)_speed) + "/s" : "";
+    public string SpeedText => _status == "running" && _speed > 1
+        ? (Direction == "delete" ? $"{_speed:0}/s" : Format((long)_speed) + "/s") : "";
 
     public string StatusText => _status switch
     {
         "done" => "完成",
         "fail" => "失败",
         "cancel" => "已取消",
-        _ => _paused ? "已暂停" : (Percent > 0 ? $"{Percent:0}%" : "…"),
+        _ => _cancelRequested ? (Ui.IsEnglish ? "Cancelling…" : "正在取消…")
+             : _paused ? "已暂停" : (Percent > 0 ? $"{Percent:0}%" : "…"),
     };
 
     public string Failure { get; private set; } = "";
@@ -142,6 +161,7 @@ public sealed class TransferTaskService
     private const string PipeName = "ExplorerRemoteFs.Tasks.v1";
     private readonly Dispatcher _dispatcher;
     private CancellationTokenSource? _cts;
+    private readonly Dictionary<string, Action> _managedCancels = new(StringComparer.Ordinal);
 
     // ---- batch bookkeeping -------------------------------------------------
     // A "batch" is one USER-level operation. Copying a folder runs one CLI job
@@ -297,10 +317,80 @@ public sealed class TransferTaskService
     public void Cancel(TransferTask task)
     {
         if (task is null || task.IsFinished) return;
+        if (_managedCancels.TryGetValue(task.Id, out var cancelManaged))
+        {
+            cancelManaged();
+            task.MarkCancelRequested();
+            return;
+        }
         try { if (task.Pid > 0) Process.GetProcessById(task.Pid).Kill(); } catch { }
         if (!_batchActive) { _batchActive = true; _batchDone = _batchFailed = _batchCancelled = 0; }
         _batchCancelled++;
         task.MarkCancelled();
+        MaybeEndBatch();
+    }
+
+    /// <summary>
+    /// Registers an operation executed by the resident service itself (rather
+    /// than by a short-lived CLI process).  The returned task is immediately
+    /// visible in the same queue used by upload/download jobs.
+    /// </summary>
+    public TransferTask BeginManagedTask(string direction, string server, string name, string remotePath, Action cancel)
+    {
+        if (!_dispatcher.CheckAccess())
+            return _dispatcher.Invoke(() => BeginManagedTask(direction, server, name, remotePath, cancel));
+
+        _batchTimer?.Stop();
+        if (!_batchActive)
+        {
+            _batchActive = true;
+            _batchDone = _batchFailed = _batchCancelled = 0;
+            Log("BATCH BEGIN (managed)");
+        }
+        var task = new TransferTask
+        {
+            Id = Guid.NewGuid().ToString("N"), Direction = direction, Server = server,
+            Name = name, RemotePath = remotePath,
+        };
+        _managedCancels[task.Id] = cancel;
+        Tasks.Insert(0, task);
+        JobStarted?.Invoke();
+        Log($"BEGIN managed id={task.Id} server={server} dir={direction} name={name}");
+        return task;
+    }
+
+    public void UpdateManagedTask(TransferTask task, long done, long total, string? current)
+    {
+        if (!_dispatcher.CheckAccess())
+        {
+            _dispatcher.BeginInvoke(() => UpdateManagedTask(task, done, total, current));
+            return;
+        }
+        if (task.IsFinished) return;
+        task.Update(done, total);
+        task.CurrentFile = current ?? string.Empty;
+    }
+
+    public void CompleteManagedTask(TransferTask task, bool ok, string? message, bool cancelled = false)
+    {
+        if (!_dispatcher.CheckAccess())
+        {
+            _dispatcher.BeginInvoke(() => CompleteManagedTask(task, ok, message, cancelled));
+            return;
+        }
+        _managedCancels.Remove(task.Id);
+        if (task.IsFinished) return;
+        if (cancelled)
+        {
+            _batchCancelled++;
+            task.MarkCancelled();
+        }
+        else
+        {
+            if (ok) _batchDone++; else _batchFailed++;
+            task.Finish(ok, message ?? string.Empty);
+        }
+        Log($"END managed id={task.Id} status={(cancelled ? "cancel" : ok ? "done" : "fail")}");
         MaybeEndBatch();
     }
 

@@ -44,6 +44,9 @@ switch (argv[0].ToLowerInvariant())
     case "mkdir":
         CmdMkdir(argv);
         break;
+    case "touch":
+        CmdTouch(argv);
+        break;
     case "chmod":
         CmdChmod(argv);
         break;
@@ -88,6 +91,7 @@ static void PrintUsage()
           delete <name> <path>  Delete remote file/dir
           rename <name> <old> <new>  Rename/move remote item
           mkdir <name> <path>   Create remote directory
+          touch <name> <path>   Create zero-byte remote file (fails if it already exists)
           chmod <name> <path> <mode>  Change permissions (octal, e.g. 640)
           chown <name> <path> <user[:group]>  Change owner/group (SFTP; - = keep)
           get <name> <remote> <local> Download remote file to local path
@@ -256,6 +260,24 @@ static void CmdMkdir(string[] args)
         var fs = ProviderFactory.Get(conn);
         fs.CreateDirectory(args[2]);
         Console.WriteLine($"MKDIR: {args[2]}");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FAIL: {ex.Message}");
+        ProviderFactory.Invalidate(conn.Name);
+        Environment.Exit(2);
+    }
+}
+
+static void CmdTouch(string[] args)
+{
+    if (args.Length < 3) { PrintUsage(); return; }
+    var conn = Find(args[1]);
+    try
+    {
+        var fs = ProviderFactory.Get(conn);
+        fs.CreateEmptyFile(args[2]);
+        Console.WriteLine($"TOUCH: {args[2]}");
     }
     catch (Exception ex)
     {
@@ -536,6 +558,17 @@ static void CmdOpen(string[] args)
     // button, which resolve the default verb through IQueryAssociations.
     if (args.Length < 2) { PrintUsage(); return; }
     string spec = args[1];
+    // Explorer substitutes an item's FORPARSING name into a ProgID command.
+    // Our namespace correctly returns a qualified private Shell parsing name
+    // (::{CLSID}\WSL:/path), whereas the CLI's provider grammar starts at
+    // WSL:/path.  Accept both forms so native double-click / Enter reaches
+    // exactly the same remote file as the context-menu Open command.
+    if (spec.StartsWith("::{", StringComparison.Ordinal))
+    {
+        int namespaceEnd = spec.IndexOf("}\\", StringComparison.Ordinal);
+        if (namespaceEnd >= 0) spec = spec[(namespaceEnd + 2)..];
+    }
+    if (spec.StartsWith("erf:", StringComparison.OrdinalIgnoreCase)) spec = spec[4..];
     int colon = spec.IndexOf(':');
     if (colon <= 0)
     {
@@ -555,7 +588,10 @@ static void CmdOpen(string[] args)
             "rfs-open-" + Guid.NewGuid().ToString("N").Substring(0, 6) + "-" + name);
         try { if (File.Exists(local)) File.Delete(local); } catch { }
         var fs = ProviderFactory.Get(conn);
-        DownloadTracked(fs, conn.Name, remotePath, local);
+        // Opening is staging for a local application, not a user-visible
+        // transfer job.  Right-click Open has the same semantics; keep the
+        // transfer queue reserved for explicit copy/upload/download requests.
+        fs.Download(remotePath, local);
         var psi = new System.Diagnostics.ProcessStartInfo(local) { UseShellExecute = true };
         System.Diagnostics.Process.Start(psi);
         Console.WriteLine($"OPEN: {remotePath} -> {local}");

@@ -29,6 +29,20 @@ Copy-Item "$here\client\*" "$InstallDir\client\" -Force -Recurse
 New-Item -Path "HKCU:\Software\ExplorerRemoteFs" -Force | Out-Null
 Set-ItemProperty "HKCU:\Software\ExplorerRemoteFs" -Name CliPath -Value "$InstallDir\cli\ExplorerRemoteFs.Cli.exe" -Type String
 Set-ItemProperty "HKCU:\Software\ExplorerRemoteFs" -Name ClientPath -Value "$InstallDir\client\RemoteFsClient.exe" -Type String
+
+# Register the public ERF address scheme. The handler belongs to the resident
+# client, which turns erf:<site>:/path into a private Shell parsing name.
+$erfProtocol = 'HKCU:\Software\Classes\erf'
+$erfRegistered = 'Registry::HKEY_CLASSES_ROOT\erf'
+$existingErf = (Get-ItemProperty -LiteralPath $erfRegistered -ErrorAction SilentlyContinue).'ERF.HandlerOwner'
+if ((Test-Path -LiteralPath $erfRegistered) -and $existingErf -ne 'ExplorerRemoteFs') {
+    throw 'The ERF address protocol is already owned by another application; installation stopped without overwriting it.'
+}
+New-Item -Path "$erfProtocol\shell\open\command" -Force | Out-Null
+Set-ItemProperty -LiteralPath $erfProtocol -Name '(default)' -Value 'URL: Explorer Remote Files' -Type String
+Set-ItemProperty -LiteralPath $erfProtocol -Name 'URL Protocol' -Value '' -Type String
+Set-ItemProperty -LiteralPath $erfProtocol -Name 'ERF.HandlerOwner' -Value 'ExplorerRemoteFs' -Type String
+Set-ItemProperty -LiteralPath "$erfProtocol\shell\open\command" -Name '(default)' -Value ('"{0}" --open-erf "%1"' -f "$InstallDir\client\RemoteFsClient.exe") -Type String
 # Keep an editable translation template in roaming profile; upgrades never overwrite it.
 $configDir = Join-Path $env:APPDATA 'ExplorerRemoteFs'
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
@@ -132,7 +146,8 @@ New-Item -Path "$hk\RemoteFsFileType\shellex\PropertySheetHandlers\$props" -Forc
 Set-ItemProperty "$hk\RemoteFsFileType\shellex\PropertySheetHandlers\$props" -Name '(default)' -Value $props
 # shell\open verb: native double-click / Enter / top-bar Open on REMOTE FILES.
 # The shell resolves the default verb via IQueryAssociations -> this ProgID; the
-# command receives the FORPARSING name ("<site>:/<path>") as %1.
+# command receives the FORPARSING name (normally "::{CLSID}\<site>:/<path>")
+# as %1; the CLI strips the namespace prefix before resolving the provider.
 $openCmd = '"' + (Join-Path $InstallDir 'cli\ExplorerRemoteFs.Cli.exe') + '" open "%1"'
 New-Item -Path "$hk\RemoteFsFileType\shell\open\command" -Force | Out-Null
 Set-ItemProperty "$hk\RemoteFsFileType\shell\open\command" -Name '(default)' -Value $openCmd

@@ -12,6 +12,8 @@ public sealed class AppSettings
     public string ServiceLanguage { get; set; } = "zh-CN";
     public string MetadataCachePath { get; set; } = DefaultMetadataCachePath;
     public string FileCachePath { get; set; } = DefaultFileCachePath;
+    /// <summary>Executable used for remote Edit/New file. Empty means Notepad.</summary>
+    public string EditorPath { get; set; } = "notepad.exe";
     /// <summary>Explorer folder default view: icons | list | details | tiles | content.</summary>
     public string DefaultViewMode { get; set; } = "details";
     /// <summary>File-size column format: "auto" (Linux -h style) or "kb" (Windows style).</summary>
@@ -32,6 +34,7 @@ public sealed class AppSettings
                 ServiceLanguage = NormalizeLanguage(key?.GetValue("ServiceLanguage") as string),
                 MetadataCachePath = NormalizeDirectory(key?.GetValue("MetadataCachePath") as string, DefaultMetadataCachePath),
                 FileCachePath = NormalizeDirectory(key?.GetValue("FileCachePath") as string, DefaultFileCachePath),
+                EditorPath = NormalizeEditorPath(key?.GetValue("EditorPath") as string),
                 DefaultViewMode = NormalizeViewMode(key?.GetValue("DefaultViewMode") as string),
                 SizeFormat = NormalizeSizeFormat(key?.GetValue("SizeFormat") as string),
             };
@@ -50,6 +53,8 @@ public sealed class AppSettings
         FileCachePath = NormalizeDirectory(FileCachePath, DefaultFileCachePath); Directory.CreateDirectory(FileCachePath);
         key.SetValue("MetadataCachePath", MetadataCachePath, RegistryValueKind.String);
         key.SetValue("FileCachePath", FileCachePath, RegistryValueKind.String);
+        EditorPath = NormalizeEditorPath(EditorPath);
+        key.SetValue("EditorPath", EditorPath, RegistryValueKind.String);
         key.SetValue("DefaultViewMode", NormalizeViewMode(DefaultViewMode), RegistryValueKind.String);
         key.SetValue("SizeFormat", NormalizeSizeFormat(SizeFormat), RegistryValueKind.String);
     }
@@ -58,6 +63,9 @@ public sealed class AppSettings
     {
         try { return string.IsNullOrWhiteSpace(path) ? fallback : Path.GetFullPath(path.Trim()); } catch { return fallback; }
     }
+
+    public static string NormalizeEditorPath(string? path) =>
+        string.IsNullOrWhiteSpace(path) ? "notepad.exe" : path.Trim();
 
     /// <summary>icons | list | details | tiles | content; anything else falls back to details.</summary>
     public static string NormalizeViewMode(string? mode) => (mode ?? "").Trim().ToLowerInvariant() switch
@@ -97,6 +105,7 @@ public static class Ui
             ["ApplicationSettings"] = ("应用设置", "Application settings"), ["WinScpBackend"] = ("WinSCP 后端", "WinSCP backend"),
             ["WinScpPath"] = ("WinSCP.com 路径", "WinSCP.com path"), ["Browse"] = ("浏览...", "Browse..."),
             ["MetadataCachePath"] = ("元数据缓存目录", "Metadata cache directory"), ["FileCachePath"] = ("文件缓存目录", "File cache directory"),
+            ["DefaultEditor"] = ("默认编辑器", "Default editor"),
             ["CacheDirectoryHint"] = ("元数据缓存保存目录列表和属性快照；文件缓存用于打开、编辑及跨站点复制的临时文件。保存后请重新打开 Explorer 窗口。", "Metadata cache stores directory listings and property snapshots; file cache stages Open, Edit, and cross-site copies. Reopen Explorer windows after saving."),
             ["ExplorerLanguage"] = ("Explorer 扩展显示语言", "Explorer extension language"),
             ["ServiceLanguage"] = ("服务程序界面语言", "Service program language"),

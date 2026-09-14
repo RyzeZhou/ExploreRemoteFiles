@@ -134,6 +134,17 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"SFTP mkdir: {path}");
     }
 
+    public void CreateEmptyFile(string path)
+    {
+        EnsureConnected();
+        if (_client is null) return;
+        // CreateNew asks the SFTP server to reject an existing path.  This is
+        // intentionally not UploadFile: a new-file command must never
+        // truncate an existing remote document.
+        using var stream = _client.Open(path, FileMode.CreateNew, FileAccess.Write);
+        Utils.ShellLog.Write($"SFTP touch: {path}");
+    }
+
     // NOTE: SSH.NET has no resume API; SFTP resume would need OpenWrite + Seek
     // against the remote offset (TODO). The flag is accepted for interface
     // compatibility and currently ignored, so SFTP restarts the transfer.
