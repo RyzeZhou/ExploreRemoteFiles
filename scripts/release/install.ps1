@@ -68,10 +68,16 @@ $desktopNs = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\N
 New-Item -Path $desktopNs -Force | Out-Null
 Set-ItemProperty $desktopNs -Name '(default)' -Value 'FTP'
 
-# Hide only this extension's own desktop icon. This value is named by our CLSID;
-# it does not read or modify the separate This PC desktop-icon setting.
+# Hide only this extension's own desktop icon: we write ONE value named by our
+# CLSID. Never `New-Item -Force` on this key -- measured 2026-09-14: before the
+# run the key held {C816CE0E-...} plus Windows' own
+# {20D04FE0-3AEA-1069-A2D8-08002B30309D} = 0 (the "show This PC" flag), and after
+# install.ps1 ran with -Force only our value survived. -Force rebuilds a key that
+# belongs to Windows and destroys every sibling value, i.e. it silently resets the
+# user's desktop icons. Rule: create keys we own freely, but for a key we do NOT
+# own, create it only when absent and then touch only our own value.
 $hideIcons = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel"
-New-Item -Path $hideIcons -Force | Out-Null
+if (-not (Test-Path $hideIcons)) { New-Item -Path $hideIcons | Out-Null }
 Set-ItemProperty $hideIcons -Name $folder -Value 1 -Type DWord
 
 # --- CLSID\folder: the NSE itself ---
