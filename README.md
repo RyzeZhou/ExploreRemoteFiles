@@ -67,8 +67,13 @@ powershell -ExecutionPolicy Bypass -File dist\ExplorerRemoteFs-win-x64\install.p
 
 ## 路线
 
+> **出口条件与版本线以 [docs/MILESTONES.md](docs/MILESTONES.md) 为准**：
+> 真正的 **Alpha** ＝ 递归设置权限 ＋「远程操作队列」 ＋ 在目录右键「打开终端」三件事全部完成；
+> 之后**第一件事就是 Windows 安装程序**（可选安装目录、常驻程序随登录自启动、可干净升级与卸载）。
+
 | 期 | 内容 | 文档 |
 |---|---|---|
+| Alpha 门槛 | 递归权限 + 队列 + 打开终端（含安装包的技术岔路：不用 MSIX、自启动不做成 Session 0 服务） | `docs/MILESTONES.md` |
 | 近期 | 自研进度窗口升格为**「远程操作队列」**（删除 / 递归改权限 / 传输共用一个队列与一组契约），顺带修递归 chmod | `docs/KNOWN_ISSUES_2026-09-14.md` §1 §3 |
 | 近期 | **ERF 协议第一步**：在 SFTP 上解决"多而小文件"传得慢与传不全（并行会话 / `ssh exec` 打包流 + manifest + 校验） | `docs/ERF_PROTOCOL_PLAN.md` |
 | 已评估 | 站点/目录右键「在 Windows 终端中打开」：认证**交给终端里的 ssh**，产品不碰凭据 | `docs/OPEN_IN_TERMINAL_FEASIBILITY.md` |
@@ -91,6 +96,7 @@ powershell -ExecutionPolicy Bypass -File dist\ExplorerRemoteFs-win-x64\install.p
 | 文档 | 内容 |
 |---|---|
 | [PROJECT_IDENTITY.md](docs/PROJECT_IDENTITY.md) | 名称、品牌分层、版本号规范、`erf://` 前缀来源 |
+| [MILESTONES.md](docs/MILESTONES.md) | **Alpha / 0.2 出口条件**：三件事 + Windows 安装程序的技术岔路与清单 |
 | [RELEASE_v0.1-Alpha.md](docs/RELEASE_v0.1-Alpha.md) | 0.1-Alpha 发布说明与验收方法 |
 | [SHELL_NAMESPACE_SPEC.md](docs/SHELL_NAMESPACE_SPEC.md) · [PIVOT_WIN11_STRATEGY.md](docs/PIVOT_WIN11_STRATEGY.md) | Shell 层规格与选型转向 |
 | [UI_THREAD_FREEZE_AND_DATAOBJECT_2026-09-14.md](docs/UI_THREAD_FREEZE_AND_DATAOBJECT_2026-09-14.md) | UI 线程不变量的由来：冻结根因与 5 个被否证假设 |
