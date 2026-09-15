@@ -16,6 +16,7 @@ typedef struct
     WCHAR host[128];
     int   port;              // 0 = protocol default
     WCHAR user[64];
+    WCHAR keyPath[260];      // PrivateKeyPath：让"打开终端"能复用已有密钥认证
     WCHAR startPath[256];
 } FTPSITE;
 
@@ -81,6 +82,7 @@ inline void FtpSitesReload()
             if (!s.type[0]) StringCchCopyW(s.type, 16, L"sftp");
             getStr("Host", s.host, 128);
             getStr("Username", s.user, 64);
+            getStr("PrivateKeyPath", s.keyPath, 260);
             getStr("StartPath", s.startPath, 256);
             if (!s.startPath[0]) StringCchCopyW(s.startPath, 256, L"/");
             {
