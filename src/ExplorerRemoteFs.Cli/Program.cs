@@ -296,9 +296,17 @@ static void CmdChmod(string[] args)
     {
         int mode = Convert.ToInt32(args[3], 8);
         var fs = ProviderFactory.Get(conn);
-        if (recursive) fs.SetPermissionsRecursive(args[2], mode);
-        else fs.SetPermissions(args[2], mode);
-        Console.WriteLine($"CHMOD: {args[2]} = {args[3]}" + (recursive ? " (recursive)" : ""));
+        if (recursive)
+        {
+            var r = fs.SetPermissionsRecursive(args[2], mode);
+            Console.WriteLine($"CHMOD: {args[2]} = {args[3]} (recursive) {r}");
+            ReportChmodFailures(r);
+        }
+        else
+        {
+            fs.SetPermissions(args[2], mode);
+            Console.WriteLine($"CHMOD: {args[2]} = {args[3]}");
+        }
     }
     catch (Exception ex)
     {
@@ -306,6 +314,17 @@ static void CmdChmod(string[] args)
         ProviderFactory.Invalidate(conn.Name);
         Environment.Exit(2);
     }
+}
+
+// 递归 chmod 的失败清单必须可见，且"部分完成"要以非零退出码收场：
+// 调用方（shell 插件 / 队列）靠退出码判断，不能靠解析文本。
+static void ReportChmodFailures(ChmodRecursiveResult r)
+{
+    if (!r.Partial) return;
+    foreach (var f in r.Failures.Take(20)) Console.Error.WriteLine($"  FAIL {f}");
+    if (r.Failures.Count > 20) Console.Error.WriteLine($"  ... and {r.Failures.Count - 20} more");
+    Console.Error.WriteLine($"PARTIAL: {r.Failures.Count} item(s) not changed");
+    Environment.Exit(3);
 }
 
 static void CmdChmodR(string[] args)
@@ -316,8 +335,9 @@ static void CmdChmodR(string[] args)
     {
         int mode = Convert.ToInt32(args[3], 8);
         var fs = ProviderFactory.Get(conn);
-        fs.SetPermissionsRecursive(args[2], mode);
-        Console.WriteLine($"CHMOD-R: {args[2]} = {args[3]}");
+        var r = fs.SetPermissionsRecursive(args[2], mode);
+        Console.WriteLine($"CHMOD-R: {args[2]} = {args[3]} {r}");
+        ReportChmodFailures(r);
     }
     catch (Exception ex)
     {
@@ -436,9 +456,11 @@ static void DownloadTreeTracked(IRemoteFileSystem fs, string server, string remo
     long done = 0;
     bool ok = true;
     string failure = "";
+    var failures = new List<string>();
     foreach (var f in files)
     {
         string localPath = Path.Combine(localDir, f.Rel.Replace('/', Path.DirectorySeparatorChar));
+        string tmp = localPath + ".rfs-part";
         try
         {
             string? parent = Path.GetDirectoryName(localPath);
@@ -446,7 +468,6 @@ static void DownloadTreeTracked(IRemoteFileSystem fs, string server, string remo
             // Write to a temp name and rename when complete: the shell
             // extension starts reading a file as soon as it appears, so it must
             // never observe a half-written one.
-            string tmp = localPath + ".rfs-part";
             try { File.Delete(tmp); } catch { }
             long baseDone = done;
             fs.Download(f.Remote, tmp, (d, _) => JobReporter.Progress(baseDone + d, total, f.Rel));
@@ -457,11 +478,20 @@ static void DownloadTreeTracked(IRemoteFileSystem fs, string server, string remo
         }
         catch (Exception ex)
         {
+            // 不 break：单个文件的失败（权限、瞬时网络、本地磁盘）不该让整棵树半途而废，
+            // 更不该让调用方看到一个"看起来成功"的部分结果。半成品必须清掉，
+            // 否则下次续传会把它当成已有数据。
             ok = false;
-            failure = ex.Message;
+            try { File.Delete(tmp); } catch { }
+            failures.Add($"{f.Rel}: {ex.Message}");
             JobReporter.Note($"getr FAIL {f.Remote}: {ex.Message}");
-            break;
         }
+    }
+    if (failures.Count > 0)
+    {
+        failure = $"{failures.Count}/{files.Count} failed: " + string.Join("; ", failures.Take(5))
+                  + (failures.Count > 5 ? $" (+{failures.Count - 5} more)" : "");
+        JobReporter.Note($"getr PARTIAL: {failure}");
     }
     JobReporter.End(ok, failure);
 }

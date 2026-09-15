@@ -1,6 +1,16 @@
 namespace ExplorerRemoteFs.Providers;
 
 /// <summary>
+/// 递归权限修改的结果。<b>Failed &gt; 0 即"部分完成"，调用方不得报成功</b>
+/// ——同一类错误（部分完成却报成功）在复制摊平上限上已经犯过一次。
+/// </summary>
+public sealed record ChmodRecursiveResult(int Dirs, int Files, IReadOnlyList<string> Failures)
+{
+    public bool Partial => Failures.Count > 0;
+    public override string ToString() => $"dirs={Dirs} files={Files} failed={Failures.Count}";
+}
+
+/// <summary>
 /// 统一文件系统 Provider 接口（探索计划 §4 P2）。
 /// 第一版只实现浏览所需的 List；Rename/Delete/SetMetadata 等随 Prototype 2+ 扩展。
 /// </summary>
@@ -33,8 +43,12 @@ public interface IRemoteFileSystem : IDisposable
     /// <summary>修改远程权限（chmod；mode 为 8 进制数字，如 640）。</summary>
     void SetPermissions(string path, int mode);
 
-    /// <summary>递归修改目录树权限（chmod -R；mode 为 8 进制数字）。</summary>
-    void SetPermissionsRecursive(string path, int mode);
+    /// <summary>
+    /// 递归修改目录树权限（chmod -R；mode 为 8 进制数字）。
+    /// <b>目录与文件都会改</b>；符号链接<b>不跟随</b>（不通过链接改其目标权限）。
+    /// 单个条目失败不中断整棵树，结果里带失败清单。
+    /// </summary>
+    ChmodRecursiveResult SetPermissionsRecursive(string path, int mode);
 
     /// <summary>
     /// 修改所有者/组（chown/chgrp）。user/group 传 null 表示不修改；数字或名字均可（

@@ -212,13 +212,45 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"SFTP chown: {path} user={user} group={group}");
     }
 
-    public void SetPermissionsRecursive(string path, int mode)
+    public ChmodRecursiveResult SetPermissionsRecursive(string path, int mode)
     {
-        SetPermissions(path, mode);
-        foreach (var e in List(path))
+        var failures = new List<string>();
+        int dirs = 0, files = 0;
+
+        // 起点本身也在范围内（chmod -R 的语义包含根目录）。
+        try { SetPermissions(path, mode); dirs++; }
+        catch (Exception ex) { failures.Add($"{path}: {ex.Message}"); }
+
+        ChmodWalk(path, mode, failures, ref dirs, ref files);
+        Utils.ShellLog.Write($"SFTP chmod -R: {path} mode={Convert.ToString(mode, 8)} dirs={dirs} files={files} failed={failures.Count}");
+        return new ChmodRecursiveResult(dirs, files, failures);
+    }
+
+    // 目录与**文件**都要改；符号链接一律跳过（不通过链接去改它目标的权限）。
+    // 单项失败只记录、不抛出：树里一个不可写条目不该让整次递归半途而废，
+    // 更不该让调用方看到一个"成功"的部分结果。
+    private void ChmodWalk(string path, int mode, List<string> failures, ref int dirs, ref int files)
+    {
+        IReadOnlyList<RemoteEntry> entries;
+        try { entries = List(path); }
+        catch (Exception ex) { failures.Add($"{path}: {ex.Message}"); return; }
+
+        foreach (var e in entries)
         {
-            if (e.IsDirectory && !e.IsSymlink)
-                SetPermissionsRecursive(e.Path, mode);
+            if (e.IsSymlink) continue;
+            if (e.IsDirectory)
+            {
+                // 自身改成与否，都必须继续往下走：服务器可能只拒绝目录上的 setstat，
+                // 却允许改文件；若在此 return，整棵子树会被静默跳过并从失败清单里消失。
+                try { SetPermissions(e.Path, mode); dirs++; }
+                catch (Exception ex) { failures.Add($"{e.Path}: {ex.Message}"); }
+                ChmodWalk(e.Path, mode, failures, ref dirs, ref files);
+            }
+            else
+            {
+                try { SetPermissions(e.Path, mode); files++; }
+                catch (Exception ex) { failures.Add($"{e.Path}: {ex.Message}"); }
+            }
         }
     }
 
