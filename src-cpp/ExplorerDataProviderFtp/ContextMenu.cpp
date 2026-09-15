@@ -1479,10 +1479,25 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
     }
 
     // 远端命令：进入目录并启动登录 shell。
-    // $SHELL 由**远端**展开——CreateProcess 不经本地 shell，$ 会原样传下去。
+    //
+    // ⚠⚠ 这段文本是喂给 `wt.exe <整条 commandline>` 的，因此有两条硬约束（都实测过）：
+    //   1. **不能出现分号 `;`** —— Windows Terminal 把 `;` 当作它自己的命令分隔符
+    //      （`wt new-tab ; split-pane` 那种语法），**即使它在引号里也照切**。
+    //      被切下来的碎片会被 WT 当成另一条命令去启动 → 用户看到
+    //      「错误 2147942402 (0x80070002) 启动"…"时 系统找不到指定的文件」。
+    //      所以这里只用 `||` 与 `&&` 组合来表达"cd 失败也要给 shell"。
+    //   2. **不能出现双引号 `"`** —— WT 的参数切分同样不遵守 MSVCRT 的 \" 转义规则。
+    //    需要引号的地方只用单引号；单引号对 Windows 命令行解析没有特殊含义。
+    //
+    // 语义：cd 成功 → 直接 exec 登录 shell；cd 失败 → 先打印告警，再 exec 登录 shell
+    //      （绝不让窗口一闪就关）。$SHELL 由远端展开，用 ${SHELL:=/bin/sh} 兜底默认值，
+    //      这样不必写双引号。
+    PCWSTR dirForCmd = (remoteDir && remoteDir[0]) ? remoteDir : L"/";
     std::wstring remote = L"cd ";
-    AppendPosixSingleQuoted(remote, (remoteDir && remoteDir[0]) ? remoteDir : L"/");
-    remote += L" && exec $SHELL -l";
+    AppendPosixSingleQuoted(remote, dirForCmd);
+    remote += L" || printf '[ERF] cannot enter: %s\\n' ";
+    AppendPosixSingleQuoted(remote, dirForCmd);
+    remote += L" && exec ${SHELL:=/bin/sh} -l";
 
     // 用 System32 的 OpenSSH：本机 PATH 里 Git 的 ssh 排在前面，
     // MSYS 版本的路径转换与 tty 行为不同（见可行性文档红线 2）。
