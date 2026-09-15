@@ -1752,20 +1752,25 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
     }
 }
 
-// 「在此打开终端」子菜单：终端可选（Windows 终端 / PowerShell / VS Code）。
-// 父项是 MF_POPUP，不占用资源 id；三个子项用我们自己的 id（first+13..15）。
-static void InsertTerminalSubmenu(HMENU m, UINT &i, UINT first)
+// 终端偏好由**常驻服务程序的设置**决定（HKCU\Software\ExplorerRemoteFs\Terminal）。
+// 取值：wt / powershell / vscode（大小写不敏感，允许 "windows-terminal"、"pwsh"、"code" 等别名）。
+// 默认 wt；取不到或无法识别时回落到 wt（再由 LaunchTerminalForSite 按可用性降级）。
+static int ReadTerminalPreference()
 {
-    HMENU sub = CreatePopupMenu();
-    if (!sub) return;
-    AppendMenuW(sub, MF_STRING, first + MENU_TERM_WT,
-                ExplorerText(L"menu.terminal_wt", L"Windows 终端", L"Windows Terminal"));
-    AppendMenuW(sub, MF_STRING, first + MENU_TERM_PWSH,
-                ExplorerText(L"menu.terminal_pwsh", L"PowerShell", L"PowerShell"));
-    AppendMenuW(sub, MF_STRING, first + MENU_TERM_VSCODE,
-                ExplorerText(L"menu.terminal_code", L"VS Code", L"VS Code"));
-    InsertMenuW(m, i++, MF_BYPOSITION | MF_POPUP, (UINT_PTR)sub,
-                ExplorerText(L"menu.terminal", L"在此打开终端", L"Open terminal here"));
+    WCHAR val[64] = {};
+    DWORD cb = sizeof(val) - sizeof(WCHAR);
+    DWORD type = 0;
+    HKEY key = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS)
+    {
+        if (RegQueryValueExW(key, L"Terminal", NULL, &type, (LPBYTE)val, &cb) != ERROR_SUCCESS || type != REG_SZ)
+            val[0] = 0;
+        RegCloseKey(key);
+    }
+    if (!val[0]) return TERM_WT;
+    if (0 == StrCmpIW(val, L"powershell") || 0 == StrCmpIW(val, L"pwsh")) return TERM_PWSH;
+    if (0 == StrCmpIW(val, L"vscode") || 0 == StrCmpIW(val, L"code")) return TERM_VSCODE;
+    return TERM_WT;   // "wt" / "windows-terminal" / 其他
 }
 
 class CMenu : public IContextMenu, public IShellExtInit, public IObjectWithSite {
@@ -1789,7 +1794,8 @@ public:
         UINT added = 0;
         FTPSITE rowSite = {};
         if(sel.count == 1 && FindSiteByName(sel.names[0], &rowSite) && SiteIsSshCapable(rowSite.type)){
-            InsertTerminalSubmenu(m, i, first);
+            InsertMenuW(m, i++, MF_BYPOSITION, first+MENU_TERMINAL,
+                        ExplorerText(L"menu.terminal", L"在此打开终端", L"Open terminal here"));
             added = 1;
         }
         return MAKE_HRESULT(SEVERITY_SUCCESS, 0, added);
@@ -1819,7 +1825,8 @@ public:
     {
         FTPSITE termSite = {};
         if(!multi && FindSiteByName(sel.site, &termSite) && SiteIsSshCapable(termSite.type))
-            InsertTerminalSubmenu(m, i, first);
+            InsertMenuW(m, i++, MF_BYPOSITION, first+MENU_TERMINAL,
+                        ExplorerText(L"menu.terminal", L"在此打开终端", L"Open terminal here"));
     }
     int custom=0; CUSTCMD cmds[MAX_CUSTOM]={};
     if(!multi){ custom=LoadCustomCommands(cmds,MAX_CUSTOM); if(custom>0) InsertMenuW(m,i++,MF_BYPOSITION|MF_SEPARATOR,0,NULL);
@@ -1894,9 +1901,7 @@ public:
             DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_PERMBOX),ci->hwnd,PermDlgProc,(LPARAM)&pm);
         else MessageBoxW(ci->hwnd,ExplorerText(L"info.metadata_unavailable",L"元数据不可用。",L"Metadata unavailable."),sel.firstIsFolder?ExplorerText(L"property.directory_properties",L"目录属性",L"Directory properties"):ExplorerText(L"property.file_properties",L"文件属性",L"File properties"),MB_OK|MB_ICONINFORMATION);
         break; }
-    case MENU_TERM_WT:
-    case MENU_TERM_PWSH:
-    case MENU_TERM_VSCODE:
+    case MENU_TERMINAL:
     {
         // 目标目录：站点内 → 当前目录（选中的是文件夹就再进一层）；站点行 → 该站点的 StartPath。
         FTPSITE ts = {};
@@ -1916,7 +1921,8 @@ public:
         }
         if(ts.name[0])
         {
-            int which = (id == MENU_TERM_WT) ? TERM_WT : (id == MENU_TERM_PWSH) ? TERM_PWSH : TERM_VSCODE;
+            // 用哪一个终端由常驻服务程序的设置决定（HKCU\Software\ExplorerRemoteFs\Terminal）。
+            int which = ReadTerminalPreference();
             LaunchTerminalForSite(ci->hwnd, ts, dir, which);
         }
         break;
@@ -1934,9 +1940,6 @@ public:
       case MENU_RCOPY:v=L"remote_copy";break;case MENU_RMOVE:v=L"remote_move";break;case MENU_RENAME:v=L"rename";break;
       case MENU_DELETE:v=L"delete";break;case MENU_PROPERTIES:v=L"properties";break;
       case MENU_TERMINAL:v=L"openterminal";break;
-      case MENU_TERM_WT:v=L"openterminal";break;
-      case MENU_TERM_PWSH:v=L"openterminal";break;
-      case MENU_TERM_VSCODE:v=L"openterminal";break;
       default:return E_NOTIMPL;}
     // Probe (2026-09-12): the shell asks which canonical verbs we support
     // before wiring up command-bar buttons / context items. Logging the query
