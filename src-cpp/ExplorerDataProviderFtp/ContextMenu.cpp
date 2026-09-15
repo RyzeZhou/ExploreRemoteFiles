@@ -28,6 +28,7 @@
 #define MENU_RCOPY 9
 #define MENU_RMOVE 10
 #define MENU_RENAME 11
+#define MENU_TERMINAL 12
 #define MENU_CUSTOM_BASE 100
 
 #define MYOBJID 0x1234
@@ -1401,6 +1402,154 @@ static void BgCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, int idx)
     }
 }
 
+// ---- 「在此打开终端」 ---------------------------------------------------------
+// 形态：wt.exe  "C:\Windows\System32\OpenSSH\ssh.exe" -p <port> <user>@<host> -t "cd '<远端目录>' && exec $SHELL -l"
+// 认证交给终端里的 ssh：密码在终端内交互输入，或走 ssh-agent/默认密钥。
+// 我们的进程**完全不接触凭据**——这是这条路线的最大收益，也绕开了
+// "OpenSSH 不接受命令行密码（密码从 TTY 读）"这个死结。
+// 实测依据见 docs/OPEN_IN_TERMINAL_FEASIBILITY.md：
+//   * `wt new-tab -p <profile> --appendCommandLine …` 在 WT 1.24.11911 上**不生效**；
+//   * `wt <整条 commandline>`（位置参数形式）**生效** → 这里走后者。
+static BOOL SiteIsSshCapable(PCWSTR type)
+{
+    return type && (0 == StrCmpIW(type, L"sftp") || 0 == StrCmpIW(type, L"scp"));
+}
+
+static BOOL FindSiteByName(PCWSTR name, FTPSITE *out)
+{
+    if (!name || !name[0] || !out) return FALSE;
+    FTPSITE sites[64] = {};
+    int n = FtpSitesGet(sites, ARRAYSIZE(sites));
+    for (int k = 0; k < n; k++)
+        if (0 == StrCmpIW(sites[k].name, name)) { *out = sites[k]; return TRUE; }
+    return FALSE;
+}
+
+// POSIX 单引号转义。路径来自服务端目录列表：若含 ' 或 $( ) 而不转义，
+// 就等于允许远端文件系统在用户机器上执行任意命令——这是安全问题，不是格式问题。
+static void AppendPosixSingleQuoted(std::wstring &out, PCWSTR path)
+{
+    out += L'\'';
+    for (PCWSTR p = path; p && *p; ++p)
+    {
+        if (*p == L'\'') out += L"'\\''";      // '  变成  '\''
+        else out += *p;
+    }
+    out += L'\'';
+}
+
+// Windows 命令行层面的参数引号：ssh 收到的 -t 必须恰好是**一个** argv。
+// 规则（CommandLineToArgvW / MSVCRT）：只有紧跟在 " 之前的反斜杠、以及参数末尾的反斜杠
+// 才需要加倍，引号本身写成 \"。天真的"所有反斜杠都加倍"会**改写内容**——
+// 实测 `\sub` 到远端变成 `\\sub`（见 C:\temp\erf-term-escape-test.ps1 的 round-trip 探针）。
+static void AppendWinQuotedArg(std::wstring &out, PCWSTR arg)
+{
+    out += L'"';
+    size_t pendingBackslashes = 0;
+    for (PCWSTR p = arg; p && *p; ++p)
+    {
+        if (*p == L'\\') { pendingBackslashes++; continue; }
+        if (*p == L'"')
+        {
+            out.append(pendingBackslashes * 2 + 1, L'\\');   // 反斜杠加倍 + 转义引号
+            out += L'"';
+        }
+        else
+        {
+            out.append(pendingBackslashes, L'\\');           // 不紧邻引号：原样
+            out += *p;
+        }
+        pendingBackslashes = 0;
+    }
+    out.append(pendingBackslashes * 2, L'\\');               // 结尾反斜杠要加倍，否则会吃掉收尾引号
+    out += L'"';
+}
+
+static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteDir)
+{
+    if (!SiteIsSshCapable(site.type))
+    {
+        // FTP 没有 shell 通道：明确告知，而不是给一个永远失败的菜单项。
+        MessageBoxW(hwnd,
+            ExplorerText(L"error.terminal_needs_ssh",
+                         L"该站点不是 SSH 类型（SFTP），FTP 没有 shell 通道，无法打开终端。",
+                         L"This site is not SSH-based (SFTP). FTP has no shell channel, so no terminal can be opened."),
+            ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // 远端命令：进入目录并启动登录 shell。
+    // $SHELL 由**远端**展开——CreateProcess 不经本地 shell，$ 会原样传下去。
+    std::wstring remote = L"cd ";
+    AppendPosixSingleQuoted(remote, (remoteDir && remoteDir[0]) ? remoteDir : L"/");
+    remote += L" && exec $SHELL -l";
+
+    // 用 System32 的 OpenSSH：本机 PATH 里 Git 的 ssh 排在前面，
+    // MSYS 版本的路径转换与 tty 行为不同（见可行性文档红线 2）。
+    WCHAR sshExe[MAX_PATH] = L"C:\\Windows\\System32\\OpenSSH\\ssh.exe";
+    if (GetFileAttributesW(sshExe) == INVALID_FILE_ATTRIBUTES)
+        StringCchCopyW(sshExe, ARRAYSIZE(sshExe), L"ssh.exe");
+
+    WCHAR portText[16] = {};
+    StringCchPrintfW(portText, ARRAYSIZE(portText), L"%d", site.port ? site.port : 22);
+
+    std::wstring cmd;
+    cmd += L'"';
+    cmd += sshExe;
+    cmd += L"\" -p ";
+    cmd += portText;
+    cmd += L' ';
+    cmd += site.user;
+    cmd += L'@';
+    cmd += site.host;
+    cmd += L" -t ";
+    AppendWinQuotedArg(cmd, remote.c_str());
+
+    // 优先 Windows Terminal（Store 版的 app-exec 别名）；找不到就退回直接起 ssh（自带控制台）。
+    WCHAR appData[MAX_PATH] = {};
+    std::wstring wtPath;
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", appData, ARRAYSIZE(appData)))
+    {
+        wtPath = std::wstring(appData) + L"\\Microsoft\\WindowsApps\\wt.exe";
+        if (GetFileAttributesW(wtPath.c_str()) == INVALID_FILE_ATTRIBUTES) wtPath.clear();
+    }
+
+    std::wstring full;
+    DWORD flags = 0;
+    if (!wtPath.empty())
+    {
+        full = L'"'; full += wtPath; full += L"\" "; full += cmd;
+    }
+    else
+    {
+        full = cmd;                       // 直接起 ssh：给它自己的控制台
+        flags = CREATE_NEW_CONSOLE;
+    }
+
+    // 把最终命令行写进探针日志：引号/转义出问题时，这一行就是唯一证据。
+    ProbeLog(L"[TERM] launch site='%s' type='%s' dir='%s' cmd=%s",
+             site.name, site.type, (remoteDir && remoteDir[0]) ? remoteDir : L"/", full.c_str());
+
+    std::vector<WCHAR> buf(full.begin(), full.end());
+    buf.push_back(0);
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(NULL, buf.data(), NULL, NULL, FALSE, flags, NULL, NULL, &si, &pi))
+    {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    else
+    {
+        ProbeLog(L"[TERM] CreateProcess failed err=%lu", GetLastError());
+        MessageBoxW(hwnd,
+            ExplorerText(L"error.terminal_failed",
+                         L"无法启动终端（未找到 wt.exe 或 ssh.exe）。",
+                         L"Could not start the terminal (wt.exe or ssh.exe not found)."),
+            ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+    }
+}
+
 class CMenu : public IContextMenu, public IShellExtInit, public IObjectWithSite {
 public:
  CMenu():ref(1),data(NULL),site(NULL),m_pidlFolder(NULL){DllAddRef();}
@@ -1416,7 +1565,18 @@ public:
     // Site-picker items (no site segment in the folder PIDL) get the system
     // default menu (Open/Pin/Rename/Delete/Properties) only — our WinSCP-style
     // commands operate on remote files, not on saved connections.
-    if(!sel.site[0]) return MAKE_HRESULT(SEVERITY_SUCCESS,0,0);
+    if(!sel.site[0]){
+        // 站点行（站点选择器里的一行）：只加一个「在此打开终端」，落到该站点配置的 StartPath。
+        // 其余仍交给系统默认菜单——我们的文件级动词对"保存的连接"本身没有意义。
+        UINT added = 0;
+        FTPSITE rowSite = {};
+        if(sel.count == 1 && FindSiteByName(sel.names[0], &rowSite) && SiteIsSshCapable(rowSite.type)){
+            InsertMenuW(m, i++, MF_BYPOSITION, first+MENU_TERMINAL,
+                        ExplorerText(L"menu.terminal", L"在此打开终端", L"Open terminal here"));
+            added = 1;
+        }
+        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, added);
+    }
     BOOL multi = sel.count>1;
     // Explorer itself owns opening folders.  Advertising our file Open verb for
     // a folder can make the first double-click invoke it instead of navigation.
@@ -1438,12 +1598,19 @@ public:
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_RMOVE,multi?ExplorerText(L"menu.move_all",L"移动到...（全部）",L"Move to... (all)"):ExplorerText(L"menu.move",L"移动到...",L"Move to..."));
     InsertMenuW(m,i++,MF_BYPOSITION|(multi?MF_GRAYED:0),first+MENU_RENAME,ExplorerText(L"menu.rename",L"重命名",L"Rename"));
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_DELETE,ExplorerText(L"menu.delete",L"从服务器删除",L"Delete from server"));
+    // 在此打开终端：只对 SSH 类站点出现（FTP 没有 shell 通道），且单选时目录才明确。
+    {
+        FTPSITE termSite = {};
+        if(!multi && FindSiteByName(sel.site, &termSite) && SiteIsSshCapable(termSite.type))
+            InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_TERMINAL,
+                        ExplorerText(L"menu.terminal",L"在此打开终端",L"Open terminal here"));
+    }
     int custom=0; CUSTCMD cmds[MAX_CUSTOM]={};
     if(!multi){ custom=LoadCustomCommands(cmds,MAX_CUSTOM); if(custom>0) InsertMenuW(m,i++,MF_BYPOSITION|MF_SEPARATOR,0,NULL);
         for(int k=0;k<custom;k++) InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_CUSTOM_BASE+k,cmds[k].name); }
     InsertMenuW(m,i++,MF_BYPOSITION|MF_SEPARATOR,0,NULL);
     InsertMenuW(m,i++,MF_BYPOSITION,first+MENU_PROPERTIES,multi?ExplorerText(L"menu.properties_first",L"属性（第一个）",L"Properties (first)"):ExplorerText(L"menu.properties",L"属性",L"Properties"));
-    return MAKE_HRESULT(SEVERITY_SUCCESS,0,12+custom);
+    return MAKE_HRESULT(SEVERITY_SUCCESS,0,13+custom);
  }
  HRESULT InvokeCommand(LPCMINVOKECOMMANDINFO ci){
     UINT id=IS_INTRESOURCE(ci->lpVerb)?LOWORD((UINT_PTR)ci->lpVerb):99;
@@ -1511,6 +1678,27 @@ public:
             DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_PERMBOX),ci->hwnd,PermDlgProc,(LPARAM)&pm);
         else MessageBoxW(ci->hwnd,ExplorerText(L"info.metadata_unavailable",L"元数据不可用。",L"Metadata unavailable."),sel.firstIsFolder?ExplorerText(L"property.directory_properties",L"目录属性",L"Directory properties"):ExplorerText(L"property.file_properties",L"文件属性",L"File properties"),MB_OK|MB_ICONINFORMATION);
         break; }
+    case MENU_TERMINAL:
+    {
+        // 目标目录：站点内 → 当前目录（选中的是文件夹就再进一层）；站点行 → 该站点的 StartPath。
+        FTPSITE ts = {};
+        WCHAR dir[512] = {};
+        if(sel.site[0]){
+            if(FindSiteByName(sel.site, &ts)){
+                StringCchCopyW(dir, ARRAYSIZE(dir), sel.folder);
+                if(sel.count == 1 && sel.firstIsFolder && sel.names[0][0]){
+                    size_t len = wcslen(dir);
+                    if(len && dir[len - 1] != L'/') StringCchCatW(dir, ARRAYSIZE(dir), L"/");
+                    StringCchCatW(dir, ARRAYSIZE(dir), sel.names[0]);
+                }
+            }
+        }
+        else if(sel.count == 1 && FindSiteByName(sel.names[0], &ts)){
+            StringCchCopyW(dir, ARRAYSIZE(dir), ts.startPath);
+        }
+        if(ts.name[0]) LaunchTerminalForSite(ci->hwnd, ts, dir);
+        break;
+    }
     default: if(sel.notify)CoTaskMemFree(sel.notify); return E_INVALIDARG;
     }
     if(sel.notify) CoTaskMemFree(sel.notify);
@@ -1522,7 +1710,8 @@ public:
       case MENU_COPY_CLIP:v=L"copy_to_clipboard";break;case MENU_COPY_NAME:v=L"copy_file_name";break;
       case MENU_COPY_NATIVE:v=L"copy_remote_path";break;case MENU_COPY_FULL:v=L"copyaspath";break;
       case MENU_RCOPY:v=L"remote_copy";break;case MENU_RMOVE:v=L"remote_move";break;case MENU_RENAME:v=L"rename";break;
-      case MENU_DELETE:v=L"delete";break;case MENU_PROPERTIES:v=L"properties";break;default:return E_NOTIMPL;}
+      case MENU_DELETE:v=L"delete";break;case MENU_PROPERTIES:v=L"properties";break;
+      case MENU_TERMINAL:v=L"openterminal";break;default:return E_NOTIMPL;}
     // Probe (2026-09-12): the shell asks which canonical verbs we support
     // before wiring up command-bar buttons / context items. Logging the query
     // shows which host commands are actually offered to a namespace extension.
