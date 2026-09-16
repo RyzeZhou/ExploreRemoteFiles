@@ -51,5 +51,5 @@ if ($outDir) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
 $implib = [IO.Path]::ChangeExtension($OutputPath, '.lib')
 $pdb = [IO.Path]::ChangeExtension($OutputPath, '.pdb')
 # gdi32: SetBkMode/GetSysColorBrush —— 属性页只读值框要画成静态文本的观感。
-link.exe /nologo /DLL /OUT:"$OutputPath" /IMPLIB:"$implib" /PDB:"$pdb" /DEF:ExplorerDataProvider.def /MACHINE:X64 $objs ExplorerDataProvider.res propsys.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib uuid.lib comctl32.lib comdlg32.lib
+link.exe /nologo /DLL /OUT:"$OutputPath" /IMPLIB:"$implib" /PDB:"$pdb" /DEF:ExplorerDataProvider.def /MACHINE:X64 $objs ExplorerDataProvider.res propsys.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib uuid.lib comctl32.lib comdlg32.lib uxtheme.lib
 exit $LASTEXITCODE

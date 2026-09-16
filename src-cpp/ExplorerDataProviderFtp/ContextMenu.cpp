@@ -9,6 +9,7 @@
 #include <string>
 #include <time.h>
 #include <shellapi.h>
+#include <uxtheme.h>   // SetWindowTheme：属性页只读值框要关掉视觉样式
 #include "FtpMeta.h"
 #include "FtpSites.h"
 #include "VscodeBridge.h"
@@ -506,10 +507,71 @@ static BOOL SiteCanSetOwner(PCWSTR site)
 
 static void PermSetOwnerChangeVisible(HWND hDlg, BOOL visible)
 {
-    // 3042 是"可填名称或 ID"的说明行：FTP 站点没有 chown 通道，
-    // 输入框和说明必须一起隐藏，否则等于承诺一个做不到的操作。
-    const int controls[] = { 3024, 3025, 3026, 3027, 3042 };
+    const int controls[] = { 3024, 3025, 3026, 3027 };
     for (int id : controls) ShowWindow(GetDlgItem(hDlg, id), visible ? SW_SHOW : SW_HIDE);
+}
+
+// 值框（3001~3007）去掉 WS_BORDER：只画底色还不够 —— 用户看到"输入框样式"
+// 的根源是那个 1px 边框。去掉边框后它看起来就是普通文本，
+// 但仍然是只读 EDIT，所以**可以拖动选中、Ctrl+C 复制**（这是保留 EDIT 的原因）。
+static void PermMakeValueFieldsFlat(HWND hDlg)
+{
+    for (int id = 3001; id <= 3007; ++id)
+    {
+        HWND ctl = GetDlgItem(hDlg, id);
+        if (!ctl) continue;
+        LONG_PTR style = GetWindowLongPtrW(ctl, GWL_STYLE);
+        if (style & WS_BORDER)
+        {
+            SetWindowLongPtrW(ctl, GWL_STYLE, style & ~WS_BORDER);
+            SetWindowPos(ctl, NULL, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        }
+        // 关掉视觉样式：主题化的 EDIT 走 uxtheme 的 EP_EDITTEXT 绘制，那一版自带边框，
+        // 光把样式位去掉在某些主题下仍会画出框（模板里也已声明 NOT WS_BORDER，两道保险）。
+        SetWindowTheme(ctl, L"", L"");
+    }
+}
+
+// 值框虽然只读，却是第一个可停靠控件：对话框一打开，焦点落在「名称」上，
+// 而 EDIT 拿到焦点会**全选**文本 —— 用户看到的是一个蓝底高亮的名字，
+// 像是"刚被选中准备改写"。这里把选择收起来（光标归 0），并把焦点交给对话框本身
+// （不留高亮、也不让空格键误触某个勾选框），字段照样可点可复制。
+static void PermClearValueSelection(HWND hDlg)
+{
+    for (int id = 3001; id <= 3007; ++id)
+        SendDlgItemMessageW(hDlg, id, EM_SETSEL, 0, 0);
+    SetFocus(hDlg);
+}
+
+// "所有者/组可填名称或数字 ID"这条提示从对话框正文里撤掉了（正文留白给信息行），
+// 改成输入框上的 tooltip：鼠标停上去才出现，信息没丢、版面干净。
+static void PermAttachInputTooltip(HWND hDlg)
+{
+    static std::wstring hint;      // tooltip 保存的是指针，必须由我们持有生命周期
+    hint = ExplorerText(L"property.owner_input_hint",
+                        L"可填名称或数字 ID（例：zhou 或 1000）；保留「名称 [ID]」原样即不修改。",
+                        L"Accept a name or a numeric ID (e.g. zhou or 1000); keep \"name [ID]\" unchanged to skip.");
+
+    HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+                               WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                               hDlg, NULL, g_hInst, NULL);
+    if (!tip) return;
+    SetWindowPos(tip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    const int ids[] = { 3024, 3025 };
+    for (int id : ids)
+    {
+        HWND ctl = GetDlgItem(hDlg, id);
+        if (!ctl) continue;
+        TOOLINFOW ti = {};
+        ti.cbSize = sizeof(ti);
+        ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        ti.hwnd = hDlg;
+        ti.uId = (UINT_PTR)ctl;
+        ti.lpszText = const_cast<PWSTR>(hint.c_str());
+        SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    }
 }
 
 // 只读值框的观感：值要**可选中复制**（所以不能改成静态文本），
@@ -704,9 +766,7 @@ static void LocalizePermissionDialog(HWND hDlg)
     SetDlgItemTextW(hDlg, IDC_PROP_MODIFIED, ExplorerText(L"property.modified", L"修改日期：", L"Modified:"));
     SetDlgItemTextW(hDlg, 3026, ExplorerText(L"property.new_owner", L"新所有者：", L"New owner:"));
     SetDlgItemTextW(hDlg, 3027, ExplorerText(L"property.new_group", L"新组：", L"New group:"));
-    SetDlgItemTextW(hDlg, 3042, ExplorerText(L"property.owner_input_hint",
-        L"所有者/组可填名称或数字 ID（例：zhou 或 1000），也可保留「名称 [ID]」原样不改。",
-        L"Owner/group accept a name or a numeric ID (e.g. zhou or 1000); keep the current \"name [ID]\" to leave it unchanged."));
+    // 输入格式提示不写在正文里（用户要求去掉那一行），改挂 tooltip：见 PermAttachInputTooltip。
     SetDlgItemTextW(hDlg, IDC_PROP_PERMISSION_GROUP, ExplorerText(L"label.permissions", L"权限", L"Permissions"));
     SetDlgItemTextW(hDlg, IDC_PROP_OWNER_ROLE, ExplorerText(L"label.owner", L"所有者", L"Owner"));
     SetDlgItemTextW(hDlg, IDC_PROP_GROUP_ROLE, ExplorerText(L"label.group", L"组", L"Group"));
@@ -743,6 +803,9 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
         SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
         PermInitOwnerGroup(hDlg,m);
         PermSetOwnerChangeVisible(hDlg, pm->canSetOwner);
+        PermMakeValueFieldsFlat(hDlg);
+        if (pm->canSetOwner) PermAttachInputTooltip(hDlg);
+        PermClearValueSelection(hDlg);
         PermSetChecks(hDlg,m->bits);
         PermSyncChecksToOctal(hDlg);
         EnableWindow(GetDlgItem(hDlg,3023), m->fIsFolder ? TRUE : FALSE);
@@ -2591,6 +2654,9 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
         PermInitOwnerGroup(hDlg,m);
         PermSetOwnerChangeVisible(hDlg, pm->canSetOwner);
+        PermMakeValueFieldsFlat(hDlg);
+        if (pm->canSetOwner) PermAttachInputTooltip(hDlg);
+        PermClearValueSelection(hDlg);
         PermSetChecks(hDlg,m->bits);
         PermSyncChecksToOctal(hDlg);
         EnableWindow(GetDlgItem(hDlg,3023), m->fIsFolder ? TRUE : FALSE);

@@ -70,93 +70,93 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 118, 38, 48, 14
 END
 
-IDD_PERMBOX DIALOGEX 0, 0, 240, 262
+IDD_PERMBOX DIALOGEX 0, 0, 240, 250
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Remote Permissions"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Name:", 3030, 12, 11, 44, 10
-    EDITTEXT        3001, 60, 11, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Type:", 3031, 12, 25, 44, 10
-    EDITTEXT        3002, 60, 25, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Permissions:", 3032, 12, 39, 60, 10
-    EDITTEXT        3003, 80, 39, 150, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Owner:", 3033, 12, 53, 44, 10
-    EDITTEXT        3004, 60, 53, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Group:", 3034, 12, 67, 44, 10
-    EDITTEXT        3005, 60, 67, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Size:", 3035, 12, 81, 44, 10
-    EDITTEXT        3006, 60, 81, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Modified:", 3036, 12, 95, 48, 10
-    EDITTEXT        3007, 64, 95, 166, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "New owner:", 3026, 12, 110, 72, 10
-    EDITTEXT        3024, 88, 109, 142, 12, ES_AUTOHSCROLL
-    LTEXT           "New group:", 3027, 12, 124, 72, 10
-    EDITTEXT        3025, 88, 123, 142, 12, ES_AUTOHSCROLL
-    GROUPBOX        "Permissions", 3037, 12, 139, 218, 52
-    LTEXT           "Owner", 3038, 22, 151, 40, 10
-    AUTOCHECKBOX    "Read", 3011, 72, 151, 42, 10
-    AUTOCHECKBOX    "Write", 3012, 118, 151, 42, 10
-    AUTOCHECKBOX    "Exec", 3013, 164, 151, 42, 10
-    LTEXT           "Group", 3039, 22, 165, 40, 10
-    AUTOCHECKBOX    "Read", 3014, 72, 165, 42, 10
-    AUTOCHECKBOX    "Write", 3015, 118, 165, 42, 10
-    AUTOCHECKBOX    "Exec", 3016, 164, 165, 42, 10
-    LTEXT           "Others", 3040, 22, 179, 40, 10
-    AUTOCHECKBOX    "Read", 3017, 72, 179, 42, 10
-    AUTOCHECKBOX    "Write", 3018, 118, 179, 42, 10
-    AUTOCHECKBOX    "Exec", 3019, 164, 179, 42, 10
-    LTEXT           "Octal:", 3041, 12, 200, 36, 10
-    EDITTEXT        3022, 52, 198, 44, 13, ES_AUTOHSCROLL
-    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 199, 122, 10
-    LTEXT           "", 3042, 12, 215, 218, 10
-    DEFPUSHBUTTON   "OK", IDOK, 82, 238, 56, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 146, 238, 56, 14
+    LTEXT           "Name:", 3030, 12, 6, 72, 10
+    EDITTEXT        3001, 88, 6, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Type:", 3031, 12, 20, 72, 10
+    EDITTEXT        3002, 88, 20, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Permissions:", 3032, 12, 34, 72, 10
+    EDITTEXT        3003, 88, 34, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Owner:", 3033, 12, 48, 72, 10
+    EDITTEXT        3004, 88, 48, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Group:", 3034, 12, 62, 72, 10
+    EDITTEXT        3005, 88, 62, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Size:", 3035, 12, 76, 72, 10
+    EDITTEXT        3006, 88, 76, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Modified:", 3036, 12, 90, 72, 10
+    EDITTEXT        3007, 88, 90, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "", 3043, 12, 106, 218, 1, SS_ETCHEDHORZ
+    LTEXT           "New owner:", 3026, 12, 114, 72, 10
+    EDITTEXT        3024, 88, 113, 142, 12, ES_AUTOHSCROLL
+    LTEXT           "New group:", 3027, 12, 128, 72, 10
+    EDITTEXT        3025, 88, 127, 142, 12, ES_AUTOHSCROLL
+    GROUPBOX        "Permissions", 3037, 12, 143, 218, 52
+    LTEXT           "Owner", 3038, 22, 155, 40, 10
+    AUTOCHECKBOX    "Read", 3011, 72, 155, 42, 10
+    AUTOCHECKBOX    "Write", 3012, 118, 155, 42, 10
+    AUTOCHECKBOX    "Exec", 3013, 164, 155, 42, 10
+    LTEXT           "Group", 3039, 22, 169, 40, 10
+    AUTOCHECKBOX    "Read", 3014, 72, 169, 42, 10
+    AUTOCHECKBOX    "Write", 3015, 118, 169, 42, 10
+    AUTOCHECKBOX    "Exec", 3016, 164, 169, 42, 10
+    LTEXT           "Others", 3040, 22, 183, 40, 10
+    AUTOCHECKBOX    "Read", 3017, 72, 183, 42, 10
+    AUTOCHECKBOX    "Write", 3018, 118, 183, 42, 10
+    AUTOCHECKBOX    "Exec", 3019, 164, 183, 42, 10
+    LTEXT           "Octal:", 3041, 12, 204, 36, 10
+    EDITTEXT        3022, 52, 202, 44, 13, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 203, 122, 10
+    DEFPUSHBUTTON   "OK", IDOK, 82, 226, 56, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 146, 226, 56, 14
 END
 
 // Property-sheet version of the permissions page (no buttons; the standard
 // Properties dialog provides OK/Cancel). Standard property-page template
 // style: DS_FIXEDSYS | WS_CHILD | WS_DISABLED.
-IDD_PERMPAGE DIALOGEX 0, 0, 240, 236
+IDD_PERMPAGE DIALOGEX 0, 0, 240, 224
 STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD | WS_DISABLED | WS_CAPTION
 CAPTION "Permissions"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Name:", 3030, 12, 11, 44, 10
-    EDITTEXT        3001, 60, 11, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Type:", 3031, 12, 25, 44, 10
-    EDITTEXT        3002, 60, 25, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Permissions:", 3032, 12, 39, 60, 10
-    EDITTEXT        3003, 80, 39, 150, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Owner:", 3033, 12, 53, 44, 10
-    EDITTEXT        3004, 60, 53, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Group:", 3034, 12, 67, 44, 10
-    EDITTEXT        3005, 60, 67, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Size:", 3035, 12, 81, 44, 10
-    EDITTEXT        3006, 60, 81, 170, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "Modified:", 3036, 12, 95, 48, 10
-    EDITTEXT        3007, 64, 95, 166, 12, ES_AUTOHSCROLL | ES_READONLY
-    LTEXT           "New owner:", 3026, 12, 110, 72, 10
-    EDITTEXT        3024, 88, 109, 142, 12, ES_AUTOHSCROLL
-    LTEXT           "New group:", 3027, 12, 124, 72, 10
-    EDITTEXT        3025, 88, 123, 142, 12, ES_AUTOHSCROLL
-    GROUPBOX        "Permissions", 3037, 12, 139, 218, 52
-    LTEXT           "Owner", 3038, 22, 151, 40, 10
-    AUTOCHECKBOX    "Read", 3011, 72, 151, 42, 10
-    AUTOCHECKBOX    "Write", 3012, 118, 151, 42, 10
-    AUTOCHECKBOX    "Exec", 3013, 164, 151, 42, 10
-    LTEXT           "Group", 3039, 22, 165, 40, 10
-    AUTOCHECKBOX    "Read", 3014, 72, 165, 42, 10
-    AUTOCHECKBOX    "Write", 3015, 118, 165, 42, 10
-    AUTOCHECKBOX    "Exec", 3016, 164, 165, 42, 10
-    LTEXT           "Others", 3040, 22, 179, 40, 10
-    AUTOCHECKBOX    "Read", 3017, 72, 179, 42, 10
-    AUTOCHECKBOX    "Write", 3018, 118, 179, 42, 10
-    AUTOCHECKBOX    "Exec", 3019, 164, 179, 42, 10
-    LTEXT           "Octal:", 3041, 12, 200, 36, 10
-    EDITTEXT        3022, 52, 198, 44, 13, ES_AUTOHSCROLL
-    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 199, 122, 10
-    LTEXT           "", 3042, 12, 215, 218, 20
+    LTEXT           "Name:", 3030, 12, 6, 72, 10
+    EDITTEXT        3001, 88, 6, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Type:", 3031, 12, 20, 72, 10
+    EDITTEXT        3002, 88, 20, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Permissions:", 3032, 12, 34, 72, 10
+    EDITTEXT        3003, 88, 34, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Owner:", 3033, 12, 48, 72, 10
+    EDITTEXT        3004, 88, 48, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Group:", 3034, 12, 62, 72, 10
+    EDITTEXT        3005, 88, 62, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Size:", 3035, 12, 76, 72, 10
+    EDITTEXT        3006, 88, 76, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "Modified:", 3036, 12, 90, 72, 10
+    EDITTEXT        3007, 88, 90, 142, 12, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER
+    LTEXT           "", 3043, 12, 106, 218, 1, SS_ETCHEDHORZ
+    LTEXT           "New owner:", 3026, 12, 114, 72, 10
+    EDITTEXT        3024, 88, 113, 142, 12, ES_AUTOHSCROLL
+    LTEXT           "New group:", 3027, 12, 128, 72, 10
+    EDITTEXT        3025, 88, 127, 142, 12, ES_AUTOHSCROLL
+    GROUPBOX        "Permissions", 3037, 12, 143, 218, 52
+    LTEXT           "Owner", 3038, 22, 155, 40, 10
+    AUTOCHECKBOX    "Read", 3011, 72, 155, 42, 10
+    AUTOCHECKBOX    "Write", 3012, 118, 155, 42, 10
+    AUTOCHECKBOX    "Exec", 3013, 164, 155, 42, 10
+    LTEXT           "Group", 3039, 22, 169, 40, 10
+    AUTOCHECKBOX    "Read", 3014, 72, 169, 42, 10
+    AUTOCHECKBOX    "Write", 3015, 118, 169, 42, 10
+    AUTOCHECKBOX    "Exec", 3016, 164, 169, 42, 10
+    LTEXT           "Others", 3040, 22, 183, 40, 10
+    AUTOCHECKBOX    "Read", 3017, 72, 183, 42, 10
+    AUTOCHECKBOX    "Write", 3018, 118, 183, 42, 10
+    AUTOCHECKBOX    "Exec", 3019, 164, 183, 42, 10
+    LTEXT           "Octal:", 3041, 12, 204, 36, 10
+    EDITTEXT        3022, 52, 202, 44, 13, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Recursive (subdirs)", 3023, 108, 203, 122, 10
 END
 
 // Read-only connection info page for a saved site (site-picker level 0).
