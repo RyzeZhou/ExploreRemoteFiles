@@ -44,18 +44,8 @@ public sealed class RemoteEntry
 
     public string ModifiedDisplay => LastWriteTime?.ToString("yyyy-MM-dd HH:mm") ?? "";
 
-    public static string FormatSize(long bytes)
-    {
-        if (bytes < 1024) return $"{bytes} B";
-        string[] units = { "KB", "MB", "GB", "TB" };
-        double v = bytes;
-        var unit = "B";
-        foreach (var u in units)
-        {
-            v /= 1024;
-            unit = u;
-            if (v < 1024) break;
-        }
-        return $"{v:0.#} {unit}";
-    }
+    /// 大小显示口径（1024/1000、KB/kB/KiB）在 Utils.SizeFormat 里统一实现，
+    /// 与扩展 DLL 的 SizeFormat.h 用同一个注册表设置，避免两边各写一套。
+    public static string FormatSize(long bytes, Utils.SizeFormatMode? mode = null)
+        => Utils.SizeFormat.Format(bytes, mode ?? Utils.SizeFormat.CurrentMode);
 }

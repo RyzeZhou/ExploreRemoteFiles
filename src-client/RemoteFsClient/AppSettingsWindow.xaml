@@ -36,7 +36,7 @@
         </ComboBox>
         <TextBlock x:Name="SizeFormatLabel" Grid.Row="7" VerticalAlignment="Center" Margin="0,14,0,0"/>
         <ComboBox x:Name="SizeFormatBox" Grid.Row="7" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,14,0,0" SelectedValuePath="Tag">
-            <ComboBoxItem Tag="auto"/><ComboBoxItem Tag="kb"/>
+            <ComboBoxItem Tag="auto"/><ComboBoxItem Tag="kb"/><ComboBoxItem Tag="si"/><ComboBoxItem Tag="iec"/>
         </ComboBox>
         <TextBlock x:Name="TerminalLabel" Grid.Row="8" VerticalAlignment="Center" Margin="0,14,0,0"/>
         <ComboBox x:Name="TerminalBox" Grid.Row="8" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,14,0,0" SelectedValuePath="Tag">

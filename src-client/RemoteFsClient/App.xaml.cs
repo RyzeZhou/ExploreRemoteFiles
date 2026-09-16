@@ -65,6 +65,13 @@ public partial class App : System.Windows.Application
         // 图标生成器：导出静态 .ico（默认全绿，供资源管理器 / 将来的安装程序用）
         // 与 3×3 状态对照图，让图标设计可复现、可复核。
         // 用法：RemoteFsClient.exe --make-icon <输出目录>
+        // 大小口径自检：与 C++ 的 sizeformat-test 用**同一张期望表**，两边实现必须逐字一致。
+        if (e.Args.Any(a => string.Equals(a, "--size-selftest", StringComparison.OrdinalIgnoreCase)))
+        {
+            Shutdown(SizeSelfTest.Run());
+            return;
+        }
+
         int iconArg = Array.FindIndex(e.Args, a => string.Equals(a, "--make-icon", StringComparison.OrdinalIgnoreCase));
         if (iconArg >= 0)
         {

@@ -140,14 +140,9 @@ public sealed class TransferTask : INotifyPropertyChanged
         Raise(nameof(CurrentFileText));
     }
 
+    /// <summary>传输大小/速度的显示同样走统一口径（与列、属性页、CLI 一致）。</summary>
     internal static string Format(long bytes)
-    {
-        string[] unit = { "B", "KB", "MB", "GB", "TB" };
-        double value = bytes;
-        int i = 0;
-        while (value >= 1024 && i < unit.Length - 1) { value /= 1024; i++; }
-        return i == 0 ? $"{value:0} {unit[i]}" : $"{value:0.0} {unit[i]}";
-    }
+        => ExplorerRemoteFs.Utils.SizeFormat.Format(bytes, AppSettings.CurrentSizeMode);
 }
 
 /// <summary>

@@ -86,9 +86,20 @@ public sealed class AppSettings
         _ => "details",
     };
 
-    /// <summary>auto = human readable (1.2 MB); kb = Windows Explorer style (1234 KB).</summary>
-    public static string NormalizeSizeFormat(string? format) =>
-        string.Equals((format ?? "").Trim(), "kb", StringComparison.OrdinalIgnoreCase) ? "kb" : "auto";
+    /// <summary>大小口径：auto = 1024 进制 + KB/MB（Windows 口径，默认）；kb = 整 KB；
+    /// si = 1000 进制 + kB/MB（Nautilus、<c>ls --si</c>）；iec = 1024 + KiB/MiB（严格 IEC）。
+    /// 规则与扩展 DLL 的 <c>SizeFormat.h</c> 一致 —— 两边共用同一个注册表值。</summary>
+    public static string NormalizeSizeFormat(string? format) => (format ?? "").Trim().ToLowerInvariant() switch
+    {
+        "kb" => "kb",
+        "si" => "si",
+        "iec" => "iec",
+        _ => "auto",
+    };
+
+    /// <summary>当前口径（给传输队列等显示用）。</summary>
+    public static ExplorerRemoteFs.Utils.SizeFormatMode CurrentSizeMode =>
+        ExplorerRemoteFs.Utils.SizeFormat.Parse(Load().SizeFormat);
 
     /// <summary>wt (Windows Terminal) | powershell (console) | vscode (Remote-SSH).</summary>
     public static string NormalizeTerminal(string? value) => (value ?? "").Trim().ToLowerInvariant() switch

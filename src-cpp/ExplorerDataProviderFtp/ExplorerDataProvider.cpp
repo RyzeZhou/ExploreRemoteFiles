@@ -21,6 +21,7 @@
 #include "FtpMeta.h"
 #include "FtpSites.h"
 #include "ColumnModel.h"
+#include "SizeFormat.h"
 
 #include "resource.h"
 #include "Utils.h"
@@ -487,53 +488,12 @@ static void FormatMode(DWORD mode, BOOL folder, BOOL symlink, PWSTR out, UINT cc
         (mode & 0040) ? L'r' : L'-', (mode & 0020) ? L'w' : L'-', (mode & 0010) ? L'x' : L'-',
         (mode & 0004) ? L'r' : L'-', (mode & 0002) ? L'w' : L'-', (mode & 0001) ? L'x' : L'-');
 }
-static void FormatExactBytes(ULONGLONG value, PWSTR out, UINT cch)
-{
-    WCHAR raw[32] = {}; StringCchPrintf(raw, ARRAYSIZE(raw), L"%llu", value);
-    UINT digits = lstrlenW(raw), first = digits % 3; if (!first) first = 3;
-    std::wstring text(raw, first);
-    for (UINT i = first; i < digits; i += 3) { text += L','; text.append(raw + i, 3); }
-    StringCchCopyW(out, cch, text.c_str());
-}
-// File-size display mode, configured in the client's settings
-// (HKCU\Software\ExplorerRemoteFs\SizeFormat):
-//   "auto" (default) - human readable, Linux "ls -h" style:  1.2 MB
-//   "kb"             - Windows Explorer style, whole KB:     1234 KB
-// The old "1.2 MB (1,234,567 B)" form was redundant noise in the column.
-// Cached for 2s: this runs once per rendered row, so do not hit the registry
-// for every item.
-static BOOL ReadSizeFormatAuto()
-{
-    static DWORD cached = 0xFFFFFFFF;
-    static ULONGLONG tick = 0;
-    ULONGLONG now = GetTickCount64();
-    if (cached != 0xFFFFFFFF && now - tick < 2000) return cached != 0;
-    WCHAR buf[32] = {};
-    DWORD cb = sizeof(buf);
-    BOOL autoFormat = TRUE;
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", L"SizeFormat",
-                     RRF_RT_REG_SZ, NULL, buf, &cb) == ERROR_SUCCESS && buf[0])
-        autoFormat = (0 != StrCmpIW(buf, L"kb"));
-    cached = autoFormat ? 1 : 0;
-    tick = now;
-    return autoFormat;
-}
-
+// 大小显示：口径（1024/1000、KB/kB/KiB）与格式化集中在 SizeFormat.h ——
+// 与客户端设置共用同一个注册表值（HKCU\Software\ExplorerRemoteFs\SizeFormat），
+// C++ 侧与 CLI/客户端侧因此不会各写一套。属性页另给精确字节数。
 static void FormatSize(ULONGLONG size, BOOL folder, PWSTR out, UINT cch)
 {
-    if (folder) { StringCchCopy(out, cch, L"-"); return; }
-    if (!ReadSizeFormatAuto())
-    {
-        // Windows Explorer style: whole kilobytes, rounded up.
-        ULONGLONG kb = (size + 1023) / 1024;
-        StringCchPrintf(out, cch, L"%llu KB", kb);
-        return;
-    }
-    if (size < 1024) { StringCchPrintf(out, cch, L"%llu B", size); return; }
-    static const WCHAR *units[] = { L"KB", L"MB", L"GB", L"TB", L"PB" };
-    double shown = (double)size / 1024.0; int unit = 0;
-    while (shown >= 1024.0 && unit < 4) { shown /= 1024.0; ++unit; }
-    StringCchPrintf(out, cch, L"%.1f %s", shown, units[unit]);
+    ErfFormatSize(size, folder, out, cch);
 }
 static void FormatMtime(DWORD mtime, PWSTR out, UINT cch)
 {

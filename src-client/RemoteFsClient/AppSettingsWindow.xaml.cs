@@ -44,9 +44,19 @@ public partial class AppSettingsWindow : Window
         for (int i = 0; i < DefaultViewBox.Items.Count && i < viewNames.Length; i++)
             ((ComboBoxItem)DefaultViewBox.Items[i]).Content = viewNames[i];
         SizeFormatLabel.Text = Ui.IsEnglish ? "File size format" : "文件大小格式";
+        // 默认（第一项）刻意与资源管理器一致：1 GB = 1024 MB、标签写 KB/MB。
+        // 我们是 Explorer 插件，同一个窗口里本地文件与远程文件的列不该"看起来对不上"。
+        // 后两项是给"要严格单位"的人用的：si = 1000 进制（kB/MB），iec = KiB/MiB。
+        // 底层永远是精确字节数（属性页会把字节数一并显示），口径只影响显示。
         var sizeNames = Ui.IsEnglish
-            ? new[] { "Auto (1.2 MB)", "KB (1234 KB)" }
-            : new[] { "自动单位（1.2 MB）", "固定 KB（1234 KB）" };
+            ? new[] { "Auto (1.0 MB — Explorer style, 1024-based)",
+                      "KB (1234 KB — whole KB, 1024-based)",
+                      "SI (1.0 MB — 1000-based, like ls --si)",
+                      "IEC (1.0 MiB — 1024-based, strict KiB/MiB)" }
+            : new[] { "自动单位（1.0 MB，1024 进制，与资源管理器一致）",
+                      "固定 KB（1234 KB，1024 进制，整 KB）",
+                      "十进制（1.0 MB，1000 进制，同 ls --si / Nautilus）",
+                      "IEC（1.0 MiB，1024 进制，严格 KiB/MiB）" };
         for (int i = 0; i < SizeFormatBox.Items.Count && i < sizeNames.Length; i++)
             ((ComboBoxItem)SizeFormatBox.Items[i]).Content = sizeNames[i];
         TerminalLabel.Text = Ui.T("TerminalGlobalLabel");

@@ -13,6 +13,7 @@
 #include "FtpMeta.h"
 #include "FtpSites.h"
 #include "VscodeBridge.h"
+#include "SizeFormat.h"
 #include "Utils.h"
 #include "resource.h"
 #include "ProbeLog.h"
@@ -429,23 +430,11 @@ static void FormatModeString(DWORD mode, BOOL folder, BOOL symlink, PWSTR out, U
         (mode & 0040) ? L'r' : L'-', (mode & 0020) ? L'w' : L'-', (mode & 0010) ? L'x' : L'-',
         (mode & 0004) ? L'r' : L'-', (mode & 0002) ? L'w' : L'-', (mode & 0001) ? L'x' : L'-');
 }
-static void FormatByteCount(ULONGLONG value, PWSTR out, UINT cch)
-{
-    WCHAR raw[32] = {}; StringCchPrintf(raw, ARRAYSIZE(raw), L"%llu", value);
-    UINT digits = lstrlenW(raw), first = digits % 3; if (!first) first = 3;
-    std::wstring text(raw, first);
-    for (UINT i = first; i < digits; i += 3) { text += L','; text.append(raw + i, 3); }
-    StringCchCopyW(out, cch, text.c_str());
-}
+// 属性页的大小：口径 + **精确字节数**两者都给（见 SizeFormat.h：
+// "1.2 MB (1,234,567 B)"）—— 列里只给人读的形式，别让精确值无处可查。
 static void FormatSizeString(ULONGLONG size, BOOL folder, PWSTR out, UINT cch)
 {
-    if (folder) { StringCchCopy(out, cch, L"-"); return; }
-    if (size < 1024) { StringCchPrintf(out, cch, L"%llu B", size); return; }
-    static const WCHAR *units[] = { L"KB", L"MB", L"GB", L"TB", L"PB" };
-    double shown = (double)size / 1024.0; int unit = 0;
-    while (shown >= 1024.0 && unit < 4) { shown /= 1024.0; ++unit; }
-    WCHAR exact[40] = {}; FormatByteCount(size, exact, ARRAYSIZE(exact));
-    StringCchPrintf(out, cch, L"%.1f %s (%s B)", shown, units[unit], exact);
+    ErfFormatSizeWithExact(size, folder, out, cch);
 }
 static void FormatMtimeString(DWORD mtime, PWSTR out, UINT cch)
 {
