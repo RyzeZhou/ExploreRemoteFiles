@@ -32,8 +32,8 @@ public static class ErfIcon
     public static readonly Color Green = Color.FromArgb(0x2E, 0xA0, 0x43);
     public static readonly Color Yellow = Color.FromArgb(0xE8, 0xA3, 0x1C);
     public static readonly Color Red = Color.FromArgb(0xD1, 0x34, 0x38);
-    private static readonly Color Plate = Color.FromArgb(0x1F, 0x3B, 0x63);   // 底板：深蓝
-    private static readonly Color PlateEdge = Color.FromArgb(0x14, 0x28, 0x45);
+    // 字母描边色：深板岩蓝。透明背景下它负责"在浅色底上也看得清"。
+    private static readonly Color Outline = Color.FromArgb(0x14, 0x28, 0x45);
 
     public static ColorState ColorFor(RemoteState state) => state == RemoteState.Ok ? ColorState.Green : ColorState.Red;
 
@@ -61,29 +61,24 @@ public static class ErfIcon
         g.Clear(Color.Transparent);
 
         float s = size;
-        // 圆角底板：让白色字母在任何背景（深色任务栏 / 浅色资源管理器）上都读得出来。
-        float pad = s * 0.04f;
-        var plate = new RectangleF(pad, pad, s - 2 * pad, s - 2 * pad);
-        float radius = s * 0.22f;
-        using (var path = RoundedRect(plate, radius))
-        using (var fill = new LinearGradientBrush(plate, Plate, PlateEdge, 60f))
-        using (var edge = new Pen(Color.FromArgb(90, 255, 255, 255), Math.Max(1f, s * 0.02f)))
-        {
-            g.FillPath(fill, path);
-            g.DrawPath(edge, path);
-        }
+        // **透明背景**：不画底板。三个字母各自带一圈深色描边 ——
+        // 白 E 在浅色资源管理器里靠描边读得出来，在深色任务栏上靠白色本身读得出来；
+        // 彩色的 R/F 同理。（早先是深蓝圆角底板，在深色任务栏上是"方块套方块"。）
 
         // 版面：E 占上方大半，R/F 占下方一条带（各占一半宽）。
         // 字母用**测量后缩放到框内**的方式画（见 DrawGlyph），
-        // 这样任何尺寸都不会被画布/底板裁掉 —— 第一版按字号猜，结果三个字母互相压、
+        // 这样任何尺寸都不会被画布裁掉 —— 第一版按字号猜，结果三个字母互相压、
         // 底部还被圆角切掉。
         var eBox = new RectangleF(s * 0.14f, s * 0.06f, s * 0.72f, s * 0.46f);
         var rBox = new RectangleF(s * 0.08f, s * 0.57f, s * 0.38f, s * 0.33f);
         var fBox = new RectangleF(s * 0.54f, s * 0.57f, s * 0.38f, s * 0.33f);
+        // 小尺寸下描边要更粗：16px 里字母只有 6~7px 高，细描边会让
+        // 透明底上的白 E 糊成一片浅色（实测）。
+        float haloW = Math.Max(1f, s * (s <= 20 ? 0.12f : 0.045f));
         using (var white = new SolidBrush(Color.White))
         using (var rBrush = new SolidBrush(Brush(remote)))
         using (var fBrush = new SolidBrush(Brush(transfer)))
-        using (var halo = new Pen(PlateEdge, Math.Max(1f, s * 0.030f)) { LineJoin = LineJoin.Round })
+        using (var halo = new Pen(Outline, haloW) { LineJoin = LineJoin.Round })
         {
             DrawGlyph(g, "E", eBox, white, halo);
             DrawGlyph(g, "R", rBox, rBrush, halo);
@@ -120,18 +115,6 @@ public static class ErfIcon
         try { return new FontFamily("Arial Black"); }
         catch { /* 系统没有该字体时退回通用无衬线 */ }
         return FontFamily.GenericSansSerif;
-    }
-
-    private static GraphicsPath RoundedRect(RectangleF r, float radius)
-    {
-        var path = new GraphicsPath();
-        float d = radius * 2;
-        path.AddArc(r.X, r.Y, d, d, 180, 90);
-        path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-        path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-        path.CloseFigure();
-        return path;
     }
 
     /// <summary>状态图标（缓存）。给托盘 / 窗口标题栏用。</summary>

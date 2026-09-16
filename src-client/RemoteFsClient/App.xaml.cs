@@ -36,8 +36,12 @@ public partial class App : System.Windows.Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
-        Ui.SetLanguage(AppSettings.Load().ServiceLanguage);
+        var settings = AppSettings.Load();
+        Ui.SetLanguage(settings.ServiceLanguage);
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        // 资源管理器条目的名字跟服务程序语言走（中文「易远传」/ 英文「ERF sites」），
+        // 其余窗口标题与托盘提示不受影响。
+        ShellNamespaceName.Apply(Ui.IsEnglish);
 
         // 常驻服务必须有兜底：一个 WPF 异常（例如 XAML 绑定附加失败）默认会直接
         // 终止进程 —— 实测过一次（进度条绑定到只读属性 → XamlParseException →
@@ -568,6 +572,8 @@ public partial class App : System.Windows.Application
 
     internal void RefreshLocalizedShell()
     {
+        // 语言切换后，资源管理器里的条目名也要跟着变（改注册表 + 通知 shell 刷新缓存）。
+        ShellNamespaceName.Apply(Ui.IsEnglish);
         if (_trayMenu is not null)
         {
             _trayMenu.Items.Clear();
