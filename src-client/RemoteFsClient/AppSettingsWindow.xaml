@@ -4,7 +4,7 @@
         Height="536" Width="650" ResizeMode="NoResize" WindowStartupLocation="CenterOwner">
     <Grid Margin="16">
         <Grid.ColumnDefinitions><ColumnDefinition Width="175"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
 
         <TextBlock x:Name="WinScpPathLabel" VerticalAlignment="Center"/>
         <TextBox x:Name="WinScpPathBox" Grid.Column="1" Margin="0,0,8,0"/>
@@ -38,8 +38,12 @@
         <ComboBox x:Name="SizeFormatBox" Grid.Row="7" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,14,0,0" SelectedValuePath="Tag">
             <ComboBoxItem Tag="auto"/><ComboBoxItem Tag="kb"/>
         </ComboBox>
-        <TextBlock x:Name="HintText" Grid.Row="8" Grid.ColumnSpan="3" TextWrapping="Wrap" Foreground="#666" Margin="0,16,0,0"/>
-        <StackPanel Grid.Row="9" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+        <TextBlock x:Name="TerminalLabel" Grid.Row="8" VerticalAlignment="Center" Margin="0,14,0,0"/>
+        <ComboBox x:Name="TerminalBox" Grid.Row="8" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,14,0,0" SelectedValuePath="Tag">
+            <ComboBoxItem Tag="wt"/><ComboBoxItem Tag="powershell"/><ComboBoxItem Tag="vscode"/>
+        </ComboBox>
+        <TextBlock x:Name="HintText" Grid.Row="9" Grid.ColumnSpan="3" TextWrapping="Wrap" Foreground="#666" Margin="0,16,0,0"/>
+        <StackPanel Grid.Row="10" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
             <Button x:Name="SaveButton" Click="OnSave" Padding="16,4" Margin="0,0,8,0"/><Button x:Name="CancelButton" IsCancel="True" Padding="16,4"/>
         </StackPanel>
     </Grid>

@@ -11,6 +11,7 @@
 #include <shellapi.h>
 #include "FtpMeta.h"
 #include "FtpSites.h"
+#include "VscodeBridge.h"
 #include "Utils.h"
 #include "resource.h"
 #include "ProbeLog.h"
@@ -114,7 +115,10 @@ static void CopyTextToClipboard(HWND hwnd, PCWSTR text)
     }
     CloseClipboard();
 }
-static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *captured)
+// timeoutMs：等待 CLI 结束的上限，超时即终止子进程。默认 30 秒适合单条目操作；
+// 递归遍历（chmodr）这类长任务在**工作线程**里调用时可以放大（UI 线程绝不能用长超时）。
+static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *captured,
+                  DWORD timeoutMs = 30000)
 {
     WCHAR cmd[2400];
     PCWSTR cli = GetCliPath();
@@ -139,7 +143,7 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
         return -1;
     }
     if(captured){char b[4096];DWORD n=0;while(ReadFile(rd,b,sizeof(b),&n,NULL)&&n)captured->append(b,n);CloseHandle(rd);}
-    DWORD wait=WaitForSingleObject(pi.hProcess,30000);
+    DWORD wait=WaitForSingleObject(pi.hProcess,timeoutMs);
     if(wait==WAIT_TIMEOUT){
         ProbeLog(L"[FTP] RunCli timed out cmd='%s'", cmd);
         TerminateProcess(pi.hProcess,1);
@@ -150,6 +154,10 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
              site,verb,p1,p2?p2:L"",wait,code);
     CloseHandle(pi.hThread);CloseHandle(pi.hProcess);return code==0?0:-1;
 }
+
+// 递归改权限的异步入口（实现在文件后面的终端辅助区）。属性页在 UI 线程上调用它，
+// 真正的工作交给常驻服务 + 工作线程，所以这里必须先声明。
+static void StartChmodRecursiveAsync(PCWSTR site, PCWSTR path, PCWSTR modeOctal);
 
 // Single refresh pipeline for EVERY successful remote mutation — right-click
 // commands, background menu, drop target (Ctrl+V / drag-drop) all funnel here.
@@ -642,7 +650,12 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
                 BOOL recursive = IsDlgButtonChecked(hDlg,3023)!=0;
                 if(mode != pm->meta.bits || recursive){
                     WCHAR modeStr[8]; StringCchPrintf(modeStr,ARRAYSIZE(modeStr),L"%03o",mode);
-                    if(RunCli(pm->site, recursive?L"chmodr":L"chmod", pm->path, modeStr, NULL)==0){
+                    if(recursive){
+                        // 递归改权限可能遍历上万个条目：**绝不能在 UI 线程上等**。
+                        // 交给常驻服务（它带进度窗口和「取消」），本对话框立即关闭。
+                        StartChmodRecursiveAsync(pm->site, pm->path, modeStr);
+                    } else if(RunCli(pm->site, L"chmod", pm->path, modeStr, NULL)==0){
+                        // 单个条目的 chmod 很快，保持同步：结果确定、无需进度窗口。
                         WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
                         AfterRemoteMutation(pm->site, parentDir, pm->notify);
                     } else MessageBoxW(hDlg, ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
@@ -1532,21 +1545,30 @@ static BOOL WriteTerminalShim(const FTPSITE &site, PCWSTR remoteDir,
     StringCchPrintfW(portText, ARRAYSIZE(portText), L"%d", site.port ? site.port : 22);
     std::wstring target = std::wstring(site.user) + L"@" + site.host;
 
-    // 认证完全交给 ssh：有 PrivateKeyPath 就 -i（复用站点已有密钥），
-    // 否则走 ssh-agent / 默认密钥 / 终端内交互输密码。我们的进程始终不接触凭据。
+    // 认证交给 ssh：站点绑定了现有 SSH 配置就直接用别名（用户的密钥/agent/端口全部照旧），
+    // 否则用站点的端口 + PrivateKeyPath，再退到 ssh-agent / 默认密钥 / 终端内输密码。
+    // 我们的进程始终不接触凭据。
     // accept-new：首连自动接受主机密钥（TOFU），避免用户被指纹交互卡住。
     sshCmdText = L"& ";
     AppendPsSingleQuoted(sshCmdText, sshExe);
-    sshCmdText += L" -p ";
-    sshCmdText += portText;
     sshCmdText += L" -o StrictHostKeyChecking=accept-new";
-    if (site.keyPath[0])
+    if (site.sshAlias[0])
     {
-        sshCmdText += L" -i ";
-        AppendPsSingleQuoted(sshCmdText, site.keyPath);
+        sshCmdText += L" ";
+        AppendPsSingleQuoted(sshCmdText, site.sshAlias);
     }
-    sshCmdText += L" ";
-    AppendPsSingleQuoted(sshCmdText, target.c_str());
+    else
+    {
+        sshCmdText += L" -p ";
+        sshCmdText += portText;
+        if (site.keyPath[0])
+        {
+            sshCmdText += L" -i ";
+            AppendPsSingleQuoted(sshCmdText, site.keyPath);
+        }
+        sshCmdText += L" ";
+        AppendPsSingleQuoted(sshCmdText, target.c_str());
+    }
     sshCmdText += L" -t ";
     AppendPsSingleQuoted(sshCmdText, remote.c_str());
 
@@ -1637,6 +1659,393 @@ static BOOL EnsureSshConfigAlias(const FTPSITE &site, std::wstring &alias)
     return ok;
 }
 
+// 从 Code.exe 的完整路径推出 CLI 包装脚本 <安装目录>\bin\code.cmd。
+// 我们要的是 code.cmd：只有它会把参数转发给正在运行的 VS Code 实例。
+static BOOL DeriveCodeCmdFromExe(PCWSTR codeExe, std::wstring &out)
+{
+    if (!codeExe || !codeExe[0]) return FALSE;
+    std::wstring exe = codeExe;
+    if (exe.size() >= 2 && exe.front() == L'"' && exe.back() == L'"') exe = exe.substr(1, exe.size() - 2);
+    size_t slash = exe.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return FALSE;
+    std::wstring cmd = exe.substr(0, slash) + L"\\bin\\code.cmd";
+    if (GetFileAttributesW(cmd.c_str()) == INVALID_FILE_ATTRIBUTES) return FALSE;
+    out = cmd;
+    return TRUE;
+}
+
+// 解析 code.cmd 的真实位置。
+// 旧代码只查 %LOCALAPPDATA%\Programs（用户级安装），装在 D:\Program\Microsoft VS Code
+// 这类自定义/系统级目录时就会报"未找到 code.cmd"。
+// 顺序：注册表 App Paths（HKCU→HKLM）→ Uninstall 的 InstallLocation → 常见路径 → PATH。
+static BOOL ResolveCodeCmd(std::wstring &out)
+{
+    const HKEY roots[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+
+    // 1) App Paths\code.exe （默认值指向 Code.exe）
+    for (int i = 0; i < 2; ++i)
+    {
+        HKEY k = NULL;
+        if (RegOpenKeyExW(roots[i], L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\code.exe",
+                          0, KEY_QUERY_VALUE, &k) == ERROR_SUCCESS)
+        {
+            WCHAR val[MAX_PATH * 2] = {};
+            DWORD cb = sizeof(val), type = 0;
+            LONG rc = RegQueryValueExW(k, NULL, NULL, &type, (LPBYTE)val, &cb);
+            RegCloseKey(k);
+            if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) && val[0])
+            {
+                if (type == REG_EXPAND_SZ)
+                {
+                    WCHAR expanded[MAX_PATH * 2] = {};
+                    ExpandEnvironmentStringsW(val, expanded, ARRAYSIZE(expanded));
+                    StringCchCopyW(val, ARRAYSIZE(val), expanded);
+                }
+                if (DeriveCodeCmdFromExe(val, out)) return TRUE;
+            }
+        }
+    }
+
+    // 2) 卸载信息里的 InstallLocation（自定义安装目录常在这里）
+    for (int i = 0; i < 2; ++i)
+    {
+        HKEY uninst = NULL;
+        if (RegOpenKeyExW(roots[i], L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                          0, KEY_ENUMERATE_SUB_KEYS, &uninst) != ERROR_SUCCESS) continue;
+        WCHAR sub[256] = {}; DWORD index = 0, cch = ARRAYSIZE(sub);
+        while (RegEnumKeyExW(uninst, index++, sub, &cch, NULL, NULL, NULL, NULL) == ERROR_SUCCESS)
+        {
+            cch = ARRAYSIZE(sub);
+            HKEY app = NULL;
+            if (RegOpenKeyExW(uninst, sub, 0, KEY_QUERY_VALUE, &app) == ERROR_SUCCESS)
+            {
+                WCHAR display[256] = {}, loc[MAX_PATH * 2] = {};
+                DWORD cb = sizeof(display), type = 0;
+                if (RegQueryValueExW(app, L"DisplayName", NULL, &type, (LPBYTE)display, &cb) == ERROR_SUCCESS
+                    && (0 == StrCmpIW(display, L"Microsoft VS Code") || 0 == StrCmpIW(display, L"Microsoft VS Code Insiders")))
+                {
+                    cb = sizeof(loc);
+                    if (RegQueryValueExW(app, L"InstallLocation", NULL, &type, (LPBYTE)loc, &cb) == ERROR_SUCCESS && loc[0])
+                    {
+                        std::wstring cmd = std::wstring(loc) + L"\\bin\\code.cmd";
+                        if (GetFileAttributesW(cmd.c_str()) != INVALID_FILE_ATTRIBUTES)
+                        {
+                            RegCloseKey(app); RegCloseKey(uninst);
+                            out = cmd; return TRUE;
+                        }
+                    }
+                }
+                RegCloseKey(app);
+            }
+        }
+        RegCloseKey(uninst);
+    }
+
+    // 3) 常见安装位置（用户级 / 系统级 / Insiders）
+    WCHAR local[MAX_PATH] = {}, pf[MAX_PATH] = {}, pf86[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local));
+    GetEnvironmentVariableW(L"ProgramFiles", pf, ARRAYSIZE(pf));
+    GetEnvironmentVariableW(L"ProgramFiles(x86)", pf86, ARRAYSIZE(pf86));
+    const wchar_t *userTails[] = {
+        L"\\Programs\\Microsoft VS Code\\bin\\code.cmd",
+        L"\\Programs\\Microsoft VS Code Insiders\\bin\\code-insiders.cmd",
+    };
+    for (int i = 0; i < ARRAYSIZE(userTails); ++i)
+    {
+        std::wstring p = std::wstring(local) + userTails[i];
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) { out = p; return TRUE; }
+    }
+    const wchar_t *machineTails[] = {
+        L"\\Microsoft VS Code\\bin\\code.cmd",
+        L"\\Microsoft VS Code Insiders\\bin\\code-insiders.cmd",
+    };
+    const std::wstring bases[2] = { pf, pf86 };
+    for (int i = 0; i < 2; ++i)
+    {
+        if (bases[i].empty()) continue;
+        for (int j = 0; j < ARRAYSIZE(machineTails); ++j)
+        {
+            std::wstring p = bases[i] + machineTails[j];
+            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) { out = p; return TRUE; }
+        }
+    }
+
+    // 4) PATH
+    const wchar_t *names[2] = { L"code.cmd", L"code-insiders.cmd" };
+    for (int i = 0; i < 2; ++i)
+    {
+        WCHAR found[MAX_PATH] = {};
+        if (SearchPathW(NULL, names[i], NULL, ARRAYSIZE(found), found, NULL))
+        {
+            out = found;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// 把「在此打开终端」的目标写进请求文件，交给 VS Code 里的 ERF 伴随扩展处理：
+//   已有窗口连着该 authority → 直接在那个窗口里新开终端（不新开窗口）
+//   没有窗口 → 我们随后启动窗口，扩展激活时接单，终端仍落在目标目录
+// 协议见 src-vscode-extension/ （authority / path / ts，TTL 120s，消费后删除）。
+static BOOL WriteVscodeRequest(PCWSTR alias, PCWSTR remoteDir)
+{
+    if (!alias || !alias[0]) return FALSE;
+    WCHAR local[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local))) return FALSE;
+    std::wstring dir = std::wstring(local) + L"\\ExplorerRemoteFs";
+    if (!EnsureDirectoryExists(dir.c_str())) return FALSE;
+    std::wstring file = dir + L"\\vscode-request.json";
+
+    FILETIME ft = {};
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+    unsigned long long ms = (u.QuadPart - 116444736000000000ULL) / 10000ULL;
+
+    std::wstring json = L"{\"authority\":\"ssh-remote+";
+    for (PCWSTR p = alias; *p; ++p)                    // 别名按白名单过滤后落地
+        if (iswalnum((wint_t)*p) || *p == L'-' || *p == L'_' || *p == L'.') json += *p;
+    json += L"\",\"path\":\"";
+    for (PCWSTR p = (remoteDir && remoteDir[0]) ? remoteDir : L"/"; *p; ++p)
+    {
+        if (*p == L'"' || *p == L'\\') json += L'\\';
+        json += *p;
+    }
+    json += L"\",\"ts\":";
+    WCHAR ts[32] = {};
+    StringCchPrintfW(ts, ARRAYSIZE(ts), L"%llu", ms);
+    json += ts;
+    json += L"}";
+
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        ProbeLog(L"[TERM] vscode request write failed err=%lu", GetLastError());
+        return FALSE;
+    }
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(), NULL, 0, NULL, NULL);
+    std::string utf8((size_t)(bytes > 0 ? bytes : 0), '\0');
+    if (bytes > 0) WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(), &utf8[0], bytes, NULL, NULL);
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, utf8.data(), (DWORD)utf8.size(), &written, NULL);
+    CloseHandle(h);
+    ProbeLog(L"[TERM] vscode request file='%s' alias='%s' dir='%s' ok=%d", file.c_str(), alias, remoteDir, ok);
+    return ok;
+}
+
+
+// 异步的「递归修改权限」。属性页按下确定后立即返回，遍历与进度由常驻服务负责
+// （进度窗口带「取消」）；这里只在线程结束时把新权限刷进视图。
+// 与同步版的关键差别：不再有 30 秒被杀掉的风险，Explorer 也不会卡住。
+struct ChmodRemoteCtx
+{
+    WCHAR site[64];
+    WCHAR path[600];
+    WCHAR parent[600];
+    WCHAR mode[8];
+};
+
+static DWORD WINAPI ChmodRemoteThreadProc(LPVOID p)
+{
+    ChmodRemoteCtx *c = static_cast<ChmodRemoteCtx *>(p);
+    ProbeLog(L"[TERM] async chmod begin site='%s' path='%s' mode=%s", c->site, c->path, c->mode);
+
+    std::string reply;
+    BOOL ok = FtpBridgeChmod(c->site, c->path, c->mode, TRUE, reply);
+    BOOL serviceUnavailable = (!ok && reply.empty());     // 管道都连不上：常驻服务没运行
+    if (!ok && serviceUnavailable)
+    {
+        // 回退：直接跑 CLI（这里在工作线程上，长超时是安全的）。
+        // 不能让"常驻服务没开"变成静默失败——用户必须知道权限到底改没改。
+        ProbeLog(L"[TERM] async chmod: resident service unavailable, falling back to CLI");
+        int rc = RunCli(c->site, L"chmodr", c->path, c->mode, NULL, 60u * 60u * 1000u);
+        ok = (rc == 0);
+        if (ok) { AfterRemoteMutation(c->site, c->parent, NULL); }
+        else
+        {
+            ProbeLog(L"[TERM] async chmod CLI fallback failed rc=%d", rc);
+            MessageBoxW(NULL,
+                ExplorerText(L"error.chmod_failed", L"权限修改失败（常驻服务未运行，已回退到命令行）。",
+                                                      L"Permission update failed (resident service was not running; fell back to the CLI)."),
+                ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        }
+        delete c;
+        return 0;
+    }
+    if (ok)
+    {
+        // 权限真的改完了，才刷新视图（与服务端状态保持一致）。
+        AfterRemoteMutation(c->site, c->parent, NULL);
+        ProbeLog(L"[TERM] async chmod done site='%s' path='%s'", c->site, c->path);
+    }
+    else
+    {
+        // 失败或被用户在进度窗口里取消：那个窗口已经给出了结果与原因，
+        // 这里不再弹第二个窗（重复告警），只留日志。
+        ProbeLog(L"[TERM] async chmod failed site='%s' path='%s' reply='%hs'", c->site, c->path, reply.c_str());
+    }
+
+    delete c;
+    return 0;
+}
+
+static void StartChmodRecursiveAsync(PCWSTR site, PCWSTR path, PCWSTR modeOctal)
+{
+    if (!site || !site[0] || !path || !path[0]) return;
+    ChmodRemoteCtx *c = new (std::nothrow) ChmodRemoteCtx();
+    if (!c) return;
+    StringCchCopyW(c->site, ARRAYSIZE(c->site), site);
+    StringCchCopyW(c->path, ARRAYSIZE(c->path), path);
+    StringCchCopyW(c->mode, ARRAYSIZE(c->mode), modeOctal ? modeOctal : L"644");
+    PathParent(c->path, c->parent, ARRAYSIZE(c->parent));
+
+    HANDLE t = CreateThread(NULL, 0, ChmodRemoteThreadProc, c, 0, NULL);
+    if (t) CloseHandle(t);
+    else { delete c; ProbeLog(L"[TERM] async chmod: CreateThread failed err=%lu", GetLastError()); }
+}
+
+// ── 把 VS Code 窗口请到前台 ────────────────────────────────────────────────
+// 用户要求：在已有窗口里开完终端后，应当"跳转"到那个窗口，而不是让终端在后台出现。
+// 扩展 API 没有操作系统级聚焦能力（terminal.show() 只作用于窗口内部），所以这一步
+// 由我们这边做：找标题里带 "[SSH: <别名>]" 的 VS Code 顶层窗口（Chrome_WidgetWin_1），
+// 还原并 SetForegroundWindow。我们的代码跑在 explorer.exe 里，点击时它就是前台进程，
+// 因此 SetForegroundWindow 不会被前台锁挡住。
+struct TerminalFocusRequest
+{
+    std::wstring alias;
+    DWORD timeoutMs;
+};
+
+// 后台线程：窗口可能刚启动还没出现，最多等 timeoutMs；找不到就静默放弃
+// （聚焦只是体验优化，失败不能影响终端已经开出来这个结果）。
+static DWORD WINAPI TerminalFocusThread(LPVOID param)
+{
+    TerminalFocusRequest *req = reinterpret_cast<TerminalFocusRequest *>(param);
+    if (!req) return 0;
+    const DWORD step = 250;
+    for (DWORD waited = 0; waited <= req->timeoutMs; waited += step)
+    {
+        HWND wnd = ErfFindVscodeWindowForAlias(req->alias.c_str());
+        if (wnd)
+        {
+            if (IsIconic(wnd)) ShowWindow(wnd, SW_RESTORE);
+            SetForegroundWindow(wnd);
+            ProbeLog(L"[TERM] focused vscode window hwnd=%p alias='%s'", wnd, req->alias.c_str());
+            break;
+        }
+        Sleep(step);
+    }
+    delete req;
+    return 0;
+}
+
+static void FocusVscodeWindowAsync(PCWSTR alias, DWORD timeoutMs)
+{
+    if (!alias || !alias[0]) return;
+    TerminalFocusRequest *req = new (std::nothrow) TerminalFocusRequest();
+    if (!req) return;
+    req->alias = alias;
+    req->timeoutMs = timeoutMs;
+    HANDLE t = CreateThread(NULL, 0, TerminalFocusThread, req, 0, NULL);
+    if (t) CloseHandle(t); else delete req;
+}
+// ── Windows Terminal：用 fragment 定义我们的 profile（不改用户的 settings.json）──
+// WT 会扫描 %LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\<App>\*.json，
+// 把它当作额外的 profile 来源（VS Code、Azure 等就是这么做的）。于是：
+//   * 一个站点一个文件，幂等（覆盖自己的文件），删除即撤销；
+//   * 完全不动用户的 settings.json —— 之前把 profile 直接写进去，等于改用户的配置，
+//     而且 WT 会重写整个文件（实测它把我们的条目重排过）；
+//   * 启动只给 `wt -p "ERF: <站点>"`，WT 自己的命令行解析器无从插手。
+static void SafeToken(PCWSTR src, std::wstring &out)
+{
+    out.clear();
+    for (PCWSTR p = src; p && *p; ++p)
+        out += (iswalnum((wint_t)*p) || *p == L'-' || *p == L'_' || *p == L'.') ? *p : L'-';
+    if (out.empty()) out = L"site";
+}
+
+// 由站点名推出稳定的 GUID（MD5 前 16 字节），保证同一站点每次得到同一个 id。
+static void DeterministicGuid(PCWSTR name, WCHAR *out, UINT cch)
+{
+    BYTE hash[16] = {};
+    HCRYPTPROV prov = 0;
+    HCRYPTHASH h = 0;
+    if (CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+    {
+        if (CryptCreateHash(prov, CALG_MD5, 0, 0, &h))
+        {
+            int bytes = (int)(wcslen(name) * sizeof(WCHAR));
+            CryptHashData(h, (const BYTE *)name, (DWORD)bytes, 0);
+            DWORD got = 16;
+            CryptGetHashParam(h, HP_HASHVAL, hash, &got, 0);
+            CryptDestroyHash(h);
+        }
+        CryptReleaseContext(prov, 0);
+    }
+    // 版本位按 UUIDv4 风格摆一下，纯粹为了看起来像个合法 GUID
+    hash[6] = (BYTE)((hash[6] & 0x0F) | 0x40);
+    hash[8] = (BYTE)((hash[8] & 0x3F) | 0x80);
+    StringCchPrintfW(out, cch,
+        L"{%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+        hash[8], hash[9], hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]);
+}
+
+static BOOL WriteTerminalFragment(const FTPSITE &site, PCWSTR shimPath, std::wstring &profileName)
+{
+    WCHAR local[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local))) return FALSE;
+
+    std::wstring wtRoot = std::wstring(local) + L"\\Microsoft\\Windows Terminal";
+    std::wstring dir = wtRoot + L"\\Fragments\\ExploreRemoteFiles";
+    if (!EnsureDirectoryExists(wtRoot.c_str())
+        || !EnsureDirectoryExists((wtRoot + L"\\Fragments").c_str())
+        || !EnsureDirectoryExists(dir.c_str()))
+        return FALSE;
+
+    std::wstring safe;
+    SafeToken(site.name, safe);
+    std::wstring file = dir + L"\\erf-" + safe + L".json";
+
+    WCHAR guid[64] = {};
+    DeterministicGuid(site.name, guid, ARRAYSIZE(guid));
+    profileName = L"ERF: " + std::wstring(site.name);
+
+    // JSON 里必须转义反斜杠与引号
+    std::wstring cmd = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"";
+    for (PCWSTR p = shimPath; p && *p; ++p)
+    {
+        if (*p == L'\\' || *p == L'"') cmd += L'\\';
+        cmd += *p;
+    }
+    cmd += L"\"";
+
+    std::wstring json = L"{\r\n  \"profiles\": [\r\n    {\r\n      \"name\": \"";
+    json += profileName;
+    json += L"\",\r\n      \"guid\": \"";
+    json += guid;
+    json += L"\",\r\n      \"hidden\": false,\r\n      \"commandline\": \"";
+    json += cmd;
+    json += L"\"\r\n    }\r\n  ]\r\n}\r\n";
+
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(), NULL, 0, NULL, NULL);
+    if (bytes <= 0) return FALSE;
+    std::string utf8((size_t)bytes, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(), &utf8[0], bytes, NULL, NULL);
+
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        ProbeLog(L"[TERM] WT fragment write failed err=%lu file='%s'", GetLastError(), file.c_str());
+        return FALSE;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, utf8.data(), (DWORD)utf8.size(), &written, NULL);
+    CloseHandle(h);
+    ProbeLog(L"[TERM] WT fragment file='%s' profile='%s' guid=%s ok=%d", file.c_str(), profileName.c_str(), guid, ok);
+    return ok;
+}
+
 static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteDir, int which)
 {
     if (!SiteIsSshCapable(site.type))
@@ -1670,16 +2079,19 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
         WCHAR local[MAX_PATH] = {};
         GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local));
         std::wstring wt = std::wstring(local) + L"\\Microsoft\\WindowsApps\\wt.exe";
-        if (GetFileAttributesW(wt.c_str()) == INVALID_FILE_ATTRIBUTES)
+        std::wstring profileName;
+        if (GetFileAttributesW(wt.c_str()) == INVALID_FILE_ATTRIBUTES || !WriteTerminalFragment(site, shimPath.c_str(), profileName))
         {
-            which = TERM_PWSH;                       // 没有 Windows Terminal → 退化为 PowerShell
+            // 没有 Windows Terminal，或 fragment 写不进去 → 退化为 PowerShell 控制台（同一份 shim）
+            which = TERM_PWSH;
         }
         else
         {
-            // 关键：WT 看到的只是一条"powershell 跑某个脚本"的简单命令，
-            // 复杂参数全在脚本文件里，WT 的命令行语法无从插手。
-            full = L'"' + wt + L"\" powershell.exe -NoProfile -ExecutionPolicy Bypass -File ";
-            AppendWinQuotedArg(full, shimPath.c_str());
+            // 关键：交给 wt 的**只有** -p 和一个引号包起来的 profile 名。
+            // 真正的命令在 fragment 里（由 WT 按正常规则解析），
+            // 于是 WT 自己的命令行语法（吃以 - 开头的 token、把 ; 当分隔符）无从插手。
+            full = L'"' + wt + L"\" -p ";
+            AppendWinQuotedArg(full, profileName.c_str());
         }
     }
     if (which == TERM_PWSH)
@@ -1691,10 +2103,15 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
     else if (which == TERM_VSCODE)
     {
         // VS Code 没有"用命令行让集成终端跑一条命令"的接口，正规做法是 Remote-SSH：
-        // 把主机信息写进 ~/.ssh/config 的受管块，再让 VS Code 用它打开远端目录。
-        // 需要 Remote-SSH 扩展（缺了 VS Code 会自己提示安装）。
+        // 复用优先：站点在服务程序里绑定了现有 SSH 配置就用它（用户自己的主机/端口/密钥/
+        // agent 设置全部照旧生效）；没绑定才写 ~/.ssh/config 的受管块。
         std::wstring alias;
-        if (!EnsureSshConfigAlias(site, alias))
+        if (site.sshAlias[0])
+        {
+            alias = site.sshAlias;
+            ProbeLog(L"[TERM] vscode using bound ssh alias '%s'", alias.c_str());
+        }
+        else if (!EnsureSshConfigAlias(site, alias))
         {
             MessageBoxW(hwnd,
                 ExplorerText(L"error.terminal_ssh_config",
@@ -1703,23 +2120,33 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
                 ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
             return;
         }
-        WCHAR local2[MAX_PATH] = {};
-        GetEnvironmentVariableW(L"LOCALAPPDATA", local2, ARRAYSIZE(local2));
+
         std::wstring codeCmd;
-        const wchar_t *cands[] = { L"\\Programs\\Microsoft VS Code\\bin\\code.cmd",
-                                   L"\\Programs\\Microsoft VS Code Insiders\\bin\\code-insiders.cmd" };
-        for (int ci = 0; ci < ARRAYSIZE(cands); ++ci)
-        {
-            std::wstring p = std::wstring(local2) + cands[ci];
-            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) { codeCmd = p; break; }
-        }
-        if (codeCmd.empty())
+        if (!ResolveCodeCmd(codeCmd))
         {
             MessageBoxW(hwnd,
-                ExplorerText(L"error.terminal_no_vscode", L"未找到 VS Code（code.cmd）。", L"VS Code was not found (code.cmd)."),
+                ExplorerText(L"error.terminal_no_vscode",
+                             L"未找到 VS Code 的 code.cmd。请确认已安装 VS Code（或用 code 命令所在的安装目录）。",
+                             L"VS Code's code.cmd was not found. Make sure VS Code is installed."),
                 ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
             return;
         }
+        ProbeLog(L"[TERM] resolved code.cmd='%s'", codeCmd.c_str());
+
+        // 先落请求文件：已经连着该主机的 VS Code 窗口会在 2 秒内接单，直接在那个窗口里
+        // 新开终端（不新开窗口、不再弹工作区信任）。
+        WriteVscodeRequest(alias.c_str(), remoteDir);
+
+        // 关键：已有窗口连着这个主机时**绝不启动窗口**。否则不同目录会各开一个新窗口，
+        // 每个新窗口都要再问一次「是否信任此工作区」——这正是之前的错误实现。
+        if (ErfHasLiveVscodeWindow(alias.c_str()))
+        {
+            ProbeLog(L"[TERM] vscode: live window already connected to '%s' -> request file only, no launch", alias.c_str());
+            // 终端会在那个窗口里出现；顺手把窗口请到前台，用户不必自己去任务栏找。
+            FocusVscodeWindowAsync(alias.c_str(), 4000);
+            return;                                   // 不启动任何东西，任务已交给扩展
+        }
+
         // .cmd 必须经 cmd.exe；最外层再包一对引号，是 cmd /c 处理"含空格路径"的常规写法。
         full = L"cmd.exe /c \"\"" + codeCmd + L"\" --remote ssh-remote+" + alias + L" ";
         AppendWinQuotedArg(full, (remoteDir && remoteDir[0]) ? remoteDir : L"/");
@@ -1752,10 +2179,20 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
     }
 }
 
-// 终端偏好由**常驻服务程序的设置**决定（HKCU\Software\ExplorerRemoteFs\Terminal）。
+// 终端偏好：**站点级优先**（connections.json 的 Terminal，由服务程序的「终端配置」
+// 标签页设置），站点没设才用全局（HKCU\Software\ExplorerRemoteFs\Terminal）。
 // 取值：wt / powershell / vscode（大小写不敏感，允许 "windows-terminal"、"pwsh"、"code" 等别名）。
 // 默认 wt；取不到或无法识别时回落到 wt（再由 LaunchTerminalForSite 按可用性降级）。
-static int ReadTerminalPreference()
+static int ParseTerminalName(PCWSTR val)
+{
+    if (!val || !val[0]) return -1;                     // 未设置
+    if (0 == StrCmpIW(val, L"powershell") || 0 == StrCmpIW(val, L"pwsh")) return TERM_PWSH;
+    if (0 == StrCmpIW(val, L"vscode") || 0 == StrCmpIW(val, L"code")) return TERM_VSCODE;
+    if (0 == StrCmpIW(val, L"wt") || 0 == StrCmpIW(val, L"windows-terminal")) return TERM_WT;
+    return -1;                                          // 无法识别 → 当作未设置
+}
+
+static int ReadGlobalTerminalPreference()
 {
     WCHAR val[64] = {};
     DWORD cb = sizeof(val) - sizeof(WCHAR);
@@ -1767,10 +2204,22 @@ static int ReadTerminalPreference()
             val[0] = 0;
         RegCloseKey(key);
     }
-    if (!val[0]) return TERM_WT;
-    if (0 == StrCmpIW(val, L"powershell") || 0 == StrCmpIW(val, L"pwsh")) return TERM_PWSH;
-    if (0 == StrCmpIW(val, L"vscode") || 0 == StrCmpIW(val, L"code")) return TERM_VSCODE;
-    return TERM_WT;   // "wt" / "windows-terminal" / 其他
+    int parsed = ParseTerminalName(val);
+    return parsed >= 0 ? parsed : TERM_WT;
+}
+
+// 站点级设置覆盖全局；两者都取不到时用 wt。
+static int ReadTerminalForSite(const FTPSITE &site)
+{
+    int sitePref = ParseTerminalName(site.terminal);
+    if (sitePref >= 0)
+    {
+        ProbeLog(L"[TERM] terminal preference: site='%s' -> %d", site.name, sitePref);
+        return sitePref;
+    }
+    int globalPref = ReadGlobalTerminalPreference();
+    ProbeLog(L"[TERM] terminal preference: site='%s' (unset) -> global %d", site.name, globalPref);
+    return globalPref;
 }
 
 class CMenu : public IContextMenu, public IShellExtInit, public IObjectWithSite {
@@ -1921,8 +2370,8 @@ public:
         }
         if(ts.name[0])
         {
-            // 用哪一个终端由常驻服务程序的设置决定（HKCU\Software\ExplorerRemoteFs\Terminal）。
-            int which = ReadTerminalPreference();
+            // 终端：站点级优先（服务程序「终端配置」标签页），其次全局设置。
+            int which = ReadTerminalForSite(ts);
             LaunchTerminalForSite(ci->hwnd, ts, dir, which);
         }
         break;
@@ -2046,7 +2495,14 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                 if (mode != pm->meta.bits || recursive)
                 {
                     WCHAR modeStr[8]; StringCchPrintf(modeStr,ARRAYSIZE(modeStr),L"%03o",mode);
-                    if (RunCli(pm->site, recursive?L"chmodr":L"chmod", pm->path, modeStr, NULL)==0)
+                    if (recursive)
+                    {
+                        // 递归改权限：属性页的「应用」在 Explorer 的 UI 线程上，
+                        // 同步跑 CLI 会把整个属性页卡死（树大时还会撞上 RunCli 的 30 秒超时被杀）。
+                        // 交给常驻服务：遍历在它自己的线程上，带进度窗口与「取消」。
+                        StartChmodRecursiveAsync(pm->site, pm->path, modeStr);
+                    }
+                    else if (RunCli(pm->site, L"chmod", pm->path, modeStr, NULL)==0)
                     {
                         WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
                         AfterRemoteMutation(pm->site, parentDir, pm->notify);
@@ -2187,7 +2643,7 @@ class CFolderViewImplBgMenu : public IContextMenu, public IObjectWithSite
 {
 public:
     CFolderViewImplBgMenu(IContextMenu *pDef, PCIDLIST_ABSOLUTE pidlFolder, int level)
-        : ref(1), m_pDefault(pDef), m_site(NULL), m_lastFirst(0), m_defaultCount(0), m_nLevel(level)
+        : ref(1), m_pDefault(pDef), m_site(NULL), m_lastFirst(0), m_defaultCount(0), m_hasTerminalItem(FALSE), m_nLevel(level)
     {
         if (m_pDefault) m_pDefault->AddRef();   // keep the default menu alive
         m_pidl = pidlFolder ? ILCloneFull(pidlFolder) : NULL;
@@ -2246,6 +2702,24 @@ public:
             // Provider only yields selection-scoped commands), so the folder
             // context menu is the reliable launcher.
             BG_INSERT(ExplorerText(L"menu.transfer_queue", L"传输队列", L"Transfer queue"));
+
+            // 「在此打开终端」：只对 SSH 站点（SFTP/SCP）出现。判定必须与
+            // InvokeCommand 完全一致，否则菜单项与派发会错位。
+            {
+                WCHAR bgSite[64] = {};
+                FTPSITE bgFt = {};
+                if (m_pidl) PidlSite(m_pidl, bgSite, ARRAYSIZE(bgSite));
+                if (bgSite[0] && FindSiteByName(bgSite, &bgFt) && SiteIsSshCapable(bgFt.type))
+                {
+                    if (our < maxid)
+                    {
+                        InsertMenuW(m, pos++, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+                        added++;
+                    }
+                    BG_INSERT(ExplorerText(L"menu.open_terminal_here", L"在此打开终端", L"Open terminal here"));
+                    m_hasTerminalItem = TRUE;
+                }
+            }
         }
 #undef BG_INSERT
         int custom = 0;
@@ -2357,7 +2831,18 @@ public:
             if (GetClientPath()[0])
                 ShellExecuteW(ci->hwnd, NULL, GetClientPath(), L"--transfers", NULL, SW_SHOWNORMAL);
             break;
-        default: BgCustomCommand(ci->hwnd, site, folder, k - 6); break;
+        default:
+            // 「在此打开终端」只在 SSH 站点插入（m_hasTerminalItem 与 QueryContextMenu 同判据），
+            // 因此自定义命令的偏移要随之移动一位。
+            if (m_hasTerminalItem && k == 6)
+            {
+                FTPSITE ts = {};
+                if (FindSiteByName(site, &ts))
+                    LaunchTerminalForSite(ci->hwnd, ts, folder, ReadTerminalForSite(ts));
+                break;
+            }
+            BgCustomCommand(ci->hwnd, site, folder, (int)k - (m_hasTerminalItem ? 7 : 6));
+            break;
         }
         return S_OK;
     }
@@ -2429,6 +2914,7 @@ private:
     PIDLIST_ABSOLUTE m_pidl;
     UINT m_lastFirst;
     UINT m_defaultCount;
+    BOOL m_hasTerminalItem = FALSE;   // level>=1 时是否插入了「在此打开终端」（派发偏移要用同一判据）
     int m_nLevel;
 };
 

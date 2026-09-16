@@ -1,0 +1,18 @@
+{
+  "name": "terminal-bridge",
+  "displayName": "ERF Terminal Bridge",
+  "description": "Open an integrated terminal at a remote directory in the already-connected VS Code window.",
+  "publisher": "explorerremotefs",
+  "version": "0.1.1",
+  "license": "MIT",
+  "engines": { "vscode": "^1.80.0" },
+  "main": "./extension.js",
+  "activationEvents": ["*", "onUri"],
+  "extensionKind": ["ui"],
+  "capabilities": { "untrustedWorkspaces": { "supported": true } },
+  "contributes": {
+    "commands": [
+      { "command": "explorerremotefs.openTerminalAt", "title": "ERF: Open Terminal Here" }
+    ]
+  }
+}

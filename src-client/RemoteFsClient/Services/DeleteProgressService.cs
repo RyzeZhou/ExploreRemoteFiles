@@ -2,19 +2,21 @@ using System.Windows.Threading;
 
 namespace RemoteFsClient.Services;
 
-/// <summary>Owns the one visible destructive-operation progress window.
-/// RemoteBridgeService calls this from pipe/worker threads; all WPF access is
-/// marshalled here, so remote operations never run on the UI thread.</summary>
+/// <summary>Owns the one visible long-running/destructive-operation progress window
+/// (delete, recursive chmod). RemoteBridgeService calls this from pipe/worker
+/// threads; all WPF access is marshalled here, so remote operations never run
+/// on the UI thread.</summary>
 public sealed class DeleteProgressService
 {
     private readonly Dispatcher _dispatcher;
 
     public DeleteProgressService(Dispatcher dispatcher) => _dispatcher = dispatcher;
 
-    public DeleteProgressHandle Begin(string site, string path, Action cancel) =>
+    public DeleteProgressHandle Begin(string site, string path, Action cancel,
+                                      DeleteProgressWindow.Operation operation = DeleteProgressWindow.Operation.Delete) =>
         _dispatcher.Invoke(() =>
         {
-            var window = new DeleteProgressWindow(site, path, cancel);
+            var window = new DeleteProgressWindow(site, path, cancel, operation);
             window.Show();
             return new DeleteProgressHandle(_dispatcher, window);
         });

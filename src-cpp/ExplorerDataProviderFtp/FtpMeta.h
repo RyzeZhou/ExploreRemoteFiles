@@ -325,6 +325,59 @@ inline BOOL FtpBridgeDelete(PCWSTR site, PCWSTR path, BOOL recursive, std::strin
     return ok;
 }
 
+// 递归修改权限：走常驻服务（与 DELETE 同一条路）。
+// 为什么不能在这里同步跑 CLI：属性页的「确定」在 Explorer 的 UI 线程上，树一大就整窗卡死，
+// 而且 RunCli 有 30 秒超时会把 CLI 直接杀掉（大目录必然超时，改到一半就断）。
+// 交给常驻服务后：遍历跑在它自己的线程上，带进度窗口和「取消」，我们只在完成回调里刷新视图。
+inline BOOL FtpBridgeChmod(PCWSTR site, PCWSTR path, PCWSTR modeOctal, BOOL recursive, std::string &response)
+{
+    response.clear();
+    const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    DWORD lastError = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (pipe != INVALID_HANDLE_VALUE) break;
+        lastError = GetLastError();
+        if (lastError != ERROR_PIPE_BUSY || !WaitNamedPipeW(pipeName, 5000)) break;
+    }
+    if (pipe == INVALID_HANDLE_VALUE)
+    {
+        ProbeLog(L"[TERM] resident chmod bridge unavailable site='%s' path='%s' err=%lu",
+                 site ? site : L"", path ? path : L"", lastError);
+        return FALSE;
+    }
+
+    BOOL sent = FtpBridgeWriteLine(pipe, L"CHMOD") &&
+                FtpBridgeWriteLine(pipe, site ? site : L"") &&
+                FtpBridgeWriteLine(pipe, path ? path : L"/") &&
+                FtpBridgeWriteLine(pipe, modeOctal ? modeOctal : L"644") &&
+                FtpBridgeWriteLine(pipe, recursive ? L"1" : L"0");
+    const ULONGLONG deadline = GetTickCount64() + 30ull * 60ull * 1000ull;
+    if (sent)
+    {
+        while (GetTickCount64() < deadline)
+        {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) break;
+            if (avail > 0)
+            {
+                char buf[1024]; DWORD got = 0;
+                if (!ReadFile(pipe, buf, sizeof(buf), &got, NULL) || got == 0) break;
+                response.append(buf, got);
+                if (response.find('\n') != std::string::npos) break;
+            }
+            else Sleep(25);
+        }
+    }
+    CloseHandle(pipe);
+    BOOL ok = sent && response.rfind("OK", 0) == 0;
+    ProbeLog(L"[TERM] resident chmod bridge site='%s' path='%s' mode=%s recursive=%d sent=%d ok=%d reply='%hs'",
+             site ? site : L"", path ? path : L"/", modeOctal ? modeOctal : L"?", recursive, sent, ok, response.c_str());
+    return ok;
+}
+
 // Tell the resident bridge service to drop its listing cache for one site
 // ("*" = all). Best effort and FIRE-AND-FORGET: if the service is not running
 // this is a no-op, and no reply is ever awaited — the bridge LIST cache TTL is

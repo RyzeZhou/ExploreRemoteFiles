@@ -25,6 +25,7 @@ public partial class AppSettingsWindow : Window
         ServiceLanguageBox.SelectedValue = Settings.ServiceLanguage;
         DefaultViewBox.SelectedValue = Settings.DefaultViewMode;
         SizeFormatBox.SelectedValue = Settings.SizeFormat;
+        TerminalBox.SelectedValue = AppSettings.NormalizeTerminal(Settings.Terminal);
         ApplyLanguage();
     }
 
@@ -48,7 +49,11 @@ public partial class AppSettingsWindow : Window
             : new[] { "自动单位（1.2 MB）", "固定 KB（1234 KB）" };
         for (int i = 0; i < SizeFormatBox.Items.Count && i < sizeNames.Length; i++)
             ((ComboBoxItem)SizeFormatBox.Items[i]).Content = sizeNames[i];
-        HintText.Text = Ui.T("CacheDirectoryHint") + Environment.NewLine + Environment.NewLine + Ui.T("RestartExplorerHint"); SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");
+        TerminalLabel.Text = Ui.T("TerminalGlobalLabel");
+        var termNames = new[] { Ui.T("TerminalWt"), Ui.T("TerminalPwsh"), Ui.T("TerminalVsCode") };
+        for (int i = 0; i < TerminalBox.Items.Count && i < termNames.Length; i++)
+            ((ComboBoxItem)TerminalBox.Items[i]).Content = termNames[i];
+        HintText.Text = Ui.T("CacheDirectoryHint") + Environment.NewLine + Ui.T("TerminalGlobalHint") + Environment.NewLine + Environment.NewLine + Ui.T("RestartExplorerHint"); SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");
     }
 
     private void OnBrowse(object sender, RoutedEventArgs e)
@@ -96,6 +101,7 @@ public partial class AppSettingsWindow : Window
         Settings.ServiceLanguage = (ServiceLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.DefaultViewMode = (DefaultViewBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "details";
         Settings.SizeFormat = (SizeFormatBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "auto";
+        Settings.Terminal = AppSettings.NormalizeTerminal((TerminalBox.SelectedItem as ComboBoxItem)?.Tag as string);
         try
         {
             Settings.Save();

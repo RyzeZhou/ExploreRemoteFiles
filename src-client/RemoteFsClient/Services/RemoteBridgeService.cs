@@ -125,6 +125,36 @@ public sealed class RemoteBridgeService : IDisposable
             return;
         }
 
+        // CHMOD：递归修改权限。与 DELETE 同形——桥接边界同步等待，但真正的遍历跑在
+        // 常驻服务里（自带进度窗口与「取消」）。此前 Explorer 属性页在 UI 线程同步等
+        // CLI，树一大就卡死，而且 RunCli 的 30 秒超时会把 CLI 直接杀掉。
+        if (string.Equals(operation, "CHMOD", StringComparison.Ordinal))
+        {
+            string? chmodSite = await reader.ReadLineAsync(token);
+            string? chmodPath = await reader.ReadLineAsync(token);
+            string? modeText = await reader.ReadLineAsync(token);
+            string? chmodRecursiveText = await reader.ReadLineAsync(token);
+            // 模式串是**八进制**（与 CLI 的 `chmod <site> <path> <mode>` 约定一致，
+            // C++ 侧用 %03o 格式化）。按十进制解析会把 700 变成 0o1274 —— 实测会把目录
+            // 改成 d-w-rwxr-T 并让后续遍历 Permission denied。
+            int chmodMode = 0;
+            bool modeOk = !string.IsNullOrWhiteSpace(modeText);
+            if (modeOk)
+            {
+                try { chmodMode = Convert.ToInt32(modeText!.Trim(), 8); }
+                catch { modeOk = false; }
+            }
+            if (string.IsNullOrWhiteSpace(chmodSite) || string.IsNullOrWhiteSpace(chmodPath) ||
+                !modeOk || chmodMode <= 0 || chmodMode > 0xFFF ||
+                (chmodRecursiveText is not "0" and not "1"))
+            {
+                await writer.WriteLineAsync("FAIL: invalid chmod request");
+                return;
+            }
+            await writer.WriteLineAsync(await ChmodAsync(chmodSite, chmodPath, chmodMode, chmodRecursiveText == "1"));
+            return;
+        }
+
         string? siteName = await reader.ReadLineAsync(token);
         string? path = await reader.ReadLineAsync(token);
         if (!string.Equals(operation, "LIST", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(siteName))
@@ -215,6 +245,80 @@ public sealed class RemoteBridgeService : IDisposable
             var fs = ProviderFactory.Get(connection);
             await Task.Run(() => ExecuteDelete(fs, path, recursive, cancellation.Token, progress), cancellation.Token);
             ClearListingCache(siteName);
+            progress?.Complete(true, false, null);
+            return "OK";
+        }
+        catch (OperationCanceledException)
+        {
+            progress?.Complete(false, true, null);
+            return "FAIL: cancelled";
+        }
+        catch (Exception ex)
+        {
+            ProviderFactory.Invalidate(siteName);
+            progress?.Complete(false, false, ex.Message);
+            return $"FAIL: {SanitizeBridgeError(ex.Message)}";
+        }
+        finally
+        {
+            if (gateHeld) _providerGate.Release();
+        }
+    }
+
+    /// <summary>递归（或单个）修改远程权限：与删除同构——自带进度窗口、可取消，
+    /// 完成后清掉该站点的目录缓存，并把结果回给 Explorer（OK / FAIL: …）。</summary>
+    private async Task<string> ChmodAsync(string siteName, string requestedPath, int mode, bool recursive)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        DeleteProgressHandle? progress = null;
+        bool gateHeld = false;
+        try
+        {
+            var connection = FindConnection(siteName);
+            var root = NormalizeRemotePath(connection.StartPath);
+            var path = NormalizeRemotePath(requestedPath);
+            if (!IsAtOrBelow(path, root))
+                return "FAIL: refusing to change permissions outside the configured site root";
+            if (path == root && !recursive)
+                return "FAIL: refusing to change the configured site root itself";
+
+            progress = _deleteProgress?.Begin(siteName, path,
+                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } },
+                DeleteProgressWindow.Operation.Chmod);
+            progress?.Update(0, 0, Ui.IsEnglish ? "Waiting for remote connection" : "等待远程连接");
+
+            await _providerGate.WaitAsync(cancellation.Token);
+            gateHeld = true;
+            var fs = ProviderFactory.Get(connection);
+
+            long seen = 0;
+            DateTime lastUi = DateTime.MinValue;
+            void OnItem(string current)
+            {
+                seen++;
+                var now = DateTime.UtcNow;
+                // 回报速率刻意压低（约 3 次/秒）：进度显示对后端只是开销，
+                // 大树上百万条目时高频回报会让 UI 与遍历线程互相抢时间。
+                if (now - lastUi < TimeSpan.FromMilliseconds(300)) return;
+                lastUi = now;
+                progress?.Update(seen, 0, current);
+            }
+
+            var result = await Task.Run(() => fs.SetPermissionsRecursive(path, mode, OnItem, cancellation.Token),
+                                        cancellation.Token);
+
+            ClearListingCache(siteName);
+            if (result.Partial)
+            {
+                // 部分失败必须让用户看见，不能在进度窗口上显示"完成"了事。
+                string detail = string.Join("; ", result.Failures.Take(5));
+                if (result.Failures.Count > 5) detail += $" (+{result.Failures.Count - 5})";
+                progress?.Complete(false, false,
+                    Ui.IsEnglish
+                        ? $"{result.Dirs} dirs / {result.Files} files updated, {result.Failures.Count} failed: {detail}"
+                        : $"已修改 {result.Dirs} 个目录 / {result.Files} 个文件，{result.Failures.Count} 项失败：{detail}");
+                return $"FAIL: partial ({result.Failures.Count} failed) {detail}";
+            }
             progress?.Complete(true, false, null);
             return "OK";
         }

@@ -18,6 +18,8 @@ typedef struct
     WCHAR user[64];
     WCHAR keyPath[260];      // PrivateKeyPath：让"打开终端"能复用已有密钥认证
     WCHAR startPath[256];
+    WCHAR terminal[16];      // 站点级终端：wt / powershell / vscode；空 = 跟随全局设置
+    WCHAR sshAlias[96];      // 绑定的现有 SSH Host 别名（%USERPROFILE%\.ssh\config）；空 = 未绑定
 } FTPSITE;
 
 inline SRWLOCK &FtpSitesLock()
@@ -66,8 +68,13 @@ inline void FtpSitesReload()
                 if (k == std::string::npos) return;
                 k = obj.find(':', k + pat.size());
                 if (k == std::string::npos) return;
-                k = obj.find('"', k);
-                if (k == std::string::npos) return;
+                ++k;
+                while (k < obj.size() && (obj[k] == ' ' || obj[k] == '\t')) ++k;
+                // 只接受字符串值。null / 数字 / true / false 必须原样放弃 ——
+                // 否则会一路找到下一个键的引号，把键名当成值：
+                // 实测 "PrivateKeyPath": null 曾被解析成 "StartPath"，
+                // 于是 ssh 收到 -i 'StartPath'（终端启动失败）。
+                if (k >= obj.size() || obj[k] != '"') return;
                 size_t e = obj.find('"', k + 1);
                 if (e == std::string::npos) return;
                 std::string val = obj.substr(k + 1, e - k - 1);
@@ -84,6 +91,8 @@ inline void FtpSitesReload()
             getStr("Username", s.user, 64);
             getStr("PrivateKeyPath", s.keyPath, 260);
             getStr("StartPath", s.startPath, 256);
+            getStr("Terminal", s.terminal, 16);
+            getStr("SshHostAlias", s.sshAlias, 96);
             if (!s.startPath[0]) StringCchCopyW(s.startPath, 256, L"/");
             {
                 // "Port": 2121  |  "Port": null

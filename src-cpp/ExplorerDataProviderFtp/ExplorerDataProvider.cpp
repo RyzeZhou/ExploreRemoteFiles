@@ -166,6 +166,32 @@ typedef struct
     WCHAR   szName[MAX_PATH];
 } ITEMDATA;
 
+// ── 冷目录的「正在载入…」占位条目 ────────────────────────────────────────────
+// 为什么需要：冷目录时若返回空枚举器，用户在慢目录（尤其 FTP 无流式列表）上会以为
+// "这个目录是空的"，这是误导。返回一个占位条目，用户一眼知道在加载。
+//
+// 保证（结构性，不靠"看名字猜"）：
+//   1) 身份标记是 **ITEMDATA.nLevel = ERF_LEVEL_PLACEHOLDER(-1)** —— 真实条目永远 >= 0，
+//      所以任何拿到 PIDL 的入口都能可靠识别它；
+//   2) 它**只在缓存未命中的分支里生成**，不写缓存、不发给远端、不参与传输/复制；
+//      预取完成 → SHCNE_UPDATEDIR → 重新枚举走暖路径 → 它自然消失（不存在"残留"路径）；
+//   3) 名字层的兜底检查：暖路径与缓存写入处若见到占位名，直接丢弃并记 `[PLACEHOLDER] STALE`，
+//      防止将来有人把它漏进真实数据（这是用户要求的"后端二次检查"）。
+//   4) 只读：属性返回 0（不可重命名/删除/拖动），右键与数据对象一律拒绝。
+#define ERF_LEVEL_PLACEHOLDER (-1)
+static BOOL IsPlaceholderLevel(int nLevel) { return nLevel == ERF_LEVEL_PLACEHOLDER; }
+
+// 占位条目的显示名（同时作为名字层兜底检查的依据）。
+static PCWSTR PlaceholderName()
+{
+    return ExplorerUiText(L"正在载入…（后台读取中）", L"Loading… (reading in background)");
+}
+static BOOL IsPlaceholderName(PCWSTR name)
+{
+    if (!name || !name[0]) return FALSE;
+    return 0 == StrCmpW(name, PlaceholderName());
+}
+
 static DWORD ModeFromString(const WCHAR *pszMode)
 {
     DWORD mode = 0;
@@ -631,6 +657,13 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
     if (FAILED(hr)) return hr;
     PathRemoveBackslash(component);
 
+    // 占位条目不是真实文件：绝不允许被解析成条目（否则 shell 会把它当对象缓存/绑定）。
+    if (IsPlaceholderName(component))
+    {
+        ProbeLog(L"[PLACEHOLDER] ParseDisplayName rejected name='%s'", component);
+        return E_INVALIDARG;
+    }
+
     // Level 0 is the site picker: the first path segment must be a site name.
     if (m_nLevel == 0)
     {
@@ -853,11 +886,20 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
         if (!haveSnap)
         {
             // Cold: never touch the network on the shell UI thread.
-            ProbeLog(L"[ENUM] async-empty miss site='%s' path='%s'", m_szSiteName, m_szRemotePath);
+            // 返回一个「正在载入…」占位条目而不是空目录：慢目录（尤其 FTP）上空目录会
+            // 让用户以为没有文件。占位条目的身份是 nLevel = -1（结构标记），属性为 0，
+            // 右键/数据对象/解析名一律拒绝；列表到达后重新枚举即消失。
+            ProbeLog(L"[ENUM] async-empty miss site='%s' path='%s' -> seed loading placeholder", m_szSiteName, m_szRemotePath);
             FtpPrefetchQuiet(m_szSiteName, m_szRemotePath, m_pidl);
             CFolderViewImplEnumIDList *penumEmpty = new (std::nothrow) CFolderViewImplEnumIDList(grfFlags, m_nLevel + 1, m_szSiteName, m_szRemotePath, this);
             if (!penumEmpty) return E_OUTOFMEMORY;
-            penumEmpty->SeedData(std::vector<ITEMDATA>());
+            {
+                std::vector<ITEMDATA> ph(1);
+                ph[0].nLevel = ERF_LEVEL_PLACEHOLDER;
+                ph[0].fIsFolder = FALSE;
+                StringCchCopy(ph[0].szName, ARRAYSIZE(ph[0].szName), PlaceholderName());
+                penumEmpty->SeedData(std::move(ph));
+            }
             HRESULT hrEmpty = penumEmpty->Initialize();
             if (SUCCEEDED(hrEmpty)) hrEmpty = penumEmpty->QueryInterface(IID_PPV_ARGS(ppenumIDList));
             penumEmpty->Release();
@@ -873,6 +915,14 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
             data.reserve(snapshot.size());
             for (auto const &it : snapshot)
             {
+                // 后端二次检查：占位名永远不该出现在真实快照里（它只在冷分支生成、从不入缓存）。
+                // 万一将来有人把它漏进来，这里丢弃并留证，绝不让它冒充真实文件。
+                if (IsPlaceholderName(it.szName))
+                {
+                    ProbeLog(L"[PLACEHOLDER] STALE dropped from warm snapshot site='%s' path='%s' name='%s'",
+                             m_szSiteName, m_szRemotePath, it.szName);
+                    continue;
+                }
                 m_recentItems.emplace_back(std::wstring(it.szName), it.fIsFolder);
                 ITEMDATA item = {};
                 item.nLevel = m_nLevel + 1;
@@ -1490,6 +1540,16 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
         if (FAILED(hr)) return hr;
 
         DWORD attrs = SFGAO_CANRENAME | SFGAO_CANDELETE | SFGAO_HASPROPSHEET;
+        // 占位条目没有任何可操作性：属性全 0 → 不可重命名/删除/复制/拖动，右键菜单也不会
+        // 为它出现。它是"加载中"的视觉提示，不是文件。
+        {
+            WCHAR phName[MAX_PATH] = {};
+            if (SUCCEEDED(_GetName(apidl[i], phName, ARRAYSIZE(phName))) && IsPlaceholderName(phName))
+            {
+                *rgfInOut = 0;
+                return S_OK;
+            }
+        }
         // Stage 1 (2026-09-12): advertise COPY only, on real items (not the
         // site picker). MOVE/LINK follow once Copy is verified end-to-end —
         // the previous one-shot attempt to add COPY+MOVE+LINK together broke
@@ -1529,6 +1589,17 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
 
     if (riid == IID_IContextMenu)
     {
+        // 占位条目不可操作：右键菜单、数据对象（复制/拖动）、属性页一律不给。
+        // 属性层已返回 0（不可重命名/删除），这里是第二道闸。
+        for (UINT i = 0; i < cidl; i++)
+        {
+            WCHAR phName[MAX_PATH] = {};
+            if (SUCCEEDED(_GetName(apidl[i], phName, ARRAYSIZE(phName))) && IsPlaceholderName(phName))
+            {
+                ProbeLog(L"[PLACEHOLDER] GetUIObjectOf refused (context menu) cidl=%u", cidl);
+                return E_INVALIDARG;
+            }
+        }
         // Probe (2026-09-02 freeze hunt): does the hang sit inside
         // SHCreateDefaultContextMenu or after it?
         ProbeLog(L"[MENU] GetUIObjectOf IContextMenu cidl=%u level=%d enter", cidl, m_nLevel);

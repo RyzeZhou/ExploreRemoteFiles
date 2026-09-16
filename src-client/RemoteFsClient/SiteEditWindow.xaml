@@ -1,36 +1,68 @@
 <Window x:Class="RemoteFsClient.SiteEditWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Height="420" Width="440" WindowStartupLocation="CenterOwner" ResizeMode="NoResize">
-    <Grid Margin="16">
-        <Grid.ColumnDefinitions><ColumnDefinition Width="100"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-        <Grid.RowDefinitions>
-            <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
-            <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <Grid.Resources>
-            <Style TargetType="TextBlock"><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Margin" Value="0,4"/></Style>
-            <Style TargetType="TextBox"><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Margin" Value="0,4"/><Setter Property="Padding" Value="2"/></Style>
-        </Grid.Resources>
+        Height="500" Width="480" WindowStartupLocation="CenterOwner" ResizeMode="NoResize">
+    <Grid Margin="12">
+        <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <TabControl x:Name="Tabs" Grid.Row="0">
+            <!-- ================= 站点 ================= -->
+            <TabItem x:Name="SiteTab">
+                <Grid Margin="12">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="110"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                        <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <Grid.Resources>
+                        <Style TargetType="TextBlock"><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Margin" Value="0,4"/></Style>
+                        <Style TargetType="TextBox"><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Margin" Value="0,4"/><Setter Property="Padding" Value="2"/></Style>
+                    </Grid.Resources>
 
-        <TextBlock x:Name="NameLabel"/><TextBox Grid.Column="1" x:Name="TbName"/>
-        <TextBlock x:Name="ProtocolLabel" Grid.Row="1"/>
-        <ComboBox Grid.Row="1" Grid.Column="1" x:Name="CbType" Margin="0,4" SelectionChanged="OnTypeChanged"><ComboBoxItem Content="sftp"/><ComboBoxItem Content="ftp"/><ComboBoxItem Content="ftps"/></ComboBox>
-        <TextBlock x:Name="HostLabel" Grid.Row="2"/><TextBox Grid.Row="2" Grid.Column="1" x:Name="TbHost"/>
-        <TextBlock x:Name="PortLabel" Grid.Row="3"/><TextBox Grid.Row="3" Grid.Column="1" x:Name="TbPort"/>
-        <TextBlock x:Name="UserLabel" Grid.Row="4"/><TextBox Grid.Row="4" Grid.Column="1" x:Name="TbUser"/>
-        <TextBlock x:Name="PathLabel" Grid.Row="5"/><TextBox Grid.Row="5" Grid.Column="1" x:Name="TbPath"/>
+                    <TextBlock x:Name="NameLabel"/><TextBox Grid.Column="1" x:Name="TbName"/>
+                    <TextBlock x:Name="ProtocolLabel" Grid.Row="1"/>
+                    <ComboBox Grid.Row="1" Grid.Column="1" x:Name="CbType" Margin="0,4" SelectionChanged="OnTypeChanged"><ComboBoxItem Content="sftp"/><ComboBoxItem Content="ftp"/><ComboBoxItem Content="ftps"/></ComboBox>
+                    <TextBlock x:Name="HostLabel" Grid.Row="2"/><TextBox Grid.Row="2" Grid.Column="1" x:Name="TbHost" TextChanged="OnIdentityChanged"/>
+                    <TextBlock x:Name="PortLabel" Grid.Row="3"/><TextBox Grid.Row="3" Grid.Column="1" x:Name="TbPort" TextChanged="OnIdentityChanged"/>
+                    <TextBlock x:Name="UserLabel" Grid.Row="4"/><TextBox Grid.Row="4" Grid.Column="1" x:Name="TbUser" TextChanged="OnIdentityChanged"/>
+                    <TextBlock x:Name="PathLabel" Grid.Row="5"/><TextBox Grid.Row="5" Grid.Column="1" x:Name="TbPath"/>
 
-        <TextBlock Grid.Row="6" x:Name="LblFtpUtf8"/>
-        <CheckBox Grid.Row="6" Grid.Column="1" x:Name="CbFtpUtf8" VerticalAlignment="Center" Margin="0,4"/>
+                    <TextBlock Grid.Row="6" x:Name="LblFtpUtf8"/>
+                    <CheckBox Grid.Row="6" Grid.Column="1" x:Name="CbFtpUtf8" VerticalAlignment="Center" Margin="0,4"/>
 
-        <TextBlock x:Name="PasswordLabel" Grid.Row="7"/>
-        <StackPanel Grid.Row="7" Grid.Column="1">
-            <PasswordBox x:Name="PbPassword" Margin="0,4" Padding="2"/>
-            <TextBlock x:Name="PwdHint" FontSize="11" Foreground="#666" TextWrapping="Wrap"/>
-        </StackPanel>
+                    <TextBlock x:Name="PasswordLabel" Grid.Row="7"/>
+                    <StackPanel Grid.Row="7" Grid.Column="1">
+                        <PasswordBox x:Name="PbPassword" Margin="0,4" Padding="2"/>
+                        <TextBlock x:Name="PwdHint" FontSize="11" Foreground="#666" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Grid>
+            </TabItem>
 
-        <StackPanel Grid.Row="8" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+            <!-- ================= 终端配置 ================= -->
+            <TabItem x:Name="TerminalTab">
+                <Grid Margin="12">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="110"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <Grid.Resources>
+                        <Style TargetType="TextBlock"><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Margin" Value="0,6"/></Style>
+                    </Grid.Resources>
+
+                    <TextBlock x:Name="TerminalProgramLabel"/>
+                    <ComboBox Grid.Column="1" Grid.ColumnSpan="2" x:Name="CbTerminal" Margin="0,6" SelectedValuePath="Tag"/>
+
+                    <TextBlock x:Name="SshBindingLabel" Grid.Row="1"/>
+                    <ComboBox Grid.Row="1" Grid.Column="1" x:Name="CbSshHost" Margin="0,6" SelectedValuePath="Tag" SelectionChanged="OnSshHostChanged"/>
+                    <Button Grid.Row="1" Grid.Column="2" x:Name="RefreshSshButton" Click="OnRefreshSsh" Padding="10,3" Margin="6,6,0,6"/>
+
+                    <TextBlock Grid.Row="2" Grid.ColumnSpan="3" x:Name="SshStatus" TextWrapping="Wrap" Foreground="#444" Margin="0,2,0,0"/>
+                    <TextBlock Grid.Row="3" Grid.ColumnSpan="3" x:Name="TerminalHint" TextWrapping="Wrap" Foreground="#666" Margin="0,10,0,0"/>
+                </Grid>
+            </TabItem>
+        </TabControl>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,4,0">
             <Button x:Name="SaveButton" Click="OnSave" Padding="16,4" Margin="0,0,8,0"/>
             <Button x:Name="CancelButton" IsCancel="True" Padding="16,4"/>
         </StackPanel>

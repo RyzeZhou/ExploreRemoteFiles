@@ -19,6 +19,13 @@ public sealed class AppSettings
     /// <summary>File-size column format: "auto" (Linux -h style) or "kb" (Windows style).</summary>
     public string SizeFormat { get; set; } = "auto";
 
+    /// <summary>
+    /// Default terminal program for the Explorer "Open terminal here" command:
+    /// wt | powershell | vscode. Sites may override this individually (connections.json: Terminal).
+    /// Stored in HKCU\Software\ExplorerRemoteFs\Terminal — the same value the shell extension reads.
+    /// </summary>
+    public string Terminal { get; set; } = "wt";
+
     public static string DefaultMetadataCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "MetadataCache");
     public static string DefaultFileCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "FileCache");
 
@@ -37,6 +44,7 @@ public sealed class AppSettings
                 EditorPath = NormalizeEditorPath(key?.GetValue("EditorPath") as string),
                 DefaultViewMode = NormalizeViewMode(key?.GetValue("DefaultViewMode") as string),
                 SizeFormat = NormalizeSizeFormat(key?.GetValue("SizeFormat") as string),
+                Terminal = NormalizeTerminal(key?.GetValue("Terminal") as string),
             };
         }
         catch { return new AppSettings(); }
@@ -57,6 +65,7 @@ public sealed class AppSettings
         key.SetValue("EditorPath", EditorPath, RegistryValueKind.String);
         key.SetValue("DefaultViewMode", NormalizeViewMode(DefaultViewMode), RegistryValueKind.String);
         key.SetValue("SizeFormat", NormalizeSizeFormat(SizeFormat), RegistryValueKind.String);
+        key.SetValue("Terminal", NormalizeTerminal(Terminal), RegistryValueKind.String);
     }
 
     public static string NormalizeDirectory(string? path, string fallback)
@@ -80,6 +89,14 @@ public sealed class AppSettings
     /// <summary>auto = human readable (1.2 MB); kb = Windows Explorer style (1234 KB).</summary>
     public static string NormalizeSizeFormat(string? format) =>
         string.Equals((format ?? "").Trim(), "kb", StringComparison.OrdinalIgnoreCase) ? "kb" : "auto";
+
+    /// <summary>wt (Windows Terminal) | powershell (console) | vscode (Remote-SSH).</summary>
+    public static string NormalizeTerminal(string? value) => (value ?? "").Trim().ToLowerInvariant() switch
+    {
+        "powershell" or "pwsh" => "powershell",
+        "vscode" or "code" => "vscode",
+        _ => "wt",
+    };
 
     public static string NormalizeLanguage(string? language) =>
         string.Equals(language, "en-US", StringComparison.OrdinalIgnoreCase) ? "en-US" : "zh-CN";
@@ -119,6 +136,26 @@ public static class Ui
             ["Confirm"] = ("确认", "Confirm"), ["DeletePrompt"] = ("删除站点「{0}」？（凭据管理器中的密码一并删除）", "Delete site '{0}'? Its stored password will also be removed."),
             ["SettingsSaved"] = ("应用设置已保存", "Application settings saved"),
             ["TrayManage"] = ("FTP 站点管理...", "FTP site manager..."), ["Exit"] = ("退出", "Exit"),
+
+            // ── 「终端配置」标签页（站点编辑） ──────────────────────────────
+            ["SiteTab"] = ("站点", "Site"),
+            ["TerminalTab"] = ("终端配置", "Terminal"),
+            ["TerminalProgram"] = ("默认终端程序", "Default terminal program"),
+            ["TerminalFollowGlobal"] = ("跟随全局设置（{0}）", "Follow global setting ({0})"),
+            ["TerminalWt"] = ("Windows Terminal", "Windows Terminal"),
+            ["TerminalPwsh"] = ("PowerShell 控制台", "PowerShell console"),
+            ["TerminalVsCode"] = ("VS Code（Remote-SSH）", "VS Code (Remote-SSH)"),
+            ["TerminalGlobalLabel"] = ("全局默认终端", "Global default terminal"),
+            ["TerminalGlobalHint"] = ("站点未单独指定时使用；站点的「终端配置」标签页可逐个覆盖。", "Used when a site does not override it; override per site on the Terminal tab."),
+            ["TerminalTabHint"] = ("右键站点或目录 →「在此打开终端」时使用的终端程序。FTP 站点没有 shell 通道，不提供此配置。", "Terminal program used by the context-menu command 'Open terminal here'. FTP sites have no shell channel and are not configurable here."),
+            ["SshBinding"] = ("绑定现有 SSH 连接", "Bind an existing SSH connection"),
+            ["SshBindingAuto"] = ("自动匹配（按主机 + 端口 + 用户名）", "Automatic (match host + port + user)"),
+            ["SshBindingHint"] = ("只列出与本站点主机、端口、用户名完全一致的 SSH 配置，避免登进错误的机器或账号；没有匹配项时会自动新建受管配置。", "Only SSH configs whose host, port, and user match this site are listed, so you never sign in to the wrong machine or account. When nothing matches, a managed entry is created automatically."),
+            ["SshBindingExcluded"] = ("已排除 {0} 项主机相同但端口/用户名不同的配置：{1}", "Excluded {0} config(s) with the same host but a different port or user: {1}"),
+            ["SshBindingNoConfig"] = ("未找到 %USERPROFILE%\\.ssh\\config，或其中没有可用的主机配置。", "No %USERPROFILE%\\.ssh\\config found, or it contains no usable host entries."),
+            ["SshBindingSelected"] = ("已绑定：{0}", "Bound: {0}"),
+            ["Refresh"] = ("刷新", "Refresh"),
+            ["TerminalNotSshCapable"] = ("仅 SFTP（SSH）站点可配置终端。", "Terminal options apply to SFTP (SSH) sites only."),
         };
 
     public static bool IsEnglish => string.Equals(_language, "en-US", StringComparison.OrdinalIgnoreCase);

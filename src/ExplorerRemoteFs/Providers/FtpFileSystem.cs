@@ -239,16 +239,19 @@ public sealed class FtpFileSystem : IRemoteFileSystem
     private static bool IsError(FluentFTP.FtpReply resp)
         => resp.Code is { } c && (c.StartsWith("4") || c.StartsWith("5"));
 
-    public ChmodRecursiveResult SetPermissionsRecursive(string path, int mode)
+    public ChmodRecursiveResult SetPermissionsRecursive(string path, int mode,
+        Action<string>? onItem = null, CancellationToken cancellation = default)
     {
         var failures = new List<string>();
         int dirs = 0, files = 0;
 
         // 起点本身也在范围内（chmod -R 的语义包含根目录）。
+        cancellation.ThrowIfCancellationRequested();
+        onItem?.Invoke(path);
         try { SetPermissions(path, mode); dirs++; }
         catch (Exception ex) { failures.Add($"{path}: {ex.Message}"); }
 
-        ChmodWalk(path, mode, failures, ref dirs, ref files);
+        ChmodWalk(path, mode, failures, ref dirs, ref files, onItem, cancellation);
         Utils.ShellLog.Write($"FTP chmod -R: {path} mode={Convert.ToString(mode, 8)} dirs={dirs} files={files} failed={failures.Count}");
         return new ChmodRecursiveResult(dirs, files, failures);
     }
@@ -256,24 +259,29 @@ public sealed class FtpFileSystem : IRemoteFileSystem
     // 与 SFTP 实现同形：目录与文件都改，符号链接跳过，单项失败只记录。
     // FTP 的 SITE CHMOD 支持度因服务器而异，失败清单因此尤其重要——
     // 用户必须能看出"哪些条目没改成"，而不是拿到一个笼统的成功。
-    private void ChmodWalk(string path, int mode, List<string> failures, ref int dirs, ref int files)
+    private void ChmodWalk(string path, int mode, List<string> failures, ref int dirs, ref int files,
+                           Action<string>? onItem, CancellationToken cancellation)
     {
+        cancellation.ThrowIfCancellationRequested();
         IReadOnlyList<RemoteEntry> entries;
         try { entries = List(path); }
         catch (Exception ex) { failures.Add($"{path}: {ex.Message}"); return; }
 
         foreach (var e in entries)
         {
+            cancellation.ThrowIfCancellationRequested();
             if (e.IsSymlink) continue;
             if (e.IsDirectory)
             {
                 // 同 SFTP：目录自身改成与否都要继续下探，否则一棵子树会被静默跳过。
+                onItem?.Invoke(e.Path);
                 try { SetPermissions(e.Path, mode); dirs++; }
                 catch (Exception ex) { failures.Add($"{e.Path}: {ex.Message}"); }
-                ChmodWalk(e.Path, mode, failures, ref dirs, ref files);
+                ChmodWalk(e.Path, mode, failures, ref dirs, ref files, onItem, cancellation);
             }
             else
             {
+                onItem?.Invoke(e.Path);
                 try { SetPermissions(e.Path, mode); files++; }
                 catch (Exception ex) { failures.Add($"{e.Path}: {ex.Message}"); }
             }

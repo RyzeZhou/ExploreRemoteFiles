@@ -241,11 +241,13 @@ public partial class MainWindow : Window
         to.Name = from.Name; to.Type = from.Type; to.Host = from.Host;
         to.Port = from.Port; to.Username = from.Username; to.PrivateKeyPath = from.PrivateKeyPath;
         to.StartPath = from.StartPath; to.FtpUseUtf8 = from.FtpUseUtf8;
+        to.Terminal = from.Terminal; to.SshHostAlias = from.SshHostAlias;
     }
 
     private static Models.SiteInfo Clone(Models.SiteInfo s) => new()
     { Name = s.Name, Type = s.Type, Host = s.Host, Port = s.Port, Username = s.Username,
-      Password = s.Password, PrivateKeyPath = s.PrivateKeyPath, StartPath = s.StartPath, FtpUseUtf8 = s.FtpUseUtf8 };
+      Password = s.Password, PrivateKeyPath = s.PrivateKeyPath, StartPath = s.StartPath, FtpUseUtf8 = s.FtpUseUtf8,
+      Terminal = s.Terminal, SshHostAlias = s.SshHostAlias };
 
     private string SuggestName()
     {

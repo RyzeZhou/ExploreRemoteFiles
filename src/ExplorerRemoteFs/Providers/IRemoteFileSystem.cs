@@ -47,8 +47,12 @@ public interface IRemoteFileSystem : IDisposable
     /// 递归修改目录树权限（chmod -R；mode 为 8 进制数字）。
     /// <b>目录与文件都会改</b>；符号链接<b>不跟随</b>（不通过链接改其目标权限）。
     /// 单个条目失败不中断整棵树，结果里带失败清单。
+    /// <paramref name="onItem"/> 每处理一个条目回调一次（当前路径），供进度窗口显示；
+    /// <paramref name="cancellation"/> 用于「取消」——取消后抛出 OperationCanceledException，
+    /// 已改过的条目保持已改状态（不做回滚，与 chmod -R 的语义一致）。
     /// </summary>
-    ChmodRecursiveResult SetPermissionsRecursive(string path, int mode);
+    ChmodRecursiveResult SetPermissionsRecursive(string path, int mode,
+        Action<string>? onItem = null, CancellationToken cancellation = default);
 
     /// <summary>
     /// 修改所有者/组（chown/chgrp）。user/group 传 null 表示不修改；数字或名字均可（

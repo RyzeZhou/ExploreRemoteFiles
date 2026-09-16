@@ -34,9 +34,11 @@ public sealed class RemoteEntry
 
     public string ModeDisplay => Mode ?? "";
 
-    public string OwnerDisplay => Owner ?? "";
+    /// <summary>所有者显示名：优先账户名（/etc/passwd 映射），取不到才退回数字 uid。</summary>
+    public string OwnerDisplay => !string.IsNullOrEmpty(Owner) ? Owner : (Uid >= 0 ? Uid.ToString() : "");
 
-    public string GroupDisplay => Group ?? "";
+    /// <summary>属组显示名：优先组名（/etc/group 映射），取不到才退回数字 gid。</summary>
+    public string GroupDisplay => !string.IsNullOrEmpty(Group) ? Group : (Gid >= 0 ? Gid.ToString() : "");
 
     public string SizeDisplay => IsDirectory ? "" : FormatSize(Size);
 

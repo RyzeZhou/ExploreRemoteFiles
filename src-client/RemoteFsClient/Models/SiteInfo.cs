@@ -17,6 +17,18 @@ public sealed class SiteInfo
     public string StartPath { get; set; } = "/";
     public bool FtpUseUtf8 { get; set; } = true;
 
+    /// <summary>站点级默认终端程序：null/空 = 跟随全局；wt / powershell / vscode。</summary>
+    public string? Terminal { get; set; }
+
+    /// <summary>绑定的现有 SSH Host 别名（%USERPROFILE%\.ssh\config）；null = 未绑定。</summary>
+    public string? SshHostAlias { get; set; }
+
+    /// <summary>本站点是否具备 SSH 通道（只有 SFTP/SCP 才有 shell 可用）。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsSshCapable => Type.StartsWith("sftp", StringComparison.OrdinalIgnoreCase)
+                             || Type.StartsWith("scp", StringComparison.OrdinalIgnoreCase);
+
+    [System.Text.Json.Serialization.JsonIgnore]
     public int EffectivePort => Port ?? (Type.StartsWith("sftp", StringComparison.OrdinalIgnoreCase) ? 22 : 21);
 
     public override string ToString() => Name;
