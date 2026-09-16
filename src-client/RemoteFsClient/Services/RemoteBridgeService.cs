@@ -14,7 +14,7 @@ public sealed class RemoteBridgeService : IDisposable
 {
     public const string PipeName = "ExplorerRemoteFs.Bridge.v1";
     private readonly Func<ErfNavigationRequest, Task>? _navigationHandler;
-    private readonly DeleteProgressService? _deleteProgress;
+    private readonly RemoteOperationQueueService? _operationQueue;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _providerGate = new(1, 1);
     private readonly object _listingCacheGate = new();
@@ -23,10 +23,10 @@ public sealed class RemoteBridgeService : IDisposable
     private static readonly TimeSpan CompletedListingCacheLifetime = TimeSpan.FromSeconds(3);
 
     public RemoteBridgeService(Func<ErfNavigationRequest, Task>? navigationHandler = null,
-                               DeleteProgressService? deleteProgress = null)
+                               RemoteOperationQueueService? operationQueue = null)
     {
         _navigationHandler = navigationHandler;
-        _deleteProgress = deleteProgress;
+        _operationQueue = operationQueue;
     }
 
     public void Start() => _listener ??= Task.WhenAll(
@@ -226,7 +226,7 @@ public sealed class RemoteBridgeService : IDisposable
     private async Task<string> DeleteAsync(string siteName, string requestedPath, bool recursive)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
-        DeleteProgressHandle? progress = null;
+        OperationHandle? progress = null;
         bool gateHeld = false;
         try
         {
@@ -236,7 +236,8 @@ public sealed class RemoteBridgeService : IDisposable
             if (!IsAtOrBelow(path, root) || path == root)
                 return "FAIL: refusing to delete the configured site root or a path outside it";
 
-            progress = _deleteProgress?.Begin(siteName, path,
+            progress = _operationQueue?.Begin(siteName, path,
+                RemoteOperationQueueWindow.OperationKind.Delete,
                 () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
             progress?.Update(0, 0, Ui.IsEnglish ? "Waiting for remote connection" : "等待远程连接");
 
@@ -270,7 +271,7 @@ public sealed class RemoteBridgeService : IDisposable
     private async Task<string> ChmodAsync(string siteName, string requestedPath, int mode, bool recursive)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
-        DeleteProgressHandle? progress = null;
+        OperationHandle? progress = null;
         bool gateHeld = false;
         try
         {
@@ -282,9 +283,9 @@ public sealed class RemoteBridgeService : IDisposable
             if (path == root && !recursive)
                 return "FAIL: refusing to change the configured site root itself";
 
-            progress = _deleteProgress?.Begin(siteName, path,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } },
-                DeleteProgressWindow.Operation.Chmod);
+            progress = _operationQueue?.Begin(siteName, path,
+                RemoteOperationQueueWindow.OperationKind.Chmod,
+                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
             progress?.Update(0, 0, Ui.IsEnglish ? "Waiting for remote connection" : "等待远程连接");
 
             await _providerGate.WaitAsync(cancellation.Token);
@@ -340,7 +341,7 @@ public sealed class RemoteBridgeService : IDisposable
     }
 
     private void ExecuteDelete(IRemoteFileSystem fs, string path, bool recursive,
-                               CancellationToken cancellation, DeleteProgressHandle? progress)
+                               CancellationToken cancellation, OperationHandle? progress)
     {
         var plan = new List<DeletePlanItem>();
         var lastUiUpdate = DateTime.MinValue;

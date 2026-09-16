@@ -29,7 +29,7 @@ public partial class App : System.Windows.Application
     private MainWindow? _manager;
     private RemoteBridgeService? _bridge;
     private TransferTaskService? _transfers;
-    private DeleteProgressService? _deleteProgress;
+    private RemoteOperationQueueService? _operationQueue;
     private bool _isExiting;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -37,6 +37,25 @@ public partial class App : System.Windows.Application
         base.OnStartup(e);
         Ui.SetLanguage(AppSettings.Load().ServiceLanguage);
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+        // 常驻服务必须有兜底：一个 WPF 异常（例如 XAML 绑定附加失败）默认会直接
+        // 终止进程 —— 实测过一次（进度条绑定到只读属性 → XamlParseException →
+        // 整个托盘服务连同桥接管道一起消失，资源管理器那边只看到连接被断开）。
+        // 这里记录并继续运行；真正"无法继续"的错误仍会通过 ErfLog 留下证据。
+        DispatcherUnhandledException += (_, args) =>
+        {
+            ErfLog($"Unhandled UI exception: {args.Exception}");
+            args.Handled = true;
+        };
+
+        // 自检开关：不建任何连接、不显示窗口，只把操作队列窗口的汇总/条目状态
+        // 算一遍并打印（见 QueueSelfTest）。给"汇总明细算得对不对"提供后端证据，
+        // 不必靠肉眼看窗口。必须在单实例/托盘之前返回。
+        if (e.Args.Any(a => string.Equals(a, "--queue-selftest", StringComparison.OrdinalIgnoreCase)))
+        {
+            Shutdown(QueueSelfTest.Run());
+            return;
+        }
         var erfAddress = GetArgumentValue(e.Args, "--open-erf");
         ErfNavigationRequest? pendingErfNavigation = null;
         if (erfAddress is not null)
@@ -104,13 +123,13 @@ public partial class App : System.Windows.Application
         _transfers.JobStarted += OnTransferJobStarted;
         _transfers.AllFinished += OnAllTransfersFinished;
         _transfers.Start();
-        _deleteProgress = new DeleteProgressService(Dispatcher);
+        _operationQueue = new RemoteOperationQueueService(Dispatcher);
         _manager = new MainWindow();
         _manager.AttachTasks(_transfers);
         _manager.Closing += OnManagerClosing;
         MainWindow = _manager;
         CreateTrayIcon();
-        _bridge = new RemoteBridgeService(QueueErfNavigationAsync, _deleteProgress);
+        _bridge = new RemoteBridgeService(QueueErfNavigationAsync, _operationQueue);
         _bridge.Start();
         ListenForShowRequests();
         if (pendingErfNavigation is not null)

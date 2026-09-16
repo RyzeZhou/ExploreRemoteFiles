@@ -172,6 +172,31 @@ public static class Ui
             ["ColOwnerId"] = ("所有者 ID（UID）", "Owner ID (UID)"),
             ["ColGroup"] = ("组", "Group"),
             ["ColGroupId"] = ("组 ID（GID）", "Group ID (GID)"),
+
+            // ── 远程操作队列窗口（删除 / 递归改权限） ──────────────────────
+            ["OpQueueTitle"] = ("操作队列：{0}", "Operation queue: {0}"),
+            ["OpQueueEmpty"] = ("暂无进行中的远程操作。", "No remote operation in progress."),
+            ["OpQueueRunning"] = ("{0} 项进行中，已完成 {1} 项。关闭窗口不会取消操作，请对具体条目点「取消」。",
+                                  "{0} in progress, {1} finished. Closing this window does not cancel an operation — use Cancel on the entry."),
+            ["OpQueueFinished"] = ("全部结束：成功 {0} 项，失败 {1} 项，取消 {2} 项。",
+                                   "All finished: {0} succeeded, {1} failed, {2} cancelled."),
+            ["OpQueueFailures"] = ("失败明细：{0}", "Failures: {0}"),
+            ["OpQueueCannotClose"] = ("还有操作在进行，先取消或等它结束再关闭。",
+                                      "Operations are still running. Cancel them or wait before closing."),
+            ["OpKindDelete"] = ("删除", "Delete"),
+            ["OpKindChmod"] = ("递归改权限", "Recursive permissions"),
+            ["OpCancel"] = ("取消", "Cancel"),
+            ["OpCancelAll"] = ("全部取消", "Cancel all"),
+            ["OpClose"] = ("关闭", "Close"),
+            ["OpCloseBlocked"] = ("关闭（进行中）", "Close (busy)"),
+            ["OpQueued"] = ("排队中…", "Queued…"),
+            ["OpWaiting"] = ("等待远程连接…", "Waiting for remote connection…"),
+            ["OpCancelling"] = ("正在取消…", "Cancelling…"),
+            ["OpDone"] = ("已完成", "Completed"),
+            ["OpCancelled"] = ("已取消（已改动的部分保留，不回滚）", "Cancelled (already applied changes are kept)"),
+            ["OpFailed"] = ("失败：{0}", "Failed: {0}"),
+            ["OpStatusDeleted"] = ("已删除 {0} / {1}：{2}", "Deleted {0} of {1}: {2}"),
+            ["OpStatusUpdated"] = ("已修改 {0} / {1}：{2}", "Updated {0} of {1}: {2}"),
         };
 
     public static bool IsEnglish => string.Equals(_language, "en-US", StringComparison.OrdinalIgnoreCase);

@@ -1,0 +1,69 @@
+<Window x:Class="RemoteFsClient.RemoteOperationQueueWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="520" Height="300" MinWidth="420" MinHeight="200"
+        ResizeMode="CanResize" WindowStartupLocation="Manual"
+        ShowInTaskbar="True" Topmost="False">
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,8">
+            <TextBlock x:Name="TitleText" FontWeight="SemiBold" FontSize="15"/>
+            <TextBlock x:Name="SummaryText" Foreground="#555" Margin="0,4,0,0" TextWrapping="Wrap"/>
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <ItemsControl x:Name="Entries">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Border BorderBrush="#E0E0E0" BorderThickness="0,0,0,1" Padding="0,8">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="{Binding KindLabel}" FontWeight="SemiBold"
+                                               Foreground="{Binding KindBrush}" Margin="0,0,8,0"/>
+                                    <TextBlock Text="{Binding Path}" TextTrimming="CharacterEllipsis"
+                                               ToolTip="{Binding Path}"/>
+                                </StackPanel>
+                                <Button Grid.Column="1" Content="{Binding CancelLabel}" Padding="10,2"
+                                        Click="OnCancelEntry" Tag="{Binding}"
+                                        IsEnabled="{Binding CanCancel, Mode=OneWay}"/>
+
+                                <!-- Value 在这里必须显式 OneWay：ProgressBar.Value 默认是
+                                     TwoWay 绑定，而 Percent 只有私有 setter —— 绑定附加时会直接抛
+                                     XamlParseException（实测把整个常驻服务进程带崩过）。
+                                     任何"只由后台线程回报"的只读属性都要显式 Mode=OneWay。 -->
+                                <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Height="12" Margin="0,6,0,0"
+                                             Minimum="0" Maximum="100"
+                                             Value="{Binding Percent, Mode=OneWay}"
+                                             IsIndeterminate="{Binding IsIndeterminate, Mode=OneWay}"/>
+
+                                <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Margin="0,4,0,0" Foreground="#555"
+                                           Text="{Binding Status}" TextTrimming="CharacterEllipsis"
+                                           ToolTip="{Binding Status}"/>
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button x:Name="CancelAllButton" Click="OnCancelAll" Padding="14,3" Margin="0,0,8,0"/>
+            <Button x:Name="CloseButton" Click="OnClose" Padding="14,3"/>
+        </StackPanel>
+    </Grid>
+</Window>
