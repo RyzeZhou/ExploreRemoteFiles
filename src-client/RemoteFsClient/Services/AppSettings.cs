@@ -109,7 +109,9 @@ public static class Ui
     private static readonly IReadOnlyDictionary<string, (string Zh, string En)> Text =
         new Dictionary<string, (string, string)>
         {
-            ["AppTitle"] = ("Explorer Remote FS - FTP 站点管理", "Explorer Remote FS - FTP Site Manager"),
+            ["AppTitle"] = ("易远传 - 远程站点管理", "Explorer Remote Files - Site Manager"),
+            ["ApplicationSettingsTitle"] = ("易远传 - 应用设置", "Explorer Remote Files - Application settings"),
+            ["EditSiteTitle"] = ("易远传 - 编辑站点", "Explorer Remote Files - Edit site"),
             ["New"] = ("新建站点", "New site"), ["Edit"] = ("编辑", "Edit"), ["Delete"] = ("删除", "Delete"),
             ["Settings"] = ("设置", "Settings"), ["Test"] = ("测试连接", "Test connection"),
             ["SiteDetails"] = ("站点详情", "Site details"), ["SiteSettings"] = ("站点设置", "Site settings"),
@@ -134,6 +136,11 @@ public static class Ui
             ["PasswordSaved"] = ("已保存（Windows 凭据管理器）", "Saved (Windows Credential Manager)"), ["PasswordMissing"] = ("未保存", "Not saved"),
             ["SharedYes"] = ("是（与 WinSCP 同名站点）", "Yes (same name as a WinSCP site)"), ["SharedNo"] = ("否", "No"),
             ["Confirm"] = ("确认", "Confirm"), ["DeletePrompt"] = ("删除站点「{0}」？（凭据管理器中的密码一并删除）", "Delete site '{0}'? Its stored password will also be removed."),
+            ["AppName"] = ("易远传", "Explorer Remote Files"),
+            ["TrayIdle"] = ("就绪", "Ready"),
+            ["TrayTransferring"] = ("正在传输 {0} 个文件", "Transferring {0} file(s)"),
+            ["TrayTransferError"] = ("传输出错", "Transfer error"),
+            ["TrayRemoteProblem"] = ("有站点连接异常", "A site connection is failing"),
             ["SettingsSaved"] = ("应用设置已保存", "Application settings saved"),
             ["TrayManage"] = ("FTP 站点管理...", "FTP site manager..."), ["Exit"] = ("退出", "Exit"),
 

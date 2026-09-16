@@ -31,7 +31,7 @@ public partial class AppSettingsWindow : Window
 
     private void ApplyLanguage()
     {
-        Title = Ui.T("ApplicationSettings");
+        Title = Ui.T("ApplicationSettingsTitle");
         WinScpPathLabel.Text = Ui.T("WinScpPath"); BrowseButton.Content = Ui.T("Browse");
         MetadataCachePathLabel.Text = Ui.T("MetadataCachePath"); FileCachePathLabel.Text = Ui.T("FileCachePath");
         BrowseMetadataCacheButton.Content = Ui.T("Browse"); BrowseFileCacheButton.Content = Ui.T("Browse");

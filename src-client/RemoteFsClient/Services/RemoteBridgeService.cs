@@ -15,6 +15,7 @@ public sealed class RemoteBridgeService : IDisposable
     public const string PipeName = "ExplorerRemoteFs.Bridge.v1";
     private readonly Func<ErfNavigationRequest, Task>? _navigationHandler;
     private readonly RemoteOperationQueueService? _operationQueue;
+    private readonly RemoteStatusService? _status;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _providerGate = new(1, 1);
     private readonly object _listingCacheGate = new();
@@ -23,10 +24,12 @@ public sealed class RemoteBridgeService : IDisposable
     private static readonly TimeSpan CompletedListingCacheLifetime = TimeSpan.FromSeconds(3);
 
     public RemoteBridgeService(Func<ErfNavigationRequest, Task>? navigationHandler = null,
-                               RemoteOperationQueueService? operationQueue = null)
+                               RemoteOperationQueueService? operationQueue = null,
+                               RemoteStatusService? status = null)
     {
         _navigationHandler = navigationHandler;
         _operationQueue = operationQueue;
+        _status = status;
     }
 
     public void Start() => _listener ??= Task.WhenAll(
@@ -121,6 +124,7 @@ public sealed class RemoteBridgeService : IDisposable
             }
 
             var result = await DeleteAsync(site, deleteRemotePath, recursiveText == "1");
+            _status?.ReportSite(site, result.StartsWith("OK", StringComparison.Ordinal));   // R 字母颜色
             await writer.WriteLineAsync(result);
             return;
         }
@@ -151,7 +155,9 @@ public sealed class RemoteBridgeService : IDisposable
                 await writer.WriteLineAsync("FAIL: invalid chmod request");
                 return;
             }
-            await writer.WriteLineAsync(await ChmodAsync(chmodSite, chmodPath, chmodMode, chmodRecursiveText == "1"));
+            var chmodResult = await ChmodAsync(chmodSite, chmodPath, chmodMode, chmodRecursiveText == "1");
+            _status?.ReportSite(chmodSite, chmodResult.StartsWith("OK", StringComparison.Ordinal));
+            await writer.WriteLineAsync(chmodResult);
             return;
         }
 
@@ -167,11 +173,13 @@ public sealed class RemoteBridgeService : IDisposable
         try
         {
             var response = await GetListingAsync(siteName, remotePath);
+            _status?.ReportSite(siteName, true);      // 能列出内容 = 该站点连接正常
             await writer.WriteAsync(response);
         }
         catch (Exception ex)
         {
             await writer.WriteLineAsync($"FAIL: {ex.Message.Replace('\r', ' ').Replace('\n', ' ')}");
+            _status?.ReportSite(siteName, false);   // 列不出来 = 该站点连接不正常（R 变红）
             if (!string.IsNullOrWhiteSpace(siteName)) ProviderFactory.Invalidate(siteName);
         }
     }

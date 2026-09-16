@@ -66,7 +66,7 @@ $hk='HKCU:\Software\Classes'
 # and site:/ parsing through this namespace registration.
 $desktopNs = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\$folder"
 New-Item -Path $desktopNs -Force | Out-Null
-Set-ItemProperty $desktopNs -Name '(default)' -Value 'FTP'
+Set-ItemProperty $desktopNs -Name '(default)' -Value '易远传'
 
 # Hide only this extension's own desktop icon: we write ONE value named by our
 # CLSID. Never `New-Item -Force` on this key -- measured 2026-09-14: before the
@@ -82,12 +82,14 @@ Set-ItemProperty $hideIcons -Name $folder -Value 1 -Type DWord
 
 # --- CLSID\folder: the NSE itself ---
 New-Item -Path "$hk\CLSID\$folder" -Force | Out-Null
-Set-ItemProperty "$hk\CLSID\$folder" -Name '(default)' -Value 'FTP'
+Set-ItemProperty "$hk\CLSID\$folder" -Name '(default)' -Value '易远传 (Explorer Remote Files)'
 New-Item -Path "$hk\CLSID\$folder\InprocServer32" -Force | Out-Null
 Set-ItemProperty "$hk\CLSID\$folder\InprocServer32" -Name '(default)' -Value $dll
 Set-ItemProperty "$hk\CLSID\$folder\InprocServer32" -Name ThreadingModel -Value 'Apartment'
 New-Item -Path "$hk\CLSID\$folder\DefaultIcon" -Force | Out-Null
-Set-ItemProperty "$hk\CLSID\$folder\DefaultIcon" -Name '(default)' -Value 'shell32.dll,-42'
+# 命名空间图标：用扩展 DLL 里的图标资源（id 101，见 ExplorerDataProvider.rc 的 IDI_ERF）。
+# 以前是 shell32.dll,-42（一把文件夹图标），与我们自己的产品图标对不上。
+Set-ItemProperty "$hk\CLSID\$folder\DefaultIcon" -Name '(default)' -Value ('"{0}",-101' -f $dll)
 New-Item -Path "$hk\CLSID\$folder\ShellFolder" -Force | Out-Null
 Set-ItemProperty "$hk\CLSID\$folder\ShellFolder" -Name Attributes -Value 0xA8000020 -Type DWord
 # pin to navigation pane (top-level entry, sibling of This PC)
@@ -123,7 +125,7 @@ Start-Process -FilePath "$InstallDir\client\RemoteFsClient.exe" -ArgumentList '-
 Write-Host "==> Registration done. Restarting Explorer..."
 
 Write-Host ""
-Write-Host "DONE. FTP should appear as a top-level entry in the navigation pane."
+Write-Host "DONE. 易远传 should appear as a top-level entry in the navigation pane."
 Write-Host "Next: add sites via the GUI client (client\RemoteFsClient.exe),"
 Write-Host "or create %APPDATA%\ExplorerRemoteFs\connections.json manually (see README.txt)."
 

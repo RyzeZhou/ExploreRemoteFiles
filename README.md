@@ -1,5 +1,7 @@
 # ExploreRemoteFiles (ERF)
 
+> 中文名 **易远传**（易 = Explorer 的 E，远 = Remote，传 = 传输；对应图标里的 E/R/F 三个字母）。
+
 > **把 WinSCP 的远程浏览、远程语义、远程打开/编辑与高效传输能力，无缝嵌进 Windows 资源管理器。**
 > 更技术化的定义：**A native Windows Shell namespace for SFTP / FTP, backed by a cross-filesystem transfer engine.**
 

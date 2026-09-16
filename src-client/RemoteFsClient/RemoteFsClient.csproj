@@ -2,6 +2,8 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- 易远传 ERF 图标。assets/erf.ico 由客户端自带的图标生成器导出（见 IconTool），可复现。 -->
+    <ApplicationIcon>..\..\assets\erf.ico</ApplicationIcon>
     <Nullable>enable</Nullable>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>

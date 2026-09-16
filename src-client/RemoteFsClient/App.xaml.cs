@@ -30,6 +30,7 @@ public partial class App : System.Windows.Application
     private RemoteBridgeService? _bridge;
     private TransferTaskService? _transfers;
     private RemoteOperationQueueService? _operationQueue;
+    private readonly RemoteStatusService _status = new();
     private bool _isExiting;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -54,6 +55,17 @@ public partial class App : System.Windows.Application
         if (e.Args.Any(a => string.Equals(a, "--queue-selftest", StringComparison.OrdinalIgnoreCase)))
         {
             Shutdown(QueueSelfTest.Run());
+            return;
+        }
+
+        // 图标生成器：导出静态 .ico（默认全绿，供资源管理器 / 将来的安装程序用）
+        // 与 3×3 状态对照图，让图标设计可复现、可复核。
+        // 用法：RemoteFsClient.exe --make-icon <输出目录>
+        int iconArg = Array.FindIndex(e.Args, a => string.Equals(a, "--make-icon", StringComparison.OrdinalIgnoreCase));
+        if (iconArg >= 0)
+        {
+            string outDir = e.Args.Length > iconArg + 1 ? e.Args[iconArg + 1] : ".";
+            Shutdown(IconTool.MakeIcons(outDir));
             return;
         }
         var erfAddress = GetArgumentValue(e.Args, "--open-erf");
@@ -124,12 +136,13 @@ public partial class App : System.Windows.Application
         _transfers.AllFinished += OnAllTransfersFinished;
         _transfers.Start();
         _operationQueue = new RemoteOperationQueueService(Dispatcher);
-        _manager = new MainWindow();
+
+        _manager = new MainWindow { Icon = _status.WindowIcon(48) };
         _manager.AttachTasks(_transfers);
         _manager.Closing += OnManagerClosing;
         MainWindow = _manager;
         CreateTrayIcon();
-        _bridge = new RemoteBridgeService(QueueErfNavigationAsync, _operationQueue);
+        _bridge = new RemoteBridgeService(QueueErfNavigationAsync, _operationQueue, _status);
         _bridge.Start();
         ListenForShowRequests();
         if (pendingErfNavigation is not null)
@@ -541,13 +554,15 @@ public partial class App : System.Windows.Application
         _trayMenu = new WinForms.ContextMenuStrip();
         _trayIcon = new WinForms.NotifyIcon
         {
-            Icon = Drawing.SystemIcons.Application,
-            Text = "Explorer Remote FS",
+            Icon = _status.TrayIcon(),
+            Text = Ui.T("AppName"),
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
         _trayIcon.DoubleClick += (_, _) => ShowTransfers();
         _trayIcon.BalloonTipClicked += (_, _) => ShowTransfers();
+        // 状态（R/F 两个字母的颜色）变了就换图标；事件可能来自后台线程，编组到 UI 线程。
+        _status.Changed += () => Dispatcher.BeginInvoke(UpdateTrayStatus);
         RefreshLocalizedShell();
     }
 
@@ -561,7 +576,26 @@ public partial class App : System.Windows.Application
             _trayMenu.Items.Add(new WinForms.ToolStripSeparator());
             _trayMenu.Items.Add(Ui.T("Exit"), null, (_, _) => ExitApplication());
         }
-        if (_trayIcon is not null) _trayIcon.Text = "Explorer Remote FS";
+        UpdateTrayStatus();
+    }
+
+    /// <summary>托盘：图标 = ERF 状态图标，提示文字 = 应用名 + 当前状态。
+    /// 标题栏的窗口图标也用同一套（见 MainWindow/子窗口设置）。</summary>
+    private void UpdateTrayStatus()
+    {
+        if (_trayIcon is null) return;
+        int running = _transfers?.RunningCount ?? 0;
+        _trayIcon.Icon = _status.TrayIcon(16);
+
+        string name = Ui.T("AppName");
+        string detail = _status.Transfer switch
+        {
+            ErfIcon.TransferState.Error => Ui.T("TrayTransferError"),
+            ErfIcon.TransferState.Active => Ui.T("TrayTransferring").Replace("{0}", Math.Max(running, 1).ToString()),
+            _ => Ui.T("TrayIdle"),
+        };
+        if (_status.Remote == ErfIcon.RemoteState.Problem) detail = Ui.T("TrayRemoteProblem") + " · " + detail;
+        _trayIcon.Text = name + " — " + detail;
     }
 
     private void ListenForShowRequests()
@@ -583,25 +617,18 @@ public partial class App : System.Windows.Application
         });
     }
 
-    /// <summary>Tray reflects transfer state: while jobs run the icon becomes a
-    /// transfer glyph and the tooltip counts them, so "something is happening"
-    /// is visible in Explorer's notification area; double-click / the menu item
-    /// jumps to the Transfers tab in the site manager.</summary>
+    /// 每来一个传输任务/每批结束都把状态交给 RemoteStatusService，
+    /// 托盘图标（R/F 颜色）与提示文字由 UpdateTrayStatus 统一刷新。
     private void UpdateTrayTransferState()
     {
-        if (_trayIcon is null) return;
-        int running = _transfers?.RunningCount ?? 0;
-        if (running > 0)
-        {
-            _trayIcon.Icon = BusyTransferIcon();
-            _trayIcon.Text = (Ui.IsEnglish ? "Explorer Remote FS — transferring " : "Explorer Remote FS — 正在传输 ")
-                             + running + (Ui.IsEnglish ? " file(s)" : " 个文件");
-        }
+        if (_transfers is null) { UpdateTrayStatus(); return; }
+        if (_transfers.RunningCount > 0)
+            _status.SetTransfer(ErfIcon.TransferState.Active);
+        else if (_transfers.Tasks.Any(t => t.IsFailed))
+            _status.SetTransfer(ErfIcon.TransferState.Error);
         else
-        {
-            _trayIcon.Icon = Drawing.SystemIcons.Application;
-            _trayIcon.Text = "Explorer Remote FS";
-        }
+            _status.SetTransfer(ErfIcon.TransferState.Idle);
+        UpdateTrayStatus();
     }
 
     /// <summary>No per-job balloon: copying a folder runs one job per file, so
@@ -622,7 +649,7 @@ public partial class App : System.Windows.Application
                          : $"{done} transfer(s) completed")
             : (notes > 0 ? $"{done} 个已完成 · {failed} 个失败 · {cancelled} 个已取消"
                          : $"{done} 个传输已完成");
-        _trayIcon.ShowBalloonTip(3000, "Explorer Remote FS", text,
+        _trayIcon.ShowBalloonTip(3000, Ui.T("AppName"), text,
             notes > 0 ? WinForms.ToolTipIcon.Warning : WinForms.ToolTipIcon.Info);
     }
 

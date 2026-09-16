@@ -558,23 +558,6 @@ static void PermHideApplyButton(HWND hDlg)
     }
 }
 
-// 属性页里的「复制路径」：把该项的远端路径放进剪贴板（右键菜单里早就有同名命令），
-// 并在按钮上给 1.2 秒反馈。路径在右键时已算好（PROPMETA::path），不触发任何网络访问。
-static void PermCopyPath(HWND hDlg)
-{
-    PROPMETA *pm = (PROPMETA*)GetWindowLongPtrW(hDlg, DWLP_USER);
-    if (!pm || !pm->path[0]) return;
-    CopyTextToClipboard(hDlg, pm->path);
-    SetDlgItemTextW(hDlg, 3044, ExplorerText(L"button.copied", L"已复制", L"Copied"));
-    SetTimer(hDlg, 1, 1200, NULL);
-}
-
-static void PermCopyPathFeedbackDone(HWND hDlg)
-{
-    KillTimer(hDlg, 1);
-    SetDlgItemTextW(hDlg, 3044, ExplorerText(L"button.copy_path", L"复制路径", L"Copy path"));
-}
-
 // 值框虽然只读，却是第一个可停靠控件：对话框一打开，焦点落在「名称」上，
 // 而 EDIT 拿到焦点会**全选**文本 —— 用户看到的是一个蓝底高亮的名字，
 // 像是"刚被选中准备改写"。这里把选择收起来（光标归 0），并把焦点交给对话框本身
@@ -808,7 +791,6 @@ static void LocalizePermissionDialog(HWND hDlg)
     SetDlgItemTextW(hDlg, IDC_PROP_MODIFIED, ExplorerText(L"property.modified", L"修改日期：", L"Modified:"));
     SetDlgItemTextW(hDlg, 3026, ExplorerText(L"property.new_owner", L"新所有者：", L"New owner:"));
     SetDlgItemTextW(hDlg, 3027, ExplorerText(L"property.new_group", L"新组：", L"New group:"));
-    SetDlgItemTextW(hDlg, 3044, ExplorerText(L"button.copy_path", L"复制路径", L"Copy path"));
     // 输入格式提示不写在正文里（用户要求去掉那一行），改挂 tooltip：见 PermAttachInputTooltip。
     SetDlgItemTextW(hDlg, IDC_PROP_PERMISSION_GROUP, ExplorerText(L"label.permissions", L"权限", L"Permissions"));
     SetDlgItemTextW(hDlg, IDC_PROP_OWNER_ROLE, ExplorerText(L"label.owner", L"所有者", L"Owner"));
@@ -857,7 +839,6 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
     case WM_COMMAND:
         if(HIWORD(wp)==BN_CLICKED && LOWORD(wp)>=3011 && LOWORD(wp)<=3019){ PermSyncChecksToOctal(hDlg); return TRUE; }
         if(HIWORD(wp)==EN_CHANGE && LOWORD(wp)==3022){ PermSyncOctalToChecks(hDlg); return TRUE; }
-        if(LOWORD(wp)==3044){ PermCopyPath(hDlg); return TRUE; }
         if(LOWORD(wp)==IDCANCEL){
             PROPMETA *pm=(PROPMETA*)GetWindowLongPtrW(hDlg,DWLP_USER);
             if(pm && pm->modeless) DestroyWindow(hDlg); else EndDialog(hDlg,IDCANCEL);
@@ -884,9 +865,6 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
                 if(pm->modeless) DestroyWindow(hDlg); else EndDialog(hDlg,IDOK);
             }
             return TRUE;}
-        break;
-    case WM_TIMER:
-        if (wp == 1) { PermCopyPathFeedbackDone(hDlg); return TRUE; }
         break;
     case WM_CTLCOLORSTATIC:
     {
@@ -2715,10 +2693,6 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         if(HIWORD(wp)==BN_CLICKED && LOWORD(wp)>=3011 && LOWORD(wp)<=3019){ PermSyncChecksToOctal(hDlg); return TRUE; }
         if(HIWORD(wp)==EN_CHANGE && LOWORD(wp)==3022){ PermSyncOctalToChecks(hDlg); return TRUE; }
-        if(LOWORD(wp)==3044){ PermCopyPath(hDlg); return TRUE; }
-        break;
-    case WM_TIMER:
-        if (wp == 1) { PermCopyPathFeedbackDone(hDlg); return TRUE; }
         break;
     case WM_CTLCOLORSTATIC:
     {

@@ -8,6 +8,18 @@ $nativeDll = Join-Path $nativeDir 'ExplorerDataProviderFtp.dll'
 New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
 Set-Location "$root\src-cpp\ExplorerDataProviderFtp"
 
+# 图标既是 DLL 的资源（IDI_ERF）也是客户端 exe 的图标；缺了就先生成一次。
+# 生成器在客户端里（IconTool），所以这一步是"先构建客户端拿到生成器，再导出图标"。
+$iconPath = Join-Path $root 'assets\erf.ico'
+if (-not (Test-Path $iconPath)) {
+    Write-Host '==> 0/4 生成 ERF 图标（assets/erf.ico）'
+    & dotnet build (Join-Path $root 'src-client\RemoteFsClient\RemoteFsClient.csproj') -c Debug | Out-Null
+    $gen = Join-Path $root 'src-client\RemoteFsClient\bin\Debug\net8.0-windows\RemoteFsClient.exe'
+    if (-not (Test-Path $gen)) { throw '编译客户端失败，拿不到图标生成器' }
+    & $gen --make-icon (Join-Path $root 'assets') | Out-Null
+    if (-not (Test-Path $iconPath)) { throw '图标生成失败' }
+}
+
 Write-Host '==> 1/4 Build C++ DLL'
 & powershell -NoProfile -ExecutionPolicy Bypass -File .\compile.ps1 -OutputPath $nativeDll
 if ($LASTEXITCODE -ne 0) { throw 'C++ compile failed' }

@@ -54,7 +54,7 @@ public partial class SiteEditWindow : Window
 
     private void ApplyLanguage()
     {
-        Title = Ui.IsEnglish ? "Edit site" : "编辑站点";
+        Title = Ui.T("EditSiteTitle");
         SiteTab.Header = Ui.T("SiteTab");
         TerminalTab.Header = Ui.T("TerminalTab");
         NameLabel.Text = Ui.T("Name"); ProtocolLabel.Text = Ui.T("Protocol"); HostLabel.Text = Ui.IsEnglish ? "Host" : "主机";

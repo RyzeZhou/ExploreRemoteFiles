@@ -44,6 +44,7 @@
 #define IDS_SETTING3_TT                 143
 
 #define IDD_NAMEBOX                     4001
+#define IDI_ERF                         101
 #define IDD_PERMBOX                     4000
 
 #define IDD_PERMPAGE                     4002
