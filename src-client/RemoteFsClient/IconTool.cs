@@ -90,7 +90,7 @@ internal static class IconTool
 
             // 把每个状态的托盘图标（16px）也导出，方便直接看"托盘里长什么样"
             var tray = Path.Combine(outDir, "erf-tray-states.png");
-            using (var sheet = new System.Drawing.Bitmap(4 * 3 * 9, 3 * 9 + 26))
+            using (var sheet = new System.Drawing.Bitmap(12 + 6 * 58, 96))
             using (var g = System.Drawing.Graphics.FromImage(sheet))
             {
                 g.Clear(System.Drawing.Color.FromArgb(0xF3, 0xF3, 0xF3));
@@ -103,7 +103,7 @@ internal static class IconTool
                     {
                         using var ic = ErfIcon.Render(16, ErfIcon.ColorFor(r), ErfIcon.ColorFor(t));
                         g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-                        g.DrawImage(ic, 4 + i * 54, 20, 48, 48);
+                        g.DrawImage(ic, 6 + i * 58, 40, 48, 48);
                         i++;
                     }
                 sheet.Save(tray, System.Drawing.Imaging.ImageFormat.Png);
