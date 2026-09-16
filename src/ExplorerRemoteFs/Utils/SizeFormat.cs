@@ -1,3 +1,7 @@
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
 namespace ExplorerRemoteFs.Utils;
 
 /// <summary>文件大小的显示口径。与扩展 DLL 的 <c>SizeFormat.h</c> 是**同一套规则**
@@ -24,6 +28,9 @@ public enum SizeFormatMode
 
 public static class SizeFormat
 {
+    [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern IntPtr StrFormatByteSizeW(long qdw, StringBuilder pszBuf, int cchBuf);
+
     private static readonly string[] SiUnits = { "kB", "MB", "GB", "TB", "PB" };
     private static readonly string[] BinUnits = { "KB", "MB", "GB", "TB", "PB" };
     private static readonly string[] IecUnits = { "KiB", "MiB", "GiB", "TiB", "PiB" };
@@ -67,11 +74,19 @@ public static class SizeFormat
         _ => "auto",
     };
 
-    /// <summary>格式化一个字节数。<paramref name="isFolder"/> 为真时返回 "-"（与列里一致）。</summary>
+    /// 格式化一个字节数。<paramref name="isFolder"/> 为真时返回 "-"（与列里一致）。
+    /// Auto = **交给 Windows 自己**（StrFormatByteSizeW，与资源管理器 Details/属性页同一套），
+    /// 于是 Win11 改成"自适应单位"后自动跟上。
     public static string Format(long bytes, SizeFormatMode mode = SizeFormatMode.Auto,
                                 bool isFolder = false)
     {
         if (isFolder) return "-";
+        if (mode == SizeFormatMode.Auto)
+        {
+            var buf = new StringBuilder(64);
+            if (StrFormatByteSizeW(bytes, buf, buf.Capacity) != IntPtr.Zero) return buf.ToString();
+            mode = SizeFormatMode.Iec;   // API 不可用：退回自己的二进制口径
+        }
         if (mode == SizeFormatMode.WholeKb) return $"{(bytes + 1023) / 1024} KB";
 
         double @base = mode == SizeFormatMode.Si ? 1000.0 : 1024.0;
@@ -90,7 +105,11 @@ public static class SizeFormat
     {
         if (isFolder) return "-";
         string human = Format(bytes, mode);
-        if (human.EndsWith(" B", StringComparison.Ordinal)) return human;   // 已经是字节数，别重复
+        // 判据与 C++ 侧一致：字符串里已出现精确数字（带或不带千位分隔）就算写过了 ——
+        // Windows 对 <1KB 会直接写 "41 字节"，此时再挂 "(41 B)" 就是重复。
+        if (human.Contains(bytes.ToString(), StringComparison.Ordinal) ||
+            human.Contains(bytes.ToString("N0"), StringComparison.Ordinal))
+            return human;
         return $"{human} ({bytes:N0} B)";
     }
 }

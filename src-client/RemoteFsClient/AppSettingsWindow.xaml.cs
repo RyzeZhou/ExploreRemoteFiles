@@ -49,11 +49,11 @@ public partial class AppSettingsWindow : Window
         // 后两项是给"要严格单位"的人用的：si = 1000 进制（kB/MB），iec = KiB/MiB。
         // 底层永远是精确字节数（属性页会把字节数一并显示），口径只影响显示。
         var sizeNames = Ui.IsEnglish
-            ? new[] { "Auto (1.0 MB — Explorer style, 1024-based)",
+            ? new[] { "Auto — same as Explorer (Windows formats it: 1.00 KB / 976 KB / 1.39 GB)",
                       "KB (1234 KB — whole KB, 1024-based)",
                       "SI (1.0 MB — 1000-based, like ls --si)",
                       "IEC (1.0 MiB — 1024-based, strict KiB/MiB)" }
-            : new[] { "自动单位（1.0 MB，1024 进制，与资源管理器一致）",
+            : new[] { "自动 —— 与资源管理器一致（交给 Windows 格式化：1.00 KB / 976 KB / 1.39 GB）",
                       "固定 KB（1234 KB，1024 进制，整 KB）",
                       "十进制（1.0 MB，1000 进制，同 ls --si / Nautilus）",
                       "IEC（1.0 MiB，1024 进制，严格 KiB/MiB）" };
