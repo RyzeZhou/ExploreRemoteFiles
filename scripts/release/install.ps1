@@ -1,4 +1,4 @@
-# ExplorerRemoteFs 安装脚本（当前用户，无需管理员）
+﻿# ExplorerRemoteFs 安装脚本（当前用户，无需管理员）
 # 用法：右键"使用 PowerShell 运行"，或
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 param(

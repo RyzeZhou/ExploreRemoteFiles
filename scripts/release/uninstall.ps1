@@ -1,4 +1,4 @@
-# ExplorerRemoteFs 卸载脚本（当前用户，无需管理员）
+﻿# ExplorerRemoteFs 卸载脚本（当前用户，无需管理员）
 # 用法：右键"使用 PowerShell 运行"，或
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1
 # 可选：-RemoveConfig 同时删除站点配置（%APPDATA%\ExplorerRemoteFs\connections.json）

@@ -1,4 +1,4 @@
-# 编译微软 Explorer Data Provider Sample 为 x64 DLL
+﻿# 编译微软 Explorer Data Provider Sample 为 x64 DLL
 $msvc = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207"
 $sdk = "C:\Program Files (x86)\Windows Kits\10"
 $sdkVer = "10.0.26100.0"
