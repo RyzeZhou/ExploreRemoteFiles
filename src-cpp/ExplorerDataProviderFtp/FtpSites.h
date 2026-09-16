@@ -20,6 +20,10 @@ typedef struct
     WCHAR startPath[256];
     WCHAR terminal[16];      // 站点级终端：wt / powershell / vscode；空 = 跟随全局设置
     WCHAR sshAlias[96];      // 绑定的现有 SSH Host 别名（%USERPROFILE%\.ssh\config）；空 = 未绑定
+    // 列顺序：9 个数字（0..8 的排列），第 i 位 = 显示列号 i 对应的语义属性号
+    // （0=名称 1=类型 2=大小 3=修改时间 4=权限 5=所有者 6=所有者ID 7=组 8=组ID）。
+    // 空/非法 = 默认 "012345678"。只影响新建或重置后的视图，Explorer 按文件夹记住用户拖后的顺序。
+    char  columnOrder[16];
 } FTPSITE;
 
 inline SRWLOCK &FtpSitesLock()
@@ -81,6 +85,23 @@ inline void FtpSitesReload()
                 int need = MultiByteToWideChar(CP_UTF8, 0, val.c_str(), -1, NULL, 0);
                 if (need > 0) MultiByteToWideChar(CP_UTF8, 0, val.c_str(), -1, out, cch);
             };
+            // 同上，但保留窄字符串（列顺序是纯 ASCII 数字串，不需要转宽字符）。
+            auto getNarrow = [&](const char *key, char *out, UINT cch)
+            {
+                std::string pat = std::string("\"") + key + "\"";
+                size_t k = obj.find(pat);
+                if (k == std::string::npos) return;
+                k = obj.find(':', k + pat.size());
+                if (k == std::string::npos) return;
+                ++k;
+                while (k < obj.size() && (obj[k] == ' ' || obj[k] == '\t')) ++k;
+                if (k >= obj.size() || obj[k] != '"') return;    // 只接受字符串值（同 getStr）
+                size_t e = obj.find('"', k + 1);
+                if (e == std::string::npos) return;
+                std::string val = obj.substr(k + 1, e - k - 1);
+                if (val.size() >= cch) val.resize(cch - 1);
+                memcpy(out, val.c_str(), val.size() + 1);
+            };
 
             FTPSITE s = {}; s.port = 0;
             getStr("Name", s.name, 64);
@@ -93,6 +114,7 @@ inline void FtpSitesReload()
             getStr("StartPath", s.startPath, 256);
             getStr("Terminal", s.terminal, 16);
             getStr("SshHostAlias", s.sshAlias, 96);
+            getNarrow("ColumnOrder", s.columnOrder, ARRAYSIZE(s.columnOrder));
             if (!s.startPath[0]) StringCchCopyW(s.startPath, 256, L"/");
             {
                 // "Port": 2121  |  "Port": null

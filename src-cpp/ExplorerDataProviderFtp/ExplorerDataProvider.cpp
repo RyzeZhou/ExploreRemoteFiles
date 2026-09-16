@@ -20,6 +20,7 @@
 #include <time.h>
 #include "FtpMeta.h"
 #include "FtpSites.h"
+#include "ColumnModel.h"
 
 #include "resource.h"
 #include "Utils.h"
@@ -133,6 +134,10 @@ private:
     PCFVITEMID _IsValid(PCUIDLIST_RELATIVE pidl);
 
     HRESULT _GetColumnDisplayName(PCUITEMID_CHILD pidl, const PROPERTYKEY* pkey, VARIANT* pv, WCHAR* pszRet, UINT cch);
+
+    // 显示列号 -> 语义属性号（站点自定义列顺序的翻译入口）。越界返回 -1，
+    // Explorer 靠这个知道"没有更多列"。列宽/表头/取值/排序/SCID 全部走它。
+    int SemanticColumn(UINT iColumn) const;
 
     long                m_cRef;
     int                 m_nLevel;
@@ -1158,10 +1163,10 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
     else
     {
         // Compare child ids by column data (lParam & SHCIDS_COLUMNMASK).
-        // Column model matches GetDetailsOf: 0=Name 1=Type 2=Permissions
-        // 3=Owner 4=Group 5=Size 6=Modified (level >=1, remote directory),
-        // or 0=Name 1=Host 2=Protocol 3=Port 4=User 5=Start Path (level 0,
-        // the connection picker — not a remote directory).
+        // 列号先经 SemanticColumn 翻译成"语义属性号"（站点可自定义显示顺序）：
+        // level >=1 的语义号 0=名称 1=类型 2=大小 3=修改时间 4=权限 5=所有者
+        // 6=所有者ID 7=组 8=组ID；level 0（连接选择器）列固定：0=名称 1=主机
+        // 2=协议 3=端口 4=用户 5=起始路径。
         WCHAR name1[MAX_PATH] = {}, name2[MAX_PATH] = {};
         if (FAILED(_GetName(pidl1, name1, ARRAYSIZE(name1))) ||
             FAILED(_GetName(pidl2, name2, ARRAYSIZE(name2))))
@@ -1218,12 +1223,12 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
                 return ResultFromShort(m1.fIsFolder ? -1 : 1);
             }
 
-            switch (lParam & SHCIDS_COLUMNMASK)
+            switch (SemanticColumn((UINT)(lParam & SHCIDS_COLUMNMASK)))
             {
-            case 0: // Name -- natural (number-aware) order.
+            case 0: // 名称 -- natural (number-aware) order.
                 cmp = StrCmpLogicalW(name1, name2);
                 break;
-            case 1: // Type -- friendly type name, tie-break by name.
+            case 1: // 类型 -- friendly type name, tie-break by name.
             {
                 WCHAR t1[128] = {}, t2[128] = {};
                 GetFriendlyType(name1, m1.fIsFolder, t1, ARRAYSIZE(t1));
@@ -1232,7 +1237,19 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
                 if (!cmp) cmp = StrCmpLogicalW(name1, name2);
                 break;
             }
-            case 2: // Permissions (Linux mode string).
+            case 2: // 大小.
+                if (m1.dwSize != m2.dwSize)
+                    cmp = (m1.dwSize < m2.dwSize) ? -1 : 1;
+                else
+                    cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 3: // 修改时间.
+                if (m1.dwMtime != m2.dwMtime)
+                    cmp = (m1.dwMtime < m2.dwMtime) ? -1 : 1;
+                else
+                    cmp = StrCmpLogicalW(name1, name2);
+                break;
+            case 4: // 权限 (Linux mode string).
             {
                 WCHAR p1[16] = {}, p2[16] = {};
                 FormatMode(m1.dwMode, m1.fIsFolder, m1.fIsSymlink, p1, ARRAYSIZE(p1));
@@ -1241,35 +1258,23 @@ HRESULT CFolderViewImplFolder::CompareIDs(LPARAM lParam, PCUIDLIST_RELATIVE pidl
                 if (!cmp) cmp = StrCmpLogicalW(name1, name2);
                 break;
             }
-            case 3: // Owner.
+            case 5: // 所有者.
                 cmp = StrCmpLogicalW(m1.szOwner, m2.szOwner);
                 if (!cmp) cmp = StrCmpLogicalW(name1, name2);
                 break;
-            case 4: // UID.
+            case 6: // 所有者 ID.
                 if (m1.dwUid != m2.dwUid)
                     cmp = (m1.dwUid < m2.dwUid) ? -1 : 1;
                 else
                     cmp = StrCmpLogicalW(name1, name2);
                 break;
-            case 5: // Group.
+            case 7: // 组.
                 cmp = StrCmpLogicalW(m1.szGroup, m2.szGroup);
                 if (!cmp) cmp = StrCmpLogicalW(name1, name2);
                 break;
-            case 6: // GID.
+            case 8: // 组 ID.
                 if (m1.dwGid != m2.dwGid)
                     cmp = (m1.dwGid < m2.dwGid) ? -1 : 1;
-                else
-                    cmp = StrCmpLogicalW(name1, name2);
-                break;
-            case 7: // Size.
-                if (m1.dwSize != m2.dwSize)
-                    cmp = (m1.dwSize < m2.dwSize) ? -1 : 1;
-                else
-                    cmp = StrCmpLogicalW(name1, name2);
-                break;
-            case 8: // Modified.
-                if (m1.dwMtime != m2.dwMtime)
-                    cmp = (m1.dwMtime < m2.dwMtime) ? -1 : 1;
                 else
                     cmp = StrCmpLogicalW(name1, name2);
                 break;
@@ -2008,6 +2013,32 @@ static BOOL GetFriendlyType(PCWSTR name, BOOL fIsFolder, PWSTR out, UINT cch)
     return TRUE;
 }
 
+// ── 列顺序：语义属性号（站点设置 ColumnOrder）────────────────────────────────
+// 翻译表与宽度表在 ColumnModel.h（纯逻辑，可脱离 shell 单独编译测试）。
+// 非法值整体回退默认；列宽/表头/取值/排序/MapColumnToSCID 共用同一个入口。
+static void ColumnOrderForSite(PCWSTR siteName, int out[ERF_COLUMN_COUNT])
+{
+    const FTPSITE *s = (siteName && siteName[0]) ? FtpSiteFind(siteName) : NULL;
+    ErfParseColumnOrder(s ? s->columnOrder : "", out);
+}
+
+// 站点设置的原始串（空 = 默认），只用于日志。
+static const char *FtpSiteColumnOrderSpec(PCWSTR siteName)
+{
+    const FTPSITE *s = (siteName && siteName[0]) ? FtpSiteFind(siteName) : NULL;
+    return (s && s->columnOrder[0]) ? s->columnOrder : ErfDefaultColumnOrder;
+}
+
+int CFolderViewImplFolder::SemanticColumn(UINT iColumn) const
+{
+    // 站点选择器（level 0）是连接管理器，列固定、不可自定义。
+    if (m_nLevel == 0) return (iColumn < 6) ? (int)iColumn : -1;
+    if (iColumn >= ERF_COLUMN_COUNT) return -1;
+    int order[ERF_COLUMN_COUNT];
+    ColumnOrderForSite(m_szSiteName, order);
+    return order[iColumn];
+}
+
 HRESULT CFolderViewImplFolder::GetDefaultColumnState(UINT iColumn, SHCOLSTATEF *pcsFlags)
 {
     if (m_nLevel == 0)
@@ -2018,17 +2049,21 @@ HRESULT CFolderViewImplFolder::GetDefaultColumnState(UINT iColumn, SHCOLSTATEF *
         else                   *pcsFlags |= SHCOLSTATE_TYPE_STR;
         return S_OK;
     }
-    if (iColumn >= 9) return E_INVALIDARG;
+    int sem = SemanticColumn(iColumn);
+    if (sem < 0) return E_INVALIDARG;
     *pcsFlags = SHCOLSTATE_ONBYDEFAULT;
-    if (iColumn == 0)          *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Name
-    else if (iColumn == 1)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Type
-    else if (iColumn == 2)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Permissions
-    else if (iColumn == 3)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Owner
-    else if (iColumn == 4)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // UID
-    else if (iColumn == 5)     *pcsFlags |= SHCOLSTATE_TYPE_STR;   // Group
-    else if (iColumn == 6)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // GID
-    else if (iColumn == 7)     *pcsFlags |= SHCOLSTATE_TYPE_INT;   // Size
-    else if (iColumn == 8)     *pcsFlags |= SHCOLSTATE_TYPE_DATE;  // Modified
+    switch (sem)
+    {
+    case 0:  *pcsFlags |= SHCOLSTATE_TYPE_STR;  break;   // 名称
+    case 1:  *pcsFlags |= SHCOLSTATE_TYPE_STR;  break;   // 类型
+    case 2:  *pcsFlags |= SHCOLSTATE_TYPE_INT;  break;   // 大小
+    case 3:  *pcsFlags |= SHCOLSTATE_TYPE_DATE; break;   // 修改时间
+    case 4:  *pcsFlags |= SHCOLSTATE_TYPE_STR;  break;   // 权限
+    case 5:  *pcsFlags |= SHCOLSTATE_TYPE_STR;  break;   // 所有者
+    case 6:  *pcsFlags |= SHCOLSTATE_TYPE_INT;  break;   // 所有者 ID
+    case 7:  *pcsFlags |= SHCOLSTATE_TYPE_STR;  break;   // 组
+    default: *pcsFlags |= SHCOLSTATE_TYPE_INT;  break;   // 组 ID
+    }
     return S_OK;
 }
 
@@ -2174,11 +2209,24 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
 {
     PROPERTYKEY key;
     HRESULT hr = MapColumnToSCID(iColumn, &key);
-    pDetails->cxChar = 24;
+    // 列宽按**语义属性号**给（宽度表见 ColumnModel.h）：站点改了列顺序，
+    // 宽度跟着那一列走，不会出现"某一列宽得离谱、另一列正常"的错位。
+    pDetails->cxChar = ErfColumnWidthChars(SemanticColumn(iColumn), m_nLevel == 0);
     WCHAR szRet[MAX_PATH];
 
     if (!pidl)
     {
+        // 每个视图取一次列头，把生效的列顺序写进探针日志：
+        // 列宽/表头/排序一旦错位，先看这一行就能判断是不是列顺序没生效。
+        if (m_nLevel >= 1 && iColumn == 0)
+        {
+            int order[ERF_COLUMN_COUNT];
+            ColumnOrderForSite(m_szSiteName, order);
+            ProbeLog(L"[COLORDER] site='%s' spec='%S' -> %d %d %d %d %d %d %d %d %d",
+                     m_szSiteName, FtpSiteColumnOrderSpec(m_szSiteName),
+                     order[0], order[1], order[2], order[3], order[4],
+                     order[5], order[6], order[7], order[8]);
+        }
         // No item means we're returning information about the column itself.
         // The FTP root (level 0) is a CONNECTION PICKER, not a remote
         // directory — it gets its own column set describing the connection.
@@ -2217,7 +2265,8 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
         }
         else
         {
-            switch (iColumn)
+            // 表头按**语义属性号**取，站点自定义列顺序后表头跟着列走。
+            switch (SemanticColumn(iColumn))
             {
             case 0:
                 pDetails->fmt = LVCFMT_LEFT;
@@ -2228,32 +2277,32 @@ HRESULT CFolderViewImplFolder::GetDetailsOf(PCUITEMID_CHILD pidl,
                 hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.type",L"类型",L"Type"));
                 break;
             case 2:
-                pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.permissions",L"权限",L"Permissions"));
-                break;
-            case 3:
-                pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.owner",L"所有者",L"Owner"));
-                break;
-            case 4:
-                pDetails->fmt = LVCFMT_RIGHT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.uid",L"UID",L"UID"));
-                break;
-            case 5:
-                pDetails->fmt = LVCFMT_LEFT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.group",L"组",L"Group"));
-                break;
-            case 6:
-                pDetails->fmt = LVCFMT_RIGHT;
-                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.gid",L"GID",L"GID"));
-                break;
-            case 7:
                 pDetails->fmt = LVCFMT_RIGHT;
                 hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.size",L"大小",L"Size"));
                 break;
-            case 8:
+            case 3:
                 pDetails->fmt = LVCFMT_LEFT;
                 hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.modified",L"修改日期",L"Modified"));
+                break;
+            case 4:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.permissions",L"权限",L"Permissions"));
+                break;
+            case 5:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.owner",L"所有者",L"Owner"));
+                break;
+            case 6:
+                pDetails->fmt = LVCFMT_RIGHT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.uid",L"UID",L"UID"));
+                break;
+            case 7:
+                pDetails->fmt = LVCFMT_LEFT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.group",L"组",L"Group"));
+                break;
+            case 8:
+                pDetails->fmt = LVCFMT_RIGHT;
+                hr = StringCchCopy(szRet, ARRAYSIZE(szRet), ExplorerText(L"column.gid",L"GID",L"GID"));
                 break;
             default:
                 // GetDetailsOf is called with increasing column indices until failure.
@@ -2307,17 +2356,19 @@ HRESULT CFolderViewImplFolder::MapColumnToSCID(UINT iColumn, PROPERTYKEY *pkey)
     }
     else
     {
-        switch (iColumn)
+        // 语义属性号 -> PROPERTYKEY。Explorer 用它做分组/排序/视图状态的标识，
+        // 所以"列顺序"只影响显示位置，不影响某一列的身份。
+        switch (SemanticColumn(iColumn))
         {
-        case 0:  *pkey = PKEY_ItemNameDisplay; break;
-        case 1:  *pkey = PKEY_Remote_Type; break;
-        case 2:  *pkey = PKEY_Remote_Permissions; break;
-        case 3:  *pkey = PKEY_Remote_Owner; break;
-        case 4:  *pkey = PKEY_Remote_OwnerUid; break;
-        case 5:  *pkey = PKEY_Remote_Group; break;
-        case 6:  *pkey = PKEY_Remote_GroupGid; break;
-        case 7:  *pkey = PKEY_Remote_Size; break;
-        case 8:  *pkey = PKEY_Remote_Modified; break;
+        case 0:  *pkey = PKEY_ItemNameDisplay;  break;
+        case 1:  *pkey = PKEY_Remote_Type;      break;
+        case 2:  *pkey = PKEY_Remote_Size;      break;
+        case 3:  *pkey = PKEY_Remote_Modified;  break;
+        case 4:  *pkey = PKEY_Remote_Permissions; break;
+        case 5:  *pkey = PKEY_Remote_Owner;     break;
+        case 6:  *pkey = PKEY_Remote_OwnerUid;  break;
+        case 7:  *pkey = PKEY_Remote_Group;     break;
+        case 8:  *pkey = PKEY_Remote_GroupGid;  break;
         default: hr = E_FAIL; break;
         }
     }

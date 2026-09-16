@@ -1,4 +1,4 @@
-# Build a development install directory: C++ DLL + self-contained CLI/GUI + scripts
+﻿# Build a development install directory: C++ DLL + self-contained CLI/GUI + scripts
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -16,8 +16,14 @@ Write-Host '==> 2/4 Prepare install directory'
 $pkg = Join-Path $distDir 'ExplorerRemoteFs-win-x64'
 $cliOut = Join-Path $pkg 'cli'
 $clientOut = Join-Path $pkg 'client'
-Remove-Item $pkg -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Path $pkg | Out-Null
+New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+# 清空而不是删除目录本身：如果某个进程把这个目录当成当前工作目录，
+# Remove-Item 整个目录会失败（"being used by another process"，实测），
+# 而删除里面的内容是成功的。清不干净就报错，绝不留下昨天的 DLL 混进包里。
+Get-ChildItem $pkg -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+if (Get-ChildItem $pkg -Force) {
+    throw "无法清空 $pkg —— 有进程仍占用其中的文件（先关掉资源管理器/客户端再重试）。"
+}
 Copy-Item $nativeDll $pkg
 Copy-Item "$root\scripts\release\install.ps1", "$root\scripts\release\uninstall.ps1", "$root\scripts\release\README.txt", "$root\scripts\release\explorer-translations.yaml", "$root\scripts\release\explorer-translations.example.yaml" $pkg
 

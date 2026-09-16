@@ -45,5 +45,14 @@ public sealed class ConnectionConfig
     /// </summary>
     public string? SshHostAlias { get; set; }
 
+    /// <summary>
+    /// 列顺序：9 个数字（0..8 的排列），第 i 位 = 显示列号 i 对应的语义属性号
+    /// （0=名称 1=类型 2=大小 3=修改时间 4=权限 5=所有者 6=所有者ID 7=组 8=组ID）。
+    /// null/空 = 默认 "012345678"。
+    /// 注意：本类还被 CLI 的 add/编辑流程整体 Load→Save 回写（见 CmdAdd），
+    /// 新增站点字段必须同时加到这里，否则会被静默丢掉。
+    /// </summary>
+    public string? ColumnOrder { get; set; }
+
     public int EffectivePort => Port ?? (Type.StartsWith("sftp", StringComparison.OrdinalIgnoreCase) ? 22 : 21);
 }

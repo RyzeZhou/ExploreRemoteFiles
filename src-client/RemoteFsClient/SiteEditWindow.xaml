@@ -60,6 +60,22 @@
                     <TextBlock Grid.Row="3" Grid.ColumnSpan="3" x:Name="TerminalHint" TextWrapping="Wrap" Foreground="#666" Margin="0,10,0,0"/>
                 </Grid>
             </TabItem>
+
+            <!-- ================= 列显示 ================= -->
+            <TabItem x:Name="ColumnTab">
+                <Grid Margin="12">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock x:Name="ColumnHint" TextWrapping="Wrap" Foreground="#666" Margin="0,0,0,8"/>
+                    <ListBox x:Name="LbColumns" Grid.Row="1"/>
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,0">
+                        <Button x:Name="ColUpButton" Click="OnColumnUp" Padding="14,3" Margin="0,0,6,0"/>
+                        <Button x:Name="ColDownButton" Click="OnColumnDown" Padding="14,3" Margin="0,0,6,0"/>
+                        <Button x:Name="ColResetButton" Click="OnColumnReset" Padding="14,3"/>
+                    </StackPanel>
+                </Grid>
+            </TabItem>
         </TabControl>
 
         <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,4,0">

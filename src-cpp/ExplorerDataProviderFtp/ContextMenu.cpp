@@ -506,8 +506,28 @@ static BOOL SiteCanSetOwner(PCWSTR site)
 
 static void PermSetOwnerChangeVisible(HWND hDlg, BOOL visible)
 {
-    const int controls[] = { 3024, 3025, 3026, 3027 };
+    // 3042 是"可填名称或 ID"的说明行：FTP 站点没有 chown 通道，
+    // 输入框和说明必须一起隐藏，否则等于承诺一个做不到的操作。
+    const int controls[] = { 3024, 3025, 3026, 3027, 3042 };
     for (int id : controls) ShowWindow(GetDlgItem(hDlg, id), visible ? SW_SHOW : SW_HIDE);
+}
+
+// 只读值框的观感：值要**可选中复制**（所以不能改成静态文本），
+// 但不该看着像能输入。只读的 EDIT 会把 WM_CTLCOLORSTATIC 发给父窗口
+// （不是 WM_CTLCOLOREDIT），于是用**对话框自己的背景刷**把它的底画掉，
+// 文字仍可拖动选择 / Ctrl+C 复制，视觉上等同静态文本。
+// 只处理 3001~3007 这几个值框；真正的静态标签一律走默认绘制（保持原样，
+// 免得主题化对话框里标签突然多出一个色块）。
+// 返回值 0 表示"不是我负责的控件"，让对话框管理器按老路处理。
+static INT_PTR PermColorReadOnlyValue(HWND hDlg, HWND ctl, WPARAM wp)
+{
+    int id = ctl ? GetDlgCtrlID(ctl) : 0;
+    if (id < 3001 || id > 3007) return 0;
+    SetBkMode((HDC)wp, TRANSPARENT);
+    // 问对话框要它自己的背景刷（主题化时由 WM_CTLCOLORDLG 给出），
+    // 这样值框的底色与周围**完全一致**，不会出现补丁感。
+    LRESULT bg = SendMessageW(hDlg, WM_CTLCOLORDLG, wp, (LPARAM)hDlg);
+    return bg ? bg : (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
 }
 
 static void PermSetChecks(HWND hDlg, DWORD mode)
@@ -538,39 +558,128 @@ static void PermSyncOctalToChecks(HWND hDlg)
     if((DWORD)v != PermCollectChecks(hDlg)) PermSetChecks(hDlg,(DWORD)v);
 }
 
-// Owner/Group rows show "name [uid]" / "group [gid]"; the edit boxes below
-// let the user change the numeric uid/gid (SFTP chown; FTP will fail cleanly).
+// Owner/Group 行显示 "名称 [ID]"；下面两个输入框回填**同一种写法**，并允许改写。
+// 输入接受三种写法：名称、纯数字 ID、以及我们自己回填的 "名称 [ID]"。
+// 归一化见 PermNormalizeOwnerInput；名字 → ID 的反查在服务程序侧
+// （SftpFileSystem.SetOwner 用 /etc/passwd、/etc/group 反查）。
+// 纯数字原样透传：root 可以指定一个还没有名字的 ID。
+static void PermNormalizeOwnerInput(PCWSTR text, PWSTR out, UINT cch)
+{
+    out[0] = 0;
+    if (!text) return;
+    std::wstring s(text);
+    size_t b = s.find_first_not_of(L" \t");
+    if (b == std::wstring::npos) return;
+    size_t e = s.find_last_not_of(L" \t");
+    s = s.substr(b, e - b + 1);
+
+    bool allDigits = true;
+    for (WCHAR ch : s) if (ch < L'0' || ch > L'9') { allDigits = false; break; }
+    if (allDigits) { StringCchCopyW(out, cch, s.c_str()); return; }
+
+    size_t br = s.find(L'[');
+    if (br == std::wstring::npos) { StringCchCopyW(out, cch, s.c_str()); return; }
+
+    std::wstring head = s.substr(0, br);
+    size_t hb = head.find_first_not_of(L" \t");
+    if (hb != std::wstring::npos)
+    {
+        size_t he = head.find_last_not_of(L" \t");
+        StringCchCopyW(out, cch, head.substr(hb, he - hb + 1).c_str());
+        return;
+    }
+    // "[1000]" 这种没有名字的写法：取括号里的数字。
+    size_t close = s.find(L']', br);
+    if (close == std::wstring::npos) return;
+    std::wstring inner = s.substr(br + 1, close - br - 1);
+    size_t ib = inner.find_first_not_of(L" \t");
+    if (ib == std::wstring::npos) return;
+    size_t ie = inner.find_last_not_of(L" \t");
+    StringCchCopyW(out, cch, inner.substr(ib, ie - ib + 1).c_str());
+}
+
+// 当前值在输入框里的规范写法：有名字用名字（服务端会反查成 ID），否则用数字。
+// 两者都拿不到时留空（调用方不显示输入框）。
+static void PermCurrentToken(const REMOTEMETA *m, BOOL user, PWSTR out, UINT cch)
+{
+    out[0] = 0;
+    const WCHAR *name = user ? m->owner : m->group;
+    DWORD id = user ? m->dwUid : m->dwGid;
+    if (name && name[0]) { StringCchCopyW(out, cch, name); return; }
+    if (id != 0xFFFFFFFF) StringCchPrintfW(out, cch, L"%u", id);
+}
+
+// 用户是否真的改了：把输入和**名字**与**数字 ID** 都比一遍。
+// 少了这一步，"当前 zhou [1000]，用户把框里的 zhou 改成 1000"会被当成修改，
+// 从而发出一次多余的 chown（服务器可能直接拒绝 NULL 变更）。
+static BOOL PermTokenDiffers(PCWSTR token, const REMOTEMETA *m, BOOL user)
+{
+    if (!token[0]) return FALSE;
+    const WCHAR *name = user ? m->owner : m->group;
+    DWORD id = user ? m->dwUid : m->dwGid;
+    if (name && name[0] && 0 == StrCmpW(token, name)) return FALSE;
+    if (id != 0xFFFFFFFF)
+    {
+        WCHAR idText[16] = {};
+        StringCchPrintfW(idText, ARRAYSIZE(idText), L"%u", id);
+        if (0 == StrCmpW(token, idText)) return FALSE;
+    }
+    return TRUE;
+}
+
 static void PermInitOwnerGroup(HWND hDlg, const REMOTEMETA *m)
 {
-    WCHAR u[16] = {}, g[16] = {}, buf[128];
+    WCHAR u[16] = {}, g[16] = {}, buf[160];
     if (m->dwUid != 0xFFFFFFFF) StringCchPrintf(u, ARRAYSIZE(u), L"%u", m->dwUid);
     if (m->dwGid != 0xFFFFFFFF) StringCchPrintf(g, ARRAYSIZE(g), L"%u", m->dwGid);
     StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%s]", m->owner[0] ? m->owner : L"-", u[0] ? u : L"-");
     SetDlgItemTextW(hDlg, 3004, buf);
     StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%s]", m->group[0] ? m->group : L"-", g[0] ? g : L"-");
     SetDlgItemTextW(hDlg, 3005, buf);
-    SetDlgItemTextW(hDlg, 3024, u);
-    SetDlgItemTextW(hDlg, 3025, g);
+
+    WCHAR token[64] = {};
+    PermCurrentToken(m, TRUE, token, ARRAYSIZE(token));
+    if (token[0] && m->owner[0] && m->dwUid != 0xFFFFFFFF)
+        StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%u]", m->owner, m->dwUid);   // 名称 [ID]
+    else
+        StringCchCopyW(buf, ARRAYSIZE(buf), token);
+    SetDlgItemTextW(hDlg, 3024, buf);
+
+    PermCurrentToken(m, FALSE, token, ARRAYSIZE(token));
+    if (token[0] && m->group[0] && m->dwGid != 0xFFFFFFFF)
+        StringCchPrintf(buf, ARRAYSIZE(buf), L"%s [%u]", m->group, m->dwGid);
+    else
+        StringCchCopyW(buf, ARRAYSIZE(buf), token);
+    SetDlgItemTextW(hDlg, 3025, buf);
 }
 
-// Read the uid/gid edit boxes and chown if either differs from current.
-// Returns TRUE when a change was submitted (even if it failed) so callers
-// can decide whether to refresh.
+// Read the owner/group boxes and chown if either really changed.
+// 名称由服务程序反查成 ID（纯数字直接透传）。
 static void PermApplyChown(HWND hDlg, PROPMETA *pm)
 {
     if (!pm->canSetOwner) return;
-    WCHAR newU[32] = {}, newG[32] = {}, curU[16] = {}, curG[16] = {};
-    GetDlgItemTextW(hDlg, 3024, newU, ARRAYSIZE(newU));
-    GetDlgItemTextW(hDlg, 3025, newG, ARRAYSIZE(newG));
-    if (pm->meta.dwUid != 0xFFFFFFFF) StringCchPrintf(curU, ARRAYSIZE(curU), L"%u", pm->meta.dwUid);
-    if (pm->meta.dwGid != 0xFFFFFFFF) StringCchPrintf(curG, ARRAYSIZE(curG), L"%u", pm->meta.dwGid);
-    BOOL changeU = newU[0] && StrCmp(newU, curU) != 0;
-    BOOL changeG = newG[0] && StrCmp(newG, curG) != 0;
+    WCHAR rawU[64] = {}, rawG[64] = {}, newU[64] = {}, newG[64] = {};
+    GetDlgItemTextW(hDlg, 3024, rawU, ARRAYSIZE(rawU));
+    GetDlgItemTextW(hDlg, 3025, rawG, ARRAYSIZE(rawG));
+    PermNormalizeOwnerInput(rawU, newU, ARRAYSIZE(newU));
+    PermNormalizeOwnerInput(rawG, newG, ARRAYSIZE(newG));
+
+    BOOL changeU = PermTokenDiffers(newU, &pm->meta, TRUE);
+    BOOL changeG = PermTokenDiffers(newG, &pm->meta, FALSE);
     if (!changeU && !changeG) return;
-    WCHAR spec[64];
+
+    // 协议是 "user:group"，名字里出现 ':' 会把字段劈开。
+    if ((changeU && wcschr(newU, L':')) || (changeG && wcschr(newG, L':')))
+    {
+        MessageBoxW(hDlg, ExplorerText(L"error.owner_group_invalid", L"所有者/组不能包含冒号。", L"Owner/group cannot contain a colon."),
+                    ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    WCHAR spec[160];
     StringCchPrintf(spec, ARRAYSIZE(spec), L"%s:%s", changeU ? newU : L"-", changeG ? newG : L"-");
     if (RunCli(pm->site, L"chown", pm->path, spec, NULL) != 0)
-        MessageBoxW(hDlg, ExplorerText(L"error.owner_group_rejected", L"SFTP 服务器拒绝了所有者/组更新。", L"Owner/group update was rejected by the SFTP server."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        MessageBoxW(hDlg, ExplorerText(L"error.owner_group_rejected", L"SFTP 服务器拒绝了所有者/组更新（名称必须能在远端解析，或直接填数字 ID）。", L"Owner/group update was rejected by the SFTP server (the name must resolve on the remote host, or use a numeric ID)."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
     else
     {
         WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
@@ -593,8 +702,11 @@ static void LocalizePermissionDialog(HWND hDlg)
     SetDlgItemTextW(hDlg, IDC_PROP_GROUP, ExplorerText(L"property.group", L"组：", L"Group:"));
     SetDlgItemTextW(hDlg, IDC_PROP_SIZE, ExplorerText(L"property.size", L"大小：", L"Size:"));
     SetDlgItemTextW(hDlg, IDC_PROP_MODIFIED, ExplorerText(L"property.modified", L"修改日期：", L"Modified:"));
-    SetDlgItemTextW(hDlg, 3026, ExplorerText(L"property.new_owner", L"新所有者 (UID)：", L"New owner (UID):"));
-    SetDlgItemTextW(hDlg, 3027, ExplorerText(L"property.new_group", L"新组 (GID)：", L"New group (GID):"));
+    SetDlgItemTextW(hDlg, 3026, ExplorerText(L"property.new_owner", L"新所有者：", L"New owner:"));
+    SetDlgItemTextW(hDlg, 3027, ExplorerText(L"property.new_group", L"新组：", L"New group:"));
+    SetDlgItemTextW(hDlg, 3042, ExplorerText(L"property.owner_input_hint",
+        L"所有者/组可填名称或数字 ID（例：zhou 或 1000），也可保留「名称 [ID]」原样不改。",
+        L"Owner/group accept a name or a numeric ID (e.g. zhou or 1000); keep the current \"name [ID]\" to leave it unchanged."));
     SetDlgItemTextW(hDlg, IDC_PROP_PERMISSION_GROUP, ExplorerText(L"label.permissions", L"权限", L"Permissions"));
     SetDlgItemTextW(hDlg, IDC_PROP_OWNER_ROLE, ExplorerText(L"label.owner", L"所有者", L"Owner"));
     SetDlgItemTextW(hDlg, IDC_PROP_GROUP_ROLE, ExplorerText(L"label.group", L"组", L"Group"));
@@ -665,6 +777,13 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
             }
             return TRUE;}
         break;
+    case WM_CTLCOLORSTATIC:
+    {
+        // 只读值框（3001~3007）的观感：见 PermColorReadOnlyValue。
+        INT_PTR br = PermColorReadOnlyValue(hDlg, (HWND)lp, wp);
+        if (br) return br;
+        break;
+    }
     case WM_NCDESTROY:{
         PROPMETA *pm=(PROPMETA*)GetWindowLongPtrW(hDlg,DWLP_USER);
         if(pm && pm->modeless){ if(pm->notify) CoTaskMemFree(pm->notify); CoTaskMemFree(pm); }
@@ -2481,6 +2600,13 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         if(HIWORD(wp)==BN_CLICKED && LOWORD(wp)>=3011 && LOWORD(wp)<=3019){ PermSyncChecksToOctal(hDlg); return TRUE; }
         if(HIWORD(wp)==EN_CHANGE && LOWORD(wp)==3022){ PermSyncOctalToChecks(hDlg); return TRUE; }
         break;
+    case WM_CTLCOLORSTATIC:
+    {
+        // 只读值框（3001~3007）的观感：见 PermColorReadOnlyValue。
+        INT_PTR br = PermColorReadOnlyValue(hDlg, (HWND)lp, wp);
+        if (br) return br;
+        break;
+    }
     case WM_NOTIFY:
     {
         NMHDR *nm = (NMHDR*)lp;

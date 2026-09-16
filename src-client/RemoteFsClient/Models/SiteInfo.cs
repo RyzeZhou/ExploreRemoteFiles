@@ -23,6 +23,14 @@ public sealed class SiteInfo
     /// <summary>绑定的现有 SSH Host 别名（%USERPROFILE%\.ssh\config）；null = 未绑定。</summary>
     public string? SshHostAlias { get; set; }
 
+    /// <summary>
+    /// 列顺序：9 个数字（0..8 的排列），第 i 位 = 显示列号 i 对应的语义属性号
+    /// （0=名称 1=类型 2=大小 3=修改时间 4=权限 5=所有者 6=所有者ID 7=组 8=组ID）。
+    /// null/空 = 默认 "012345678"。非法值由资源管理器侧整体回退默认。
+    /// 只影响**新建或重置后的视图**——Explorer 按文件夹记住用户自己拖过的顺序。
+    /// </summary>
+    public string? ColumnOrder { get; set; }
+
     /// <summary>本站点是否具备 SSH 通道（只有 SFTP/SCP 才有 shell 可用）。</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public bool IsSshCapable => Type.StartsWith("sftp", StringComparison.OrdinalIgnoreCase)

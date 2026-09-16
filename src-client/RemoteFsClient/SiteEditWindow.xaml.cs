@@ -17,6 +17,12 @@ public partial class SiteEditWindow : Window
     /// <summary>下拉里「自动匹配」项的哨兵值。</summary>
     private const string AutoBind = "";
 
+    /// <summary>列顺序的语义属性号全集（顺序即"默认显示顺序"）。</summary>
+    private static readonly int[] DefaultColumnOrder = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+
+    /// <summary>当前编辑中的列顺序：每个元素是语义属性号，下标 = 显示列号。</summary>
+    private readonly List<int> _columnOrder = new();
+
     /// <summary>保存动作中录入的密码（明文只在内存；由 MainWindow 写入凭据管理器）。</summary>
     public string? EnteredPassword { get; private set; }
 
@@ -38,6 +44,7 @@ public partial class SiteEditWindow : Window
 
         BuildTerminalChoices(draft.Terminal);
         ReloadSshEntries(selectAlias: draft.SshHostAlias);
+        InitColumnOrder(draft.ColumnOrder);
 
         UpdateTerminalTabVisibility();
         PwdHint.Text = CredentialStore.Exists(draft.Name)
@@ -59,6 +66,80 @@ public partial class SiteEditWindow : Window
         SshBindingLabel.Text = Ui.T("SshBinding");
         RefreshSshButton.Content = Ui.T("Refresh");
         TerminalHint.Text = Ui.T("TerminalTabHint");
+
+        ColumnTab.Header = Ui.T("ColumnTab");
+        ColumnHint.Text = Ui.T("ColumnHint");
+        ColUpButton.Content = Ui.T("ColumnMoveUp");
+        ColDownButton.Content = Ui.T("ColumnMoveDown");
+        ColResetButton.Content = Ui.T("ColumnReset");
+        RefreshColumnList();
+    }
+
+    // ── 列顺序 ──────────────────────────────────────────────────────────────
+    /// <summary>把站点里存的数字串解析成显示顺序；空/非法（长度不对、重复、越界）回退默认。</summary>
+    private void InitColumnOrder(string? spec)
+    {
+        _columnOrder.Clear();
+        var text = (spec ?? "").Trim();
+        if (text.Length == DefaultColumnOrder.Length && text.All(char.IsAsciiDigit))
+        {
+            var seen = new bool[DefaultColumnOrder.Length];
+            bool ok = true;
+            foreach (var ch in text)
+            {
+                int v = ch - '0';
+                if (v >= DefaultColumnOrder.Length || seen[v]) { ok = false; break; }
+                seen[v] = true;
+                _columnOrder.Add(v);
+            }
+            if (!ok) _columnOrder.Clear();
+        }
+        if (_columnOrder.Count == 0) _columnOrder.AddRange(DefaultColumnOrder);
+        RefreshColumnList();
+    }
+
+    private static string ColumnName(int semantic) => semantic switch
+    {
+        0 => Ui.T("ColName"),
+        1 => Ui.T("ColType"),
+        2 => Ui.T("ColSize"),
+        3 => Ui.T("ColModified"),
+        4 => Ui.T("ColPermissions"),
+        5 => Ui.T("ColOwner"),
+        6 => Ui.T("ColOwnerId"),
+        7 => Ui.T("ColGroup"),
+        _ => Ui.T("ColGroupId"),
+    };
+
+    private void RefreshColumnList()
+    {
+        int keep = LbColumns.SelectedIndex;
+        LbColumns.Items.Clear();
+        for (int i = 0; i < _columnOrder.Count; i++)
+            LbColumns.Items.Add($"{i + 1}.  {ColumnName(_columnOrder[i])}");
+        if (keep >= 0 && keep < LbColumns.Items.Count) LbColumns.SelectedIndex = keep;
+    }
+
+    private void MoveColumn(int delta)
+    {
+        int i = LbColumns.SelectedIndex;
+        int j = i + delta;
+        if (i < 0 || j < 0 || j >= _columnOrder.Count) return;
+        (_columnOrder[i], _columnOrder[j]) = (_columnOrder[j], _columnOrder[i]);
+        RefreshColumnList();
+        LbColumns.SelectedIndex = j;
+    }
+
+    private void OnColumnUp(object sender, RoutedEventArgs e) => MoveColumn(-1);
+
+    private void OnColumnDown(object sender, RoutedEventArgs e) => MoveColumn(1);
+
+    private void OnColumnReset(object sender, RoutedEventArgs e)
+    {
+        _columnOrder.Clear();
+        _columnOrder.AddRange(DefaultColumnOrder);
+        RefreshColumnList();
+        LbColumns.SelectedIndex = 0;
     }
 
     // ── 终端程序 ────────────────────────────────────────────────────────────
@@ -222,6 +303,10 @@ public partial class SiteEditWindow : Window
             }
         }
         _draft.SshHostAlias = string.IsNullOrEmpty(alias) ? null : alias;
+
+        // 列顺序：默认顺序存 null（JSON 干净，也免得把"默认"写成一个看着像自定义的值）
+        var orderText = string.Concat(_columnOrder);
+        _draft.ColumnOrder = orderText == string.Concat(DefaultColumnOrder) ? null : orderText;
 
         var pwd = PbPassword.Password;
         EnteredPassword = pwd.Length > 0 ? pwd : null;

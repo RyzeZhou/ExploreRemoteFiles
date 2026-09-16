@@ -253,28 +253,45 @@ public sealed class SftpFileSystem : IRemoteFileSystem
     {
         EnsureConnected();
         if (_client is null) return;
-        // SFTP 协议（SSH_FXP_SETSTAT）可写 uid/gid；SSH.NET 通过
-        // GetAttributes → 改 UserId/GroupId → SetAttributes 实现（SetLastWriteTime 同模式）。
-        // 名字解析（user → uid）需要服务器侧命令，暂仅支持数字。
+        // SFTP 协议（SSH_FXP_SETSTAT）只能写数字 uid/gid，所以**名字必须自己解析**：
+        // 用 /etc/passwd、/etc/group 反查（与列里显示的 Owner/Group 用的是同一张缓存表）。
+        // 纯数字一律原样透传：root 可以指定一个在 passwd 里还没有名字的 ID。
         var attrs = _client.GetAttributes(path)
             ?? throw new InvalidOperationException($"No such file: {path}");
         bool changed = false;
         if (!string.IsNullOrEmpty(user))
         {
-            if (!uint.TryParse(user, out uint uid))
-                throw new InvalidOperationException($"UID must be numeric: {user}");
-            attrs.UserId = (int)uid;
+            attrs.UserId = (int)ResolveOwnerId(user!, isUser: true);
             changed = true;
         }
         if (!string.IsNullOrEmpty(group))
         {
-            if (!uint.TryParse(group, out uint gid))
-                throw new InvalidOperationException($"GID must be numeric: {group}");
-            attrs.GroupId = (int)gid;
+            attrs.GroupId = (int)ResolveOwnerId(group!, isUser: false);
             changed = true;
         }
         if (changed) _client.SetAttributes(path, attrs);
         Utils.ShellLog.Write($"SFTP chown: {path} user={user} group={group}");
+    }
+
+    /// <summary>
+    /// 名字或数字 → uid/gid。数字直接返回；名字用远端 /etc/passwd、/etc/group 反查，
+    /// 查不到就抛出**可读**错误（而不是丢一个 "UID must be numeric"）。
+    /// </summary>
+    private uint ResolveOwnerId(string token, bool isUser)
+    {
+        if (uint.TryParse(token, out uint numeric)) return numeric;
+
+        EnsureIdMaps();                                  // 首次调用时拉 /etc/passwd、/etc/group
+        var map = isUser ? _userNames : _groupNames;
+        if (map is not null)
+        {
+            foreach (var kv in map)
+                if (string.Equals(kv.Value, token, StringComparison.Ordinal))
+                    return (uint)kv.Key;
+        }
+        throw new InvalidOperationException(isUser
+            ? $"没有名为 '{token}' 的用户（可改填数字 UID，如 1000）"
+            : $"没有名为 '{token}' 的组（可改填数字 GID，如 1000）");
     }
 
     public ChmodRecursiveResult SetPermissionsRecursive(string path, int mode,
