@@ -15,7 +15,7 @@
 2. **`Explore` 既指 Explorer，也是动词"探索"**——远程只是第一条腿，
    后续要往 Explorer 的**本地增强能力**扩展（见路线）；
 3. 缩写 **ERF** 由此成为产品前缀：地址 `erf://<site>:/path`、协议 `ERF-Proto`、
-   服务端 `ERF-Server`、插件 `ERF-Shell`。详见 [docs/PROJECT_IDENTITY.md](docs/PROJECT_IDENTITY.md)。
+   服务端 `ERF-Server`、插件 `ERF-Shell`。详见 docs/PROJECT_IDENTITY.md。
 
 ## 核心理念
 
@@ -50,7 +50,7 @@ Provider 层                                     src/ExplorerRemoteFs/Providers/
 右键菜单与命令栏按钮 · 删除由自研窗口承担真实进度与取消 ·
 10 万文件大目录下右键/删除/属性不再冻结 UI · 复制 33 430 个文件数量正确。
 
-已知缺陷（**含根因与修法**）见 [docs/KNOWN_ISSUES_2026-09-14.md](docs/KNOWN_ISSUES_2026-09-14.md)：
+已知缺陷（**含根因与修法**）见 docs/KNOWN_ISSUES_2026-09-14.md：
 递归设置权限只改目录不改文件（并入「远程操作队列」一起做）、
 深相对路径经剪贴板协议无法表达（已改为明确拒绝而非静默出错）、
 `getr` 逐文件串行且一处失败即整树中断。
@@ -58,29 +58,30 @@ Provider 层                                     src/ExplorerRemoteFs/Providers/
 ## 构建与安装
 
 ```powershell
-# 需要 VS2022（C++ 工具集 + Windows SDK）与 .NET 8 SDK
-powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
-powershell -ExecutionPolicy Bypass -File dist\ExplorerRemoteFs-win-x64\install.ps1
-# 卸载：dist\ExplorerRemoteFs-win-x64\uninstall.ps1
+# 需要 VS2022（C++ 工具集 + Windows SDK）、.NET 8 SDK、Inno Setup 6/7
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1   # 编译扩展 DLL / CLI / 客户端
+powershell -ExecutionPolicy Bypass -File src-setup\build-inno.ps1    # 出安装包 Erf-0.1-Alpha-Setup.exe
+# 自检（装到临时目录 → 51 项断言 → 卸载 → 再断言一遍）：
+powershell -ExecutionPolicy Bypass -File src-setup\inno-test.ps1
 ```
 
 站点凭据通过常驻客户端 GUI 添加，或写 `%APPDATA%\ExplorerRemoteFs\connections.json`。
-调试日志：`C:\temp\remotefs-debug.log`（4 MB 轮转，行首 tick 为 `GetTickCount`）。
+调试日志：`%LOCALAPPDATA%\ExplorerRemoteFs\logs\remotefs-debug.log`（4 MB 轮转）。
 
 ## 路线
 
-> **出口条件与版本线以 [docs/MILESTONES.md](docs/MILESTONES.md) 为准**：
+> **出口条件与版本线以内部里程碑文档为准**（不随公开仓库发布）：
 > 真正的 **Alpha** ＝ 递归设置权限 ＋「远程操作队列」 ＋ 在目录右键「打开终端」三件事全部完成；
 > 之后**第一件事就是 Windows 安装程序**（可选安装目录、常驻程序随登录自启动、可干净升级与卸载）。
 
 | 期 | 内容 | 文档 |
 |---|---|---|
-| Alpha 门槛 | 递归权限 + 队列 + 打开终端（含安装包的技术岔路：不用 MSIX、自启动不做成 Session 0 服务） | `docs/MILESTONES.md` |
-| 近期 | 自研进度窗口升格为**「远程操作队列」**（删除 / 递归改权限 / 传输共用一个队列与一组契约），顺带修递归 chmod | `docs/KNOWN_ISSUES_2026-09-14.md` §1 §3 |
-| 近期 | **ERF 协议第一步**：在 SFTP 上解决"多而小文件"传得慢与传不全（并行会话 / `ssh exec` 打包流 + manifest + 校验） | `docs/ERF_PROTOCOL_PLAN.md` |
-| 已评估 | 站点/目录右键「在 Windows 终端中打开」：认证**交给终端里的 ssh**，产品不碰凭据 | `docs/OPEN_IN_TERMINAL_FEASIBILITY.md` |
+| Alpha 门槛 | 递归权限 + 队列 + 打开终端（含安装包的技术岔路：不用 MSIX、自启动不做成 Session 0 服务） | 内部文档 |
+| 近期 | 自研进度窗口升格为**「远程操作队列」**（删除 / 递归改权限 / 传输共用一个队列与一组契约），顺带修递归 chmod | 内部文档 §1 §3 |
+| 近期 | **ERF 协议第一步**：在 SFTP 上解决"多而小文件"传得慢与传不全（并行会话 / `ssh exec` 打包流 + manifest + 校验） | 内部文档 |
+| 已评估 | 站点/目录右键「在 Windows 终端中打开」：认证**交给终端里的 ssh**，产品不碰凭据 | 内部文档 |
 | 之后 | **扩展 Explorer 的本地能力**（`Explore` 作动词的第二条腿）：批量重命名、校验、差异比对等复用同一套队列 UI 与契约 | 待定 |
-| 长期 | ERF-Server 代理模式起步 → 独立服务端（ext4/NTFS/对象存储），语义声明与独占能力落地 | `docs/ERF_PROTOCOL_PLAN.md` §7 |
+| 长期 | ERF-Server 代理模式起步 → 独立服务端（ext4/NTFS/对象存储），语义声明与独占能力落地 | 内部文档 §7 |
 
 ## 成功判据
 
@@ -93,19 +94,26 @@ powershell -ExecutionPolicy Bypass -File dist\ExplorerRemoteFs-win-x64\install.p
 6. 任何"部分完成"都必须被看见，禁止报成功
 ```
 
-## 文档索引
+## 下载与安装（0.1-Alpha）
 
-| 文档 | 内容 |
-|---|---|
-| [PROJECT_IDENTITY.md](docs/PROJECT_IDENTITY.md) | 名称、品牌分层、版本号规范、`erf://` 前缀来源 |
-| [MILESTONES.md](docs/MILESTONES.md) | **Alpha / 0.2 出口条件**：三件事 + Windows 安装程序的技术岔路与清单 |
-| [RELEASE_v0.1-Alpha.md](docs/RELEASE_v0.1-Alpha.md) | 0.1-Alpha 发布说明与验收方法 |
-| [SHELL_NAMESPACE_SPEC.md](docs/SHELL_NAMESPACE_SPEC.md) · [PIVOT_WIN11_STRATEGY.md](docs/PIVOT_WIN11_STRATEGY.md) | Shell 层规格与选型转向 |
-| [UI_THREAD_FREEZE_AND_DATAOBJECT_2026-09-14.md](docs/UI_THREAD_FREEZE_AND_DATAOBJECT_2026-09-14.md) | UI 线程不变量的由来：冻结根因与 5 个被否证假设 |
-| [KNOWN_ISSUES_2026-09-14.md](docs/KNOWN_ISSUES_2026-09-14.md) | 当前已知问题（根因、WinSCP 对照、队列契约） |
-| [ERF_PROTOCOL_PLAN.md](docs/ERF_PROTOCOL_PLAN.md) | 协议蓝图与第一步可执行拆解 |
-| [ERF_RESIDENT_SERVICE_ARCHITECTURE.md](docs/ERF_RESIDENT_SERVICE_ARCHITECTURE.md) | 常驻服务与进程边界 |
-| [OPEN_IN_TERMINAL_FEASIBILITY.md](docs/OPEN_IN_TERMINAL_FEASIBILITY.md) | 「在 Windows 终端中打开」实测结论 |
+到 [Releases](https://github.com/RyzeZhou/ExploreRemoteFiles/releases) 下载
+`Erf-0.1-Alpha-Setup.exe`（单文件、自包含，**不需要预装 .NET**），双击按向导安装即可：
+可选安装目录、创建桌面快捷方式、登录自启，只装当前用户、不弹 UAC。
+
+- 安装/升级只在替换扩展 DLL 的那几秒终止资源管理器（桌面短暂黑屏 1–3 秒后自动恢复），
+  向导会先弹一个讲清后果的确认框；卸载同理。全新安装不会终止资源管理器。
+- 安装包**未做代码签名**：SmartScreen 会提示"未知发布者"，需要点"更多信息 → 仍要运行"；
+  个别杀软也可能误报 —— 这是未签名软件的必然现象，不代表程序行为异常。
+- 卸载：设置 → 应用 → 已安装的应用 → 易远传（**站点配置与凭据会保留**）。
+
+## 关于开发文档
+
+本仓库公开的是**源码、构建脚本与安装器脚本**。里程碑、调研记录、实验与排障笔记（`docs/`），
+以及实验用探针与本地测试服务器（`research/`）**不随公开仓库发布**，它们只存在于作者的开发树里。
+
+## 许可
+
+[MIT](LICENSE)。
 
 ---
 
