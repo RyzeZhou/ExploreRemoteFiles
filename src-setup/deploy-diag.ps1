@@ -40,8 +40,7 @@ if (-not $Collect) {
     Write-Host ("    诊断日志自检: " + $check)
     if ($check -notlike 'OK*') { Write-Warning "诊断 DLL 没装上，先别急着复现，把上面的输出发回来" ; exit 1 }
 
-    Write-Host ""
-    Write-Host "==> 现在请手动复现一次：在资源管理器里把远程文件『复制』或『拖拽』到本地，直到报错"
+0：在资源管理器里把远程文件『复制』或『拖拽』到本地，直到报错"
     Write-Host "    然后跑：  powershell -ExecutionPolicy Bypass -File src-setup\deploy-diag.ps1 -Collect"
     exit 0
 }
