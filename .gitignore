@@ -30,3 +30,6 @@ remotefs-debug.log
 research/keys/
 # WinSCP capability-test outputs (session logs)
 research/winscp-test/out/
+
+# 开发文档只留本地：仓库对外只发布用户文档（2026-09-17 决定）
+docs/

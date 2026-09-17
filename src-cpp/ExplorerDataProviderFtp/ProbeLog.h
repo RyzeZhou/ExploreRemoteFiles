@@ -1,6 +1,11 @@
 /**************************************************************************
     ProbeLog.h - debug logging for Explorer RemoteFS.
-    Appends to C:\temp\remotefs-debug.log.
+
+    日志位置：%LOCALAPPDATA%\ExplorerRemoteFs\logs\remotefs-debug.log
+    （2026-09-16 改：早先硬写 C:\temp\remotefs-debug.log，那是开发机的路径，
+     装到别人机器上不能这么干 —— 见 MILESTONES 的安装包清单。
+     取不到 LOCALAPPDATA 时退回 %TEMP%；再失败就静默关闭日志：
+     它只是诊断，绝不能影响资源管理器里的任何功能。）
 
     Performance notes (2026-09-02):
     - The old implementation opened+closed the file on EVERY call. High-
@@ -15,9 +20,38 @@
 #pragma once
 
 #include <windows.h>
+#include <shlobj.h>
+#include <strsafe.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <share.h>
+
+// 计算日志全路径（只算一次）。返回空串表示拿不到可用路径。
+inline const wchar_t *ProbeLogPath()
+{
+    static wchar_t s_path[MAX_PATH] = {};
+    static bool s_done = false;
+    if (s_done) return s_path;
+    s_done = true;
+
+    wchar_t dir[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, dir)))
+    {
+        StringCchCatW(dir, MAX_PATH, L"\\ExplorerRemoteFs\\logs");
+        CreateDirectoryW(dir, NULL);   // 已存在时返回 FALSE，正常情况，忽略
+        StringCchCatW(dir, MAX_PATH, L"\\remotefs-debug.log");
+        StringCchCopyW(s_path, MAX_PATH, dir);
+        return s_path;
+    }
+
+    DWORD n = GetTempPathW(MAX_PATH, dir);
+    if (n > 0 && n < MAX_PATH - 20)
+    {
+        StringCchCatW(dir, MAX_PATH, L"remotefs-debug.log");
+        StringCchCopyW(s_path, MAX_PATH, dir);
+    }
+    return s_path;
+}
 
 inline void ProbeLog(const wchar_t *fmt, ...)
 {
@@ -33,7 +67,8 @@ inline void ProbeLog(const wchar_t *fmt, ...)
     if (!s_f)
     {
         // _SH_DENYNO: keep the log readable by other processes (diagnostics).
-        s_f = _wfsopen(L"C:\\temp\\remotefs-debug.log", L"a", _SH_DENYNO);
+        const wchar_t *path = ProbeLogPath();
+        if (path[0]) s_f = _wfsopen(path, L"a", _SH_DENYNO);
     }
     if (s_f)
     {
@@ -41,7 +76,8 @@ inline void ProbeLog(const wchar_t *fmt, ...)
         if (_ftelli64(s_f) > 4LL * 1024 * 1024)
         {
             fclose(s_f);
-            s_f = _wfsopen(L"C:\\temp\\remotefs-debug.log", L"w", _SH_DENYNO);
+            const wchar_t *path = ProbeLogPath();
+            s_f = path[0] ? _wfsopen(path, L"w", _SH_DENYNO) : NULL;
         }
         if (s_f)
         {

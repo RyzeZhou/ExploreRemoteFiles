@@ -11,7 +11,15 @@ $explorerWasRunning = $null -ne (Get-Process -Name explorer -ErrorAction Silentl
 try {
 # The resident tray service keeps the CLI/GUI exes locked (named-pipe bridge
 # host); terminate it FIRST or file copies below fail with access denied.
+#
+# 同样要临时关掉"资源管理器自动重启"：杀掉 explorer 后 Windows 默认会立刻拉起来，
+# 新 explorer 马上把旧 DLL 映射回去 → Copy-Item 覆盖失败（实测：装完还是旧版本）。
+$winlogon = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
+$autoRestart = (Get-ItemProperty -Path $winlogon -Name AutoRestartShell -ErrorAction SilentlyContinue).AutoRestartShell
+try { New-Item -Path $winlogon -Force | Out-Null; Set-ItemProperty -Path $winlogon -Name AutoRestartShell -Value 0 -Type DWord } catch { }
 Stop-Process -Name RemoteFsClient -Force -ErrorAction SilentlyContinue
+# CLI 子进程一样会锁住 cli\*.dll（实测 2026-09-17：卸载后整个 cli 目录删不掉）
+Stop-Process -Name ExplorerRemoteFs.Cli -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
@@ -131,6 +139,11 @@ Write-Host "or create %APPDATA%\ExplorerRemoteFs\connections.json manually (see 
 
 }
 finally {
+    # 恢复"资源管理器自动重启"的原值（原来没有这个值就删掉我们加的）
+    try {
+        if ($null -eq $autoRestart) { Remove-ItemProperty -Path $winlogon -Name AutoRestartShell -ErrorAction SilentlyContinue }
+        else { Set-ItemProperty -Path $winlogon -Name AutoRestartShell -Value $autoRestart -Type DWord }
+    } catch { }
     if ($explorerWasRunning) {
         Start-Process explorer.exe
         Start-Sleep -Seconds 1
