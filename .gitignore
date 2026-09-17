@@ -35,4 +35,4 @@ research/winscp-test/out/
 docs/
 
 # 安装器自测产物（日志留本地看，不进仓库）
-src-setup/*.log
+src-setup/*.log*
