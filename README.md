@@ -6,17 +6,6 @@
 名字里的三个字母就是图标上的 **E / R / F**（ExploreRemoteFiles）：**E** 居中，**R** 在左下表示
 远程站点连接状态，**F** 在右下表示文件传输状态，两国字母各自变色显示状态。
 
-<table>
-  <tr>
-    <td><img src="assets/Explorer打开SFTP目录.png" alt="Explorer打开SFTP目录" width="160"></td>
-    <td><img src="assets/属性页可更改权限或所有者.png" alt="属性页可更改权限或所有者" width="160"></td>
-  </tr>
-  <tr align="center">
-    <td>Explorer打开SFTP目录</td>
-    <td>属性页可更改权限或所有者</td>
-  </tr>
-</table>
-
 ## ⚠️ 风险提示：这是早期版本（Alpha）且为Vibe Coding产物，请谨慎使用
 
 - **没有经过充分测试**：目前只在作者自己的两台机器上实测过（Windows 10 22H2 / Windows 11），
@@ -36,12 +25,16 @@
 ## 它长什么样
 
 导航窗格里多一个「易远传」，点进去就是远程 Linux 目录，列、排序、右键菜单都跟本地一致：
-
-![在资源管理器里打开 SFTP 目录](assets/Explorer打开SFTP目录.png)
-
-右键属性就是 Linux 那一套：所有者、属组、`rwxr-xr-x` 与数字权限都能看、都能改（含递归）：
-
-![属性页：可更改权限或所有者](assets/属性页可更改权限或所有者.png)
+<table>
+  <tr>
+    <td><img src="assets/Explorer打开SFTP目录.png" alt="Explorer打开SFTP目录" width="160"></td>
+    <td><img src="assets/属性页可更改权限或所有者.png" alt="属性页可更改权限或所有者" width="160"></td>
+  </tr>
+  <tr align="center">
+    <td>Explorer打开SFTP目录</td>
+    <td>属性页可更改权限或所有者</td>
+  </tr>
+</table>
 
 ---
 
