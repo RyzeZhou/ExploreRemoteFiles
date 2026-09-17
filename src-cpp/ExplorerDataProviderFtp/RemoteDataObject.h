@@ -96,9 +96,27 @@ public:
     {
         if (pcbRead) *pcbRead = 0;
         if (!pv) return STG_E_INVALIDPOINTER;
-        if (!Ensure()) return STG_E_READFAULT;
+        if (!Ensure())
+        {
+            // 这一条是"执行读取操作时发生磁盘错误"（STG_E_READFAULT）的真正出口：
+            // 失败其实发生在把远程文件取到本地那一步，被这里一律报成了读取错误。
+            ProbeLog(L"[DL] Read FAILED at Ensure site='%s' remote='%s' local='%s'",
+                     _site.c_str(), _remote.c_str(), _local.c_str());
+            return STG_E_READFAULT;
+        }
         DWORD got = 0;
-        if (!ReadFile(_h, pv, cb, &got, NULL)) return STG_E_READFAULT;
+        if (!ReadFile(_h, pv, cb, &got, NULL))
+        {
+            ProbeLog(L"[DL] ReadFile failed cb=%lu err=%lu local='%s'",
+                     (unsigned long)cb, (unsigned long)GetLastError(), _local.c_str());
+            return STG_E_READFAULT;
+        }
+        if (!_loggedFirstRead)
+        {
+            _loggedFirstRead = TRUE;
+            ProbeLog(L"[DL] first Read ok cb=%lu got=%lu size=%llu local='%s'",
+                     (unsigned long)cb, (unsigned long)got, (unsigned long long)_size, _local.c_str());
+        }
         if (pcbRead) *pcbRead = got;
         _pos += got;
         return got == 0 ? S_FALSE : S_OK;
@@ -176,15 +194,32 @@ private:
                          PathFindFileNameW(_remote.c_str()));
         _local = name;
         DeleteFileW(_local.c_str());
+        ProbeLog(L"[DL] Ensure start site='%s' remote='%s' size=%llu -> '%s'",
+                 _site.c_str(), _remote.c_str(), (unsigned long long)_size, _local.c_str());
         if (!RfsFetchToFile(_site.c_str(), _remote.c_str(), _local.c_str()))
         {
+            ProbeLog(L"[DL] Ensure FAILED: download failed site='%s' remote='%s' local='%s' exists=%d",
+                     _site.c_str(), _remote.c_str(), _local.c_str(),
+                     (int)PathFileExistsW(_local.c_str()));
             _local.clear();
             return FALSE;
         }
         _h = CreateFileW(_local.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-        if (_h == INVALID_HANDLE_VALUE) _local.clear();
-        return _h != INVALID_HANDLE_VALUE;
+        if (_h == INVALID_HANDLE_VALUE)
+        {
+            ProbeLog(L"[DL] Ensure FAILED: cannot open local '%s' err=%lu",
+                     _local.c_str(), (unsigned long)GetLastError());
+            _local.clear();
+            return FALSE;
+        }
+        {
+            LARGE_INTEGER li = {};
+            GetFileSizeEx(_h, &li);
+            ProbeLog(L"[DL] Ensure ok local='%s' size_on_disk=%lld expected=%llu",
+                     _local.c_str(), (long long)li.QuadPart, (unsigned long long)_size);
+        }
+        return TRUE;
     }
 
     LONG _ref;
@@ -192,6 +227,7 @@ private:
     ULONGLONG _size, _pos;
     HANDLE _h;
     BOOL _done;
+    BOOL _loggedFirstRead = FALSE;
 };
 
 // ---------------------------------------------------------------------------
