@@ -1,4 +1,6 @@
 ﻿ï»¿# ExplorerRemoteFs å¸è½½èæ¬ï¼å½åç¨æ·ï¼æ éç®¡çåï¼
+# 正式发布的卸载走 Inno 的 unins000.exe（见 src-setup/erf.iss）；本脚本保留给脚本安装的机器，
+# 语义与 Inno 版对齐（保留站点配置与凭据）。
 # ç¨æ³ï¼å³é®"ä½¿ç¨ PowerShell è¿è¡"ï¼æ
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1
 # å¯éï¼-RemoveConfig åæ¶å é¤ç«ç¹éç½®ï¼%APPDATA%\ExplorerRemoteFs\connections.jsonï¼

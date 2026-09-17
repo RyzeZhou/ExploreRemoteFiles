@@ -1,4 +1,6 @@
 ﻿# ExplorerRemoteFs 安装脚本（当前用户，无需管理员）
+# 正式发布走 Inno Setup 安装包（src-setup/erf.iss -> dist/Erf-*-Setup.exe）；本脚本保留给
+# "不装安装包、直接脚本注册"的开发/排障场景，注册语义两边要保持一致，改动时都看一眼。
 # 用法：右键"使用 PowerShell 运行"，或
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 param(
