@@ -33,3 +33,6 @@ research/winscp-test/out/
 
 # 开发文档只留本地：仓库对外只发布用户文档（2026-09-17 决定）
 docs/
+
+# 安装器自测产物（日志留本地看，不进仓库）
+src-setup/*.log
