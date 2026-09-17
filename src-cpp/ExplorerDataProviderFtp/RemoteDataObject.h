@@ -196,12 +196,27 @@ private:
         DeleteFileW(_local.c_str());
         ProbeLog(L"[DL] Ensure start site='%s' remote='%s' size=%llu -> '%s'",
                  _site.c_str(), _remote.c_str(), (unsigned long long)_size, _local.c_str());
-        if (!RfsFetchToFile(_site.c_str(), _remote.c_str(), _local.c_str()))
+        // 下载失败不"一次定终身"：先重试一次再放弃，并且把 _done 放回去，
+        // 这样复制引擎的重试（Win11 上实测会重建传输源很多次）能真的再试一回。
+        // 动机：一次瞬时失败（客户端刚重启、桥接还没起来、CLI 冷启动慢）不该把
+        // 整个复制判成 STG_E_READFAULT，用户看到的就是"执行读取操作时发生磁盘错误"。
+        BOOL fetched = FALSE;
+        for (int attempt = 0; attempt < 2 && !fetched; ++attempt)
+        {
+            if (attempt)
+            {
+                ProbeLog(L"[DL] retrying download (attempt %d) remote='%s'", attempt + 1, _remote.c_str());
+                Sleep(300);
+            }
+            fetched = RfsFetchToFile(_site.c_str(), _remote.c_str(), _local.c_str());
+        }
+        if (!fetched)
         {
             ProbeLog(L"[DL] Ensure FAILED: download failed site='%s' remote='%s' local='%s' exists=%d",
                      _site.c_str(), _remote.c_str(), _local.c_str(),
                      (int)PathFileExistsW(_local.c_str()));
             _local.clear();
+            _done = FALSE;               // 允许后续 Read 再试，而不是永久失败
             return FALSE;
         }
         _h = CreateFileW(_local.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
