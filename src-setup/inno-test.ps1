@@ -98,6 +98,20 @@ Check 'erf:// owner marker' ((RegValue "$hk\erf" 'ERF.HandlerOwner') -eq 'Explor
 Check 'erf:// handler command' ((RegDefault "$hk\erf\shell\open\command") -like "*--open-erf*") (RegDefault "$hk\erf\shell\open\command")
 Check 'Winlogon AutoRestartShell restored' ($null -eq (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell') -or (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell') -eq 1) (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell')
 
+# ---- phase 1b: upgrade over the existing install ----
+# 这一遍走的才是"目标目录里已经有被 explorer 映射的 DLL"的路径：Setup 只在写 DLL 那一条
+# [Files] 的 BeforeInstall/AfterInstall 上停一次 explorer；静默模式下确认框按默认"继续"处理。
+$innoLog2 = Join-Path $PSScriptRoot 'inno-setup-upgrade.log'
+Remove-Item $innoLog2 -Force -ErrorAction SilentlyContinue
+$dllBefore = (Get-Item "$TestDir\ExplorerDataProviderFtp.dll").Length
+$code1b = RunExe $Setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$TestDir",
+                          '/TASKS=startup', "/LOG=$innoLog2") 'upgrade'
+Check 'upgrade exit code 0' ($code1b -eq 0) ("exit=" + $code1b)
+Check 'dll still there after upgrade' (Test-Path "$TestDir\ExplorerDataProviderFtp.dll") ("$dllBefore bytes before")
+Check 'client running after upgrade' ($null -ne (Get-Process -Name RemoteFsClient -ErrorAction SilentlyContinue)) 'RemoteFsClient.exe'
+Check 'explorer running after upgrade' ($null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue)) 'explorer.exe'
+Check 'AutoRestartShell restored after upgrade' ($null -eq (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell') -or (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell') -eq 1) (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell')
+
 # ---- phase 2: silent uninstall ----
 $code2 = RunExe (Join-Path $TestDir 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') 'uninstall'
 Check 'uninstaller exit code 0' ($code2 -eq 0) ("exit=" + $code2)

@@ -75,10 +75,17 @@ Name: "startup"; Description: "登录时自动启动常驻服务（托盘显示�
 Name: "addtopath"; Description: "把命令行工具 ExplorerRemoteFs.Cli.exe 加进 PATH"; Flags: unchecked
 
 [Files]
-Source: "{#PayloadDir}\ExplorerDataProviderFtp.dll"; DestDir: "{app}"; Flags: ignoreversion
+; 先拷不会被占用的东西（几百 MB）：cli\、client\、说明文件。
+; 这一步**完全不碰资源管理器** —— 以前是"一上来就杀 explorer，等整包拷完才重启"，
+; 用户要面对十几秒的黑屏，纯属自找的。
 Source: "{#PayloadDir}\cli\*";    DestDir: "{app}\cli";    Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDir}\client\*"; DestDir: "{app}\client"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDir}\README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
+; 扩展 DLL 是**唯一**被 explorer 映射着的文件，放到最后，并且只在写它的前后各停一次
+; explorer（BeforeInstall/AfterInstall）—— 黑屏窗口就只有这一个文件的拷贝时间（1 秒级）。
+; 全新安装时这个 DLL 还不存在，StopShellForDll 会直接返回，连停都不停。
+Source: "{#PayloadDir}\ExplorerDataProviderFtp.dll"; DestDir: "{app}"; Flags: ignoreversion; \
+    BeforeInstall: StopShellForDll; AfterInstall: StartShellAfterDll
 ; 翻译模板进用户配置目录，但**只在不存在时**写（升级不覆盖用户改过的翻译）
 Source: "{#PayloadDir}\explorer-translations.yaml"; DestDir: "{userappdata}\ExplorerRemoteFs"; Flags: onlyifdoesntexist uninsneveruninstall
 Source: "{#PayloadDir}\explorer-translations.example.yaml"; DestDir: "{userappdata}\ExplorerRemoteFs"; Flags: onlyifdoesntexist uninsneveruninstall
@@ -172,41 +179,45 @@ Filename: "{cmd}"; Parameters: "/c taskkill /IM ExplorerRemoteFs.Cli.exe /F"; Fl
 Type: filesandordirs; Name: "{app}\cli"
 Type: filesandordirs; Name: "{app}\client"
 
+[Messages]
+; "准备安装"页上的提醒（安装前必读）。%n 是换行。
+chinese.ReadyLabel2b=单击"安装"开始安装。%n%n注意：升级安装时，会在替换资源管理器扩展 DLL 的那几秒终止 explorer.exe —— 桌面会短暂黑屏、任务栏与文件管理器暂时不可用（通常 1–3 秒），随后自动恢复；全新安装不需要终止。卸载同理，会有单独的确认框。
+english.ReadyLabel2b=Click Install to continue.%n%nNOTE: when upgrading, explorer.exe is terminated for the 1-3 seconds it takes to replace the shell extension DLL (the desktop and taskbar disappear briefly, then come back automatically). A fresh install does not need this; uninstalling asks for its own confirmation.
+
 [Code]
 var
-  AutoRestartSaved: Boolean;      { 我们是否改过 AutoRestartShell }
-  AutoRestartWas: Cardinal;          { 改之前的值（RegQueryDWordValue 要 Cardinal，不能用 Integer） }
-  AutoRestartExisted: Boolean;       { 改之前到底有没有这个值 }
+  AutoRestartSaved: Boolean;        { 我们是否改过 AutoRestartShell }
+  AutoRestartWas: Cardinal;         { 改之前的值（RegQueryDWordValue 要 Cardinal） }
+  AutoRestartExisted: Boolean;      { 改之前到底有没有这个值 }
+  ShellStopped: Boolean;            { 当前 explorer 是否被我们停了（要负责拉回来） }
 
-{ ── 关掉"资源管理器自动重启" ────────────────────────────────────────────────
-  为什么非要这样：扩展 DLL 被 explorer 映射着就删不掉/覆盖不了；而杀掉 explorer 后
-  Windows 会立刻把它拉起来，新 explorer 马上又把旧 DLL 读回内存 —— 实测结果就是
-  "覆盖安装报成功、版本还是旧的"、以及"卸载了但 DLL 还在"。所以：关自动重启 →
-                  杀 explorer → 改文件 → 恢复设置 → 重新拉起 explorer。 }
-procedure StopShellAndHelpers();
-var
-  Code: Integer;
+{ 让资源管理器立刻发现新的命名空间项 —— 不杀进程也能刷新 }
+procedure SHChangeNotify(wEventID: Longint; uFlags: Cardinal; dwItem1, dwItem2: Cardinal);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
+{ ─────────────────────────────────────────────────────────────────────────
+  资源管理器（explorer.exe）处理总原则
+  硬约束：ExplorerDataProviderFtp.dll 被 explorer 映射着，映射期间既不能覆盖也不能删除。
+  但**只有这一个文件**有这个约束。所以：
+    · 安装：先拷完 cli\/client\/说明（不碰 explorer），最后写 DLL 时用 BeforeInstall/
+      AfterInstall 各停一次 —— 黑屏窗口 = 一个 400 KB 文件的拷贝时间。
+    · 卸载：Inno 的卸载器没有"删到某个文件之前"的钩子，DLL 的删除发生在中途，
+      所以只能整段停，但那段只是删文件，同样是秒级。
+  另外：杀掉 explorer 后 Windows 默认会立刻把它拉起来（AutoRestartShell），新 explorer
+  马上又把旧 DLL 读回内存 —— 于是"覆盖安装报成功、版本还是旧的"。所以停之前先关自动重启，
+  拉回来之前恢复原值（原来没有这个值就删掉，绝不在用户机器上留垃圾设置）。
+  ───────────────────────────────────────────────────────────────────────── }
+procedure SaveAndDisableAutoRestart();
 begin
-  if not AutoRestartSaved then
-  begin
-    AutoRestartExisted := RegQueryDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
-                                                 'AutoRestartShell', AutoRestartWas);
-    AutoRestartSaved := True;
-    RegWriteDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
-                       'AutoRestartShell', 0);
-  end;
-
-  Exec(ExpandConstant('{cmd}'), '/c taskkill /IM RemoteFsClient.exe /F /T >nul 2>&1', '',
-       SW_HIDE, ewWaitUntilTerminated, Code);
-  Exec(ExpandConstant('{cmd}'), '/c taskkill /IM ExplorerRemoteFs.Cli.exe /F >nul 2>&1', '',
-       SW_HIDE, ewWaitUntilTerminated, Code);
-  Sleep(400);
-  Exec(ExpandConstant('{cmd}'), '/c taskkill /IM explorer.exe /F >nul 2>&1', '',
-       SW_HIDE, ewWaitUntilTerminated, Code);
-  Sleep(800);
+  if AutoRestartSaved then
+    Exit;
+  AutoRestartExisted := RegQueryDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
+                                           'AutoRestartShell', AutoRestartWas);
+  AutoRestartSaved := True;
+  RegWriteDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon', 'AutoRestartShell', 0);
 end;
 
-procedure RestoreShellAutorestart();
+procedure RestoreAutoRestart();
 begin
   if not AutoRestartSaved then
     Exit;
@@ -214,9 +225,16 @@ begin
     RegWriteDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
                        'AutoRestartShell', AutoRestartWas)
   else
-    { 原来没有这个值：把它删掉，绝不在用户机器上留下我们加的垃圾设置 }
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon', 'AutoRestartShell');
   AutoRestartSaved := False;
+end;
+
+procedure KillByName(const ExeName: String);
+var
+  Code: Integer;
+begin
+  Exec(ExpandConstant('{cmd}'), '/c taskkill /IM ' + ExeName + ' /F /T >nul 2>&1', '',
+       SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
 procedure StartExplorer();
@@ -226,7 +244,88 @@ begin
   Exec(ExpandConstant('{win}\explorer.exe'), '', '', SW_SHOWNORMAL, ewNoWait, Code);
 end;
 
-{ ── erf:// 归属检查：别人占用了就中止，绝不覆盖 ─────────────────────────── }
+{ 结束时把一切恢复原状（中途取消/失败也要走这里） }
+procedure BringShellBack();
+begin
+  if ShellStopped then
+  begin
+    RestoreAutoRestart();
+    StartExplorer();
+    ShellStopped := False;
+  end
+  else
+    RestoreAutoRestart();
+end;
+
+{ ── 安装路径：只结束常驻服务与 CLI（它们锁着 cli\*.exe、client\*.exe），不碰 explorer ── }
+procedure StopHelpersForInstall();
+begin
+  KillByName('RemoteFsClient.exe');
+  KillByName('ExplorerRemoteFs.Cli.exe');
+  Sleep(400);
+end;
+
+{ ── 写扩展 DLL 之前：只有"升级"才需要（全新安装时旧 DLL 不存在，没东西被映射）── }
+procedure StopShellForDll();
+begin
+  if not FileExists(ExpandConstant('{app}\ExplorerDataProviderFtp.dll')) then
+    Exit;
+  SaveAndDisableAutoRestart();
+  KillByName('explorer.exe');
+  Sleep(700);
+  ShellStopped := True;
+end;
+
+procedure StartShellAfterDll();
+begin
+  BringShellBack();
+end;
+
+{ ── 卸载：整段停（DLL 的删除在文件队列中途），但这段只有几秒 ── }
+procedure StopEverythingForUninstall();
+begin
+  SaveAndDisableAutoRestart();
+  StopHelpersForInstall();
+  KillByName('explorer.exe');
+  Sleep(800);
+  ShellStopped := True;
+end;
+
+{ ─────────────────────────────────────────────────────────────────────────
+  确认框：把"会终止资源管理器"这件事讲清楚，用户点"确定"才继续。
+  静默安装（/SILENT、/VERYSILENT、/SUPPRESSMSGBOXES）不弹框，直接按默认按钮继续 ——
+  自动化与无人值守部署不能被一个对话框卡住。
+  ───────────────────────────────────────────────────────────────────────── }
+function ConfirmExplorerStop(const Action: String): Boolean;
+begin
+  Result := SuppressibleMsgBox(
+    '注意：' + Action + '过程会终止资源管理器（explorer.exe）进程。' + #13#10 + #13#10 +
+    '· 桌面会短暂黑屏，任务栏与文件管理器暂时不可用（通常 1–3 秒）' + #13#10 +
+    '· 正在进行的文件复制/下载请等它结束再继续' + #13#10 +
+    '· 升级安装只在替换扩展 DLL 的那几秒终止；全新安装无需终止' + #13#10 +
+    '· 之后会自动重新启动资源管理器，桌面与任务栏会自己回来' + #13#10 + #13#10 +
+    '确认继续吗？',
+    mbConfirmation, MB_OKCANCEL, IDOK) = IDOK;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  NeedsRestart := False;
+  { 只有"升级"（目标目录里已经有被映射的 DLL）才真要停 explorer，也只有这时才打扰用户 }
+  if FileExists(ExpandConstant('{app}\ExplorerDataProviderFtp.dll')) then
+  begin
+    if not ConfirmExplorerStop('安装') then
+      Result := '安装已取消：你选择了不终止资源管理器。扩展 DLL 无法在被占用的状态下替换。';
+  end;
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := ConfirmExplorerStop('卸载');
+end;
+
+{ ── erf:// 归属检查：别人占用了就中止，绝不覆盖 ── }
 function InitializeSetup(): Boolean;
 var
   Owner: String;
@@ -273,23 +372,19 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
-    StopShellAndHelpers()
+    StopHelpersForInstall()          { 只结束常驻服务/CLI；explorer 交给 DLL 条目的钩子 }
   else if CurStep = ssPostInstall then
   begin
     WriteErfProtocol();
-    RestoreShellAutorestart();
-    StartExplorer();
+    { 新装的命名空间项要立刻出现在导航窗格里：发个关联变更通知即可，不必重启 explorer }
+    SHChangeNotify($08000000, 0, 0, 0);   { SHCNE_ASSOCCHANGED }
   end;
 end;
 
 procedure DeinitializeSetup();
 begin
-  { 用户在文件复制阶段取消/失败退出时也要把设置还回去，不能留下一台"explorer 不会自动重启"的机器 }
-  if AutoRestartSaved then
-  begin
-    RestoreShellAutorestart();
-    StartExplorer();
-  end;
+  { 兜底：中途取消/失败也要把 explorer 拉回来、把设置还回去 }
+  BringShellBack();
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -297,23 +392,19 @@ var
   Owner: String;
 begin
   if CurUninstallStep = usUninstall then
-    StopShellAndHelpers()
+    StopEverythingForUninstall()
   else if CurUninstallStep = usPostUninstall then
   begin
-    { 只有确认 erf:// 是我们注册的才删（别人后来抢注了就不动） }
+    { erf:// 只有确认是我们注册的才删（别人后来抢注了就不动） }
     if RegQueryStringValue(HKCU, 'Software\Classes\erf', 'ERF.HandlerOwner', Owner) and
        (Owner = 'ExplorerRemoteFs') then
       RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\erf');
-    RestoreShellAutorestart();
-    StartExplorer();
+    SHChangeNotify($08000000, 0, 0, 0);
+    BringShellBack();
   end;
 end;
 
 procedure DeinitializeUninstall();
 begin
-  if AutoRestartSaved then
-  begin
-    RestoreShellAutorestart();
-    StartExplorer();
-  end;
+  BringShellBack();
 end;
