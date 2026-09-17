@@ -299,12 +299,12 @@ end;
 function ConfirmExplorerStop(const Action: String): Boolean;
 begin
   Result := SuppressibleMsgBox(
-    '注意：' + Action + '过程会终止资源管理器（explorer.exe）进程。' + #13#10 + #13#10 +
-    '· 桌面会短暂黑屏，任务栏与文件管理器暂时不可用（通常 1–3 秒）' + #13#10 +
-    '· 正在进行的文件复制/下载请等它结束再继续' + #13#10 +
-    '· 升级安装只在替换扩展 DLL 的那几秒终止；全新安装无需终止' + #13#10 +
-    '· 之后会自动重新启动资源管理器，桌面与任务栏会自己回来' + #13#10 + #13#10 +
-    '确认继续吗？',
+    '注意：' + Action + '过程可能需要终止资源管理器（explorer.exe）进程。' + #13#10 + #13#10 +
+    '· 升级安装与卸载时，会在替换/删除扩展 DLL 的那几秒终止它' + #13#10 +
+    '· 桌面会短暂黑屏，任务栏与文件管理器暂时不可用（通常 1–3 秒），随后自动恢复' + #13#10 +
+    '· 正在进行的文件复制/下载请等它结束后再继续' + #13#10 +
+    '· 全新安装不会终止资源管理器' + #13#10 + #13#10 +
+    '确认后继续。',
     mbConfirmation, MB_OKCANCEL, IDOK) = IDOK;
 end;
 
@@ -312,12 +312,11 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
   NeedsRestart := False;
-  { 只有"升级"（目标目录里已经有被映射的 DLL）才真要停 explorer，也只有这时才打扰用户 }
-  if FileExists(ExpandConstant('{app}\ExplorerDataProviderFtp.dll')) then
-  begin
-    if not ConfirmExplorerStop('安装') then
-      Result := '安装已取消：你选择了不终止资源管理器。扩展 DLL 无法在被占用的状态下替换。';
-  end;
+  { 确认只做一次，而且就在"点下安装按钮"这一步 —— 不按"这次到底要不要停 explorer"去
+    精细判断：用户读到的信息应该是稳定的，而不是"有时弹有时不弹"。真正的停与不停由
+    StopShellForDll 决定（全新安装不会停）。静默安装不弹框（见 ConfirmExplorerStop）。 }
+  if not ConfirmExplorerStop('安装') then
+    Result := '安装已取消：你选择了不终止资源管理器。扩展 DLL 无法在被占用的状态下替换。';
 end;
 
 function InitializeUninstall(): Boolean;
