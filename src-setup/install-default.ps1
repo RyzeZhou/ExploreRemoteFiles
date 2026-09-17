@@ -13,7 +13,7 @@ $deadline = (Get-Date).AddMinutes(10)
 while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
 Add-Content -LiteralPath $log -Value ("setup exit=" + $(if ($p.HasExited) { $p.ExitCode } else { 'TIMEOUT' })) -Encoding UTF8
 $dir = Join-Path $env:LOCALAPPDATA 'ExplorerRemoteFs'
-foreach ($item in @('ExplorerDataProviderFtp.dll', 'Setup.exe', 'Uninstall.exe', 'install.ps1', 'uninstall.ps1', 'cli\ExplorerRemoteFs.Cli.exe', 'client\RemoteFsClient.exe')) {
+foreach ($item in @('ExplorerDataProviderFtp.dll', 'Uninstall.exe', 'install.ps1', 'uninstall.ps1', 'cli\ExplorerRemoteFs.Cli.exe', 'client\RemoteFsClient.exe')) {
     Add-Content -LiteralPath $log -Value ("  {0,-40} {1}" -f $item, (Test-Path (Join-Path $dir $item))) -Encoding UTF8
 }
 $arp = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ExplorerRemoteFs'
