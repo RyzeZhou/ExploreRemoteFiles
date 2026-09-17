@@ -27,8 +27,8 @@
 导航窗格里多一个「易远传」，点进去就是远程 Linux 目录，列、排序、右键菜单都跟本地一致：
 <table>
   <tr>
-    <td><img src="assets/Explorer打开SFTP目录.png" alt="Explorer打开SFTP目录" width="160"></td>
-    <td><img src="assets/属性页可更改权限或所有者.png" alt="属性页可更改权限或所有者" width="160"></td>
+    <td><img src="assets/Explorer打开SFTP目录.png" alt="Explorer打开SFTP目录" width="320"></td>
+    <td><img src="assets/属性页可更改权限或所有者.png" alt="属性页可更改权限或所有者" width="320"></td>
   </tr>
   <tr align="center">
     <td>Explorer打开SFTP目录</td>
