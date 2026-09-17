@@ -1,120 +1,115 @@
-# ExploreRemoteFiles (ERF)
+# 易远传 · ExploreRemoteFiles
 
-> 中文名 **易远传**（易 = Explorer 的 E，远 = Remote，传 = 传输；对应图标里的 E/R/F 三个字母）。
+> 把远程 Linux 主机（**SFTP / FTP**）挂进 Windows 资源管理器的导航窗格，
+> 像本地文件夹一样浏览、改权限、复制粘贴、拖放传输 —— 并保留 POSIX 语义。
 
-> **把 WinSCP 的远程浏览、远程语义、远程打开/编辑与高效传输能力，无缝嵌进 Windows 资源管理器。**
-> 更技术化的定义：**A native Windows Shell namespace for SFTP / FTP, backed by a cross-filesystem transfer engine.**
+中文名 **易远传**：易 = Explorer 的 E，远 = Remote，传 = 传输；图标里的 **E / R / F** 三个字母代表
+ExploreRemoteFiles，其中 **R** 上色表示远程站点连接状态、**F** 上色表示文件传输状态。
 
-一句话：**不替代 Explorer，而是扩展 Explorer。**
+> ## ⚠️ 这是早期版本（Alpha），请谨慎使用
+>
+> - **没有经过足够测试**：目前只在作者自己的机器上做过实测（Windows 10 22H2 / Windows 11），
+>   **没有大规模用户验证**，也**没有代码签名**。
+> - **你可能遇到功能异常，甚至数据损失**：请不要把它当作唯一的文件管理手段；
+>   重要数据请另留一份可访问的副本 —— 远程目录里的删除、覆盖、改权限都是**立刻真实生效**的。
+> - 安装包**未签名**：SmartScreen 会提示“未知发布者”，需要点“更多信息 → 仍要运行”；
+>   个别杀毒软件也可能误报。这是未签名软件的必然现象。
+> - 安装/升级/卸载会在**替换或删除扩展 DLL 的那几秒**终止资源管理器（桌面短暂黑屏 1–3 秒后自动恢复），
+>   向导会先弹一个讲清后果的确认框；**全新安装不会**终止资源管理器。
+> - 发现问题属于预期：欢迎到 [Issues](https://github.com/RyzeZhou/ExploreRemoteFiles/issues) 报告
+>   （附日志更好，见文末“出问题了怎么办”）。
 
-版本：**0.1-Alpha** ｜ 当前主线分支：`feature/microsoft-explorer-core`
+<!-- 截图位 1：导航窗格里的「易远传」+ 多站点目录树 + 右侧 POSIX 列
+     放好后把这一行换成：![导航窗格与 POSIX 列](assets/screenshots/01-namespace.png) -->
 
-## 为什么叫 ExploreRemoteFiles（不叫 ExplorerRemoteFiles）
+## 它能做什么
 
-1. 避免 `Explor**er**Remote` 两个连续 `R` 的拼写与读音黏连；
-2. **`Explore` 既指 Explorer，也是动词"探索"**——远程只是第一条腿，
-   后续要往 Explorer 的**本地增强能力**扩展（见路线）；
-3. 缩写 **ERF** 由此成为产品前缀：地址 `erf://<site>:/path`、协议 `ERF-Proto`、
-   服务端 `ERF-Server`、插件 `ERF-Shell`。详见 docs/PROJECT_IDENTITY.md。
+**浏览与导航**
 
-## 核心理念
+- 导航窗格里的「易远传」入口，多个远程站点并列，和本地文件夹一样点进去
+- 面包屑 / 地址栏 / 后退 / 上级 / F5 刷新都按资源管理器的原生行为来
+- 10 万文件的大目录也不会把资源管理器卡死（网络动作一律在后台，UI 线程不等网络）
 
-- **统一的是操作体验，不统一文件系统语义**：本地显示 NTFS 语义（Type/Size/Date modified），
-  远程显示 POSIX 语义（Permissions/Owner/Group/Modified），并以服务端声明为准。
-- **Explorer 只表达"用户想做什么"，引擎决定"数据怎样最快完成"**：浏览与传输解耦。
-- **架构不变量**：Explorer 进程（插件 DLL）内**永不做同步网络 I/O**；网络与长任务在常驻客户端与 CLI 子进程里。
-- **远程文件是一等公民**：Ctrl+C / Ctrl+V / F2 / Delete / Alt+Enter / 双击 / 拖放 都要可用。
+**POSIX 语义**（Linux 用户最在意的部分，本地资源管理器没有）
 
-## 现在的形态
+- 列与属性页显示：大小、修改时间、**所有者**、**属组**、**权限**
+- 权限 `rwxr-xr-x` 与数字 `755` 两种写法都能看、都能改
+- **递归改权限**（`chmod -R`，文件与目录都改）与**递归改属主/属组**（`chown -R`，支持用户名或数字 ID）
 
-```text
-资源管理器（Explorer.exe）
-  └─ ERF-Shell：C++ Shell Namespace 扩展        src-cpp/ExplorerDataProviderFtp/
-       IShellFolder2 + 紧凑身份 PIDL + ITransferSource + IContextMenu + Details 列
-       只读内存缓存 / 命名管道；冷数据一律后台预取，绝不在 UI 线程等待
-       ▼
-常驻客户端 RemoteFsClient（WPF）                src-client/
-       凭据管理 · 命名管道桥接 · 「远程操作队列」（删除 / 递归改权限 / 传输共用）
-       ▼
-CLI 子进程 ExplorerRemoteFs.Cli                 src/ExplorerRemoteFs.Cli/
-       一次性网络动作：list / get / put / getr / chmod / touch / rm …
-       ▼
-Provider 层                                     src/ExplorerRemoteFs/Providers/
-       SftpFileSystem（SSH.NET） · FtpFileSystem（FluentFTP）
-```
+**读写与传输**
 
-## 0.1-Alpha 已实测通过
+- 新建文件夹、重命名、删除（含递归删除，带真实进度与取消）
+- 复制 / 剪切 / 粘贴：远程 ↔ 本地、远程 → 远程
+- 从资源管理器拖放上传、拖出下载
 
-浏览与导航（面包屑 / 地址栏 / 后退 / 上级 / F5）· POSIX 权限与属主显示及修改 ·
-新建目录 · 重命名 · 复制（远程↔本地、远程→远程）· 拖放上传下载 ·
-右键菜单与命令栏按钮 · 删除由自研窗口承担真实进度与取消 ·
-10 万文件大目录下右键/删除/属性不再冻结 UI · 复制 33 430 个文件数量正确。
+**远程操作队列**
 
-**Alpha 之后的主要缺口**：上传/下载尚未并入统一操作队列的进度与暂停体系；
-深相对路径经剪贴板协议无法表达（已改为明确拒绝而非静默出错）；
-SFTP 上「多而小文件」的传输性能与完整性是下一步（ERF 协议）。
+- 删除 / 递归改权限 / 传输共用一个队列窗口：进度、当前项、错误汇总，可暂停
 
-## 构建与安装
+**打开终端**
+
+- 远程目录右键「在 Windows 终端中打开」：Windows Terminal 配置文件与 VS Code 两条路线
+- **认证交给终端里的 `ssh`**，产品本身不碰你的凭据
+
+**其它**
+
+- `erf://` 地址协议；托盘图标显示连接与传输状态
+- 站点凭据存在 **Windows 凭据管理器**（`ExplorerRemoteFs/*`），不落明文文件
+- 文件大小显示口径与资源管理器一致（交给 Windows 自己格式化）
+- **不需要预装 .NET**：客户端与命令行各自带运行时
+
+<!-- 截图位 2：属性页（权限 / 所有者 / 属组）
+     放好后换成：![权限属性页](assets/screenshots/02-permissions.png) -->
+
+<!-- 截图位 3：远程操作队列窗口
+     放好后换成：![远程操作队列](assets/screenshots/03-queue.png) -->
+
+## 下载与安装
+
+到 [**Releases**](https://github.com/RyzeZhou/ExploreRemoteFiles/releases) 下载
+**`Erf-0.1-Alpha-Setup.exe`**（单文件、自包含，不需要预装 .NET）。
+
+- 系统要求：**Windows 10 19045+ / Windows 11，64 位**
+- **只装当前用户**（默认 `%LOCALAPPDATA%\ExplorerRemoteFs`），不弹 UAC、不需要管理员权限
+- 向导里可选安装目录、是否创建桌面快捷方式、是否登录时自启动
+- 卸载：**设置 → 应用 → 已安装的应用 → 易远传**。站点配置与凭据会保留
+
+## 第一次使用
+
+1. 装完后打开资源管理器，导航窗格里点「易远传」（或双击桌面快捷方式打开客户端窗口）
+2. 在客户端里**添加站点**：主机、端口、用户名；密码存进 Windows 凭据管理器
+   （SFTP 也可以直接复用 `~/.ssh/config` 里已有的主机别名）
+3. 回到资源管理器，进站点目录就是远程文件系统；右键有权限、终端、复制等命令
+
+## 已知限制（Alpha）
+
+- **Windows 11 上“复制 / 拖拽到本地”存在异常** —— 已收到实测报告，正在排查
+- 上传/下载尚未并入统一操作队列的进度与暂停体系（复制/移动本身可用）
+- 深相对路径经剪贴板协议无法表达 —— 已改为**明确拒绝**而不是静默出错
+- SFTP 上“多而小文件”的传输性能与完整性是下一步工作（ERF 协议：并行会话 / 打包流 + 校验）
+- 只有 per-user 安装；不做 MSIX（MSIX 不支持这类 in-proc Shell 扩展），也暂不做 per-machine 安装
+- 界面目前只有简体中文与英文
+
+## 出问题了怎么办
+
+1. 运行时日志：`%LOCALAPPDATA%\ExplorerRemoteFs\logs\remotefs-debug.log`
+2. 安装/卸载问题：用 `/LOG="C:\path\setup.log"` 重跑一次，把日志一起附上
+3. 到 [Issues](https://github.com/RyzeZhou/ExploreRemoteFiles/issues) 报告，
+   写清 Windows 版本、协议（SFTP/FTP）、操作步骤与现象
+
+## 从源码构建
+
+需要 VS2022（C++ 工具集 + Windows SDK）、.NET 8 SDK、Inno Setup 6/7：
 
 ```powershell
-# 需要 VS2022（C++ 工具集 + Windows SDK）、.NET 8 SDK、Inno Setup 6/7
-powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1   # 编译扩展 DLL / CLI / 客户端
-powershell -ExecutionPolicy Bypass -File src-setup\build-inno.ps1    # 出安装包 Erf-0.1-Alpha-Setup.exe
-# 自检（装到临时目录 → 51 项断言 → 卸载 → 再断言一遍）：
-powershell -ExecutionPolicy Bypass -File src-setup\inno-test.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1   # 扩展 DLL / CLI / 客户端
+powershell -ExecutionPolicy Bypass -File src-setup\build-inno.ps1    # 出安装包
+powershell -ExecutionPolicy Bypass -File src-setup\inno-test.ps1     # 自检：装到临时目录→断言→卸载
 ```
 
-站点凭据通过常驻客户端 GUI 添加，或写 `%APPDATA%\ExplorerRemoteFs\connections.json`。
-调试日志：`%LOCALAPPDATA%\ExplorerRemoteFs\logs\remotefs-debug.log`（4 MB 轮转）。
-
-## 路线
-
-> **出口条件与版本线以内部里程碑文档为准**（不随公开仓库发布）：
-> 真正的 **Alpha** ＝ 递归设置权限 ＋「远程操作队列」 ＋ 在目录右键「打开终端」三件事全部完成；
-> 之后**第一件事就是 Windows 安装程序**（可选安装目录、常驻程序随登录自启动、可干净升级与卸载）。
-
-| 期 | 内容 | 文档 |
-|---|---|---|
-| Alpha 门槛 | 递归权限 + 队列 + 打开终端（含安装包的技术岔路：不用 MSIX、自启动不做成 Session 0 服务） | 内部文档 |
-| 近期 | 自研进度窗口升格为**「远程操作队列」**（删除 / 递归改权限 / 传输共用一个队列与一组契约），顺带修递归 chmod | 内部文档 §1 §3 |
-| 近期 | **ERF 协议第一步**：在 SFTP 上解决"多而小文件"传得慢与传不全（并行会话 / `ssh exec` 打包流 + manifest + 校验） | 内部文档 |
-| 已评估 | 站点/目录右键「在 Windows 终端中打开」：认证**交给终端里的 ssh**，产品不碰凭据 | 内部文档 |
-| 之后 | **扩展 Explorer 的本地能力**（`Explore` 作动词的第二条腿）：批量重命名、校验、差异比对等复用同一套队列 UI 与契约 | 待定 |
-| 长期 | ERF-Server 代理模式起步 → 独立服务端（ext4/NTFS/对象存储），语义声明与独占能力落地 | 内部文档 §7 |
-
-## 成功判据
-
-```text
-1. Win+E → 左侧进入站点 → 直接看到 /var/www
-2. Details 显示 rwxr-xr-x / owner / group，且能改（含递归）
-3. Ctrl+C/V、F2、Delete、拖放、右键菜单全部可用，且 Explorer 不冻结
-4. 大目录与小文件海：传得完，也传得快
-5. 双击远端配置文件 → 本地默认编辑器打开，保存自动回传
-6. 任何"部分完成"都必须被看见，禁止报成功
-```
-
-## 下载与安装（0.1-Alpha）
-
-到 [Releases](https://github.com/RyzeZhou/ExploreRemoteFiles/releases) 下载
-`Erf-0.1-Alpha-Setup.exe`（单文件、自包含，**不需要预装 .NET**），双击按向导安装即可：
-可选安装目录、创建桌面快捷方式、登录自启，只装当前用户、不弹 UAC。
-
-- 安装/升级只在替换扩展 DLL 的那几秒终止资源管理器（桌面短暂黑屏 1–3 秒后自动恢复），
-  向导会先弹一个讲清后果的确认框；卸载同理。全新安装不会终止资源管理器。
-- 安装包**未做代码签名**：SmartScreen 会提示"未知发布者"，需要点"更多信息 → 仍要运行"；
-  个别杀软也可能误报 —— 这是未签名软件的必然现象，不代表程序行为异常。
-- 卸载：设置 → 应用 → 已安装的应用 → 易远传（**站点配置与凭据会保留**）。
-
-## 关于开发文档
-
-本仓库公开的是**源码、构建脚本与安装器脚本**。里程碑、调研记录、实验与排障笔记（`docs/`），
-以及实验用探针与本地测试服务器（`research/`）**不随公开仓库发布**，它们只存在于作者的开发树里。
+架构一句话：资源管理器里跑一个 C++ Shell 命名空间扩展（进程内、只读缓存、绝不阻塞 UI），
+网络动作交给常驻的 WPF 客户端与一次性 CLI 子进程 —— **资源管理器进程永远不做网络 I/O**。
 
 ## 许可
 
-[MIT](LICENSE)。
-
----
-
-*项目起始 2026-08-20（原名 Explorer RemoteFS，2026-09-15 定名 ExploreRemoteFiles）·
-原始探索概要归档于 `reference/`。*
+[MIT](LICENSE)。作者 RyzeZhou。
