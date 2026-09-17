@@ -47,7 +47,7 @@ if (-not (Test-Path $Setup)) { Log ("setup not found: " + $Setup); exit 1 }
 $innoLog = Join-Path $PSScriptRoot 'inno-install-default.log'
 Log ("installing: " + $Setup)
 Log ("  exit=" + (Wait-Proc (Start-Process -FilePath $Setup -PassThru -ArgumentList @(
-    '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=startup', "/LOG=$innoLog"))))
+    '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=startup,desktopicon', "/LOG=$innoLog"))))
 
 $dir = Join-Path $env:LOCALAPPDATA 'ExplorerRemoteFs'
 foreach ($item in @('ExplorerDataProviderFtp.dll', 'unins000.exe', 'cli\ExplorerRemoteFs.Cli.exe', 'client\RemoteFsClient.exe')) {

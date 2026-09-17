@@ -72,6 +72,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "startup"; Description: "登录时自动启动常驻服务（托盘显示远程连接与传输状态）"; Flags: checkedonce
+; GUI 程序按惯例要问一句桌面快捷方式（默认勾选；中文用 Inno 自带翻译的 {cm:CreateDesktopIcon}）
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 Name: "addtopath"; Description: "把命令行工具 ExplorerRemoteFs.Cli.exe 加进 PATH"; Flags: unchecked
 
 [Files]
@@ -163,6 +165,9 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
 
 [Icons]
 Name: "{userprograms}\{#AppShortName}"; Filename: "{app}\client\RemoteFsClient.exe"
+; 桌面快捷方式：指向常驻客户端的 GUI（托盘程序，双击就是客户端窗口）。
+; 注意这和"隐藏命名空间自带的桌面图标"是两回事 —— 那个是资源管理器命名空间项，这个是普通 .lnk。
+Name: "{userdesktop}\{#AppShortName}"; Filename: "{app}\client\RemoteFsClient.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 ; 装完就启动常驻服务（静默安装也一样启动——否则静默升级完托盘是空的，要等下次登录）

@@ -31,6 +31,14 @@ function RegDefault([string]$path) {
     try { return (Get-Item -LiteralPath $path -ErrorAction Stop).GetValue('') } catch { return $null }
 }
 
+function DesktopShortcut() {
+    # 按"目标是不是我们的客户端"来找快捷方式，省得在 ASCII 脚本里写中文文件名
+    $shell = New-Object -ComObject WScript.Shell
+    Get-ChildItem (Join-Path $env:USERPROFILE 'Desktop') -Filter *.lnk -ErrorAction SilentlyContinue |
+        Where-Object { ($shell.CreateShortcut($_.FullName)).TargetPath -like '*RemoteFsClient.exe' } |
+        Select-Object -First 1
+}
+
 $folder = '{C816CE0E-728C-4FC9-98E5-D0B35B384597}'
 $ctx = '{CB8F539D-3B97-4473-9E07-C8248C53248E}'
 $props = '{5DD84779-FEF1-46A3-8FCF-9F1A9603BB8F}'
@@ -77,6 +85,7 @@ Check 'CliPath' ((RegValue 'HKCU:\Software\ExplorerRemoteFs' 'CliPath') -like "$
 Check 'ClientPath' ((RegValue 'HKCU:\Software\ExplorerRemoteFs' 'ClientPath') -like "$TestDir*") (RegValue 'HKCU:\Software\ExplorerRemoteFs' 'ClientPath')
 Check 'Run entry (startup task)' ((RegValue $run 'ExplorerRemoteFs') -like "*RemoteFsClient.exe*") (RegValue $run 'ExplorerRemoteFs')
 Check 'resident client started' ($null -ne (Get-Process -Name RemoteFsClient -ErrorAction SilentlyContinue)) 'RemoteFsClient.exe'
+Check 'no desktop shortcut without the task' ($null -eq (DesktopShortcut)) 'only created when the task is checked'
 
 foreach ($c in @($folder, $ctx, $props)) {
     $v = RegDefault "$hk\CLSID\$c\InprocServer32"
@@ -105,10 +114,11 @@ $innoLog2 = Join-Path $PSScriptRoot 'inno-setup-upgrade.log'
 Remove-Item $innoLog2 -Force -ErrorAction SilentlyContinue
 $dllBefore = (Get-Item "$TestDir\ExplorerDataProviderFtp.dll").Length
 $code1b = RunExe $Setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$TestDir",
-                          '/TASKS=startup', "/LOG=$innoLog2") 'upgrade'
+                          '/TASKS=startup,desktopicon', "/LOG=$innoLog2") 'upgrade'
 Check 'upgrade exit code 0' ($code1b -eq 0) ("exit=" + $code1b)
 Check 'dll still there after upgrade' (Test-Path "$TestDir\ExplorerDataProviderFtp.dll") ("$dllBefore bytes before")
 Check 'client running after upgrade' ($null -ne (Get-Process -Name RemoteFsClient -ErrorAction SilentlyContinue)) 'RemoteFsClient.exe'
+Check 'desktop shortcut created when task checked' ($null -ne (DesktopShortcut)) (DesktopShortcut).FullName
 Check 'explorer running after upgrade' ($null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue)) 'explorer.exe'
 Check 'AutoRestartShell restored after upgrade' ($null -eq (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell') -or (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell') -eq 1) (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell')
 
@@ -130,6 +140,7 @@ foreach ($c in @($folder, $ctx, $props)) {
 Check 'erf:// removed (owner was ours)' ($null -eq (RegDefault "$hk\erf\shell\open\command")) 'erf'
 Check 'namespace key removed' ($null -eq (RegDefault "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\$folder")) 'Desktop\NameSpace'
 Check 'ctx handler removed' ($null -eq (RegDefault "$hk\RemoteFsMicrosoftCoreType\shellex\ContextMenuHandlers\$ctx")) 'RemoteFsMicrosoftCoreType'
+Check 'desktop shortcut removed on uninstall' ($null -eq (DesktopShortcut)) 'desktop .lnk'
 Check 'site config kept' (Test-Path "$env:APPDATA\ExplorerRemoteFs") "$env:APPDATA\ExplorerRemoteFs"
 Check 'Winlogon value not left behind' ($null -eq (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell') -or (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell') -eq 1) (RegValue 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell')
 
