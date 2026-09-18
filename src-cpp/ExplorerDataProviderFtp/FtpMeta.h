@@ -389,6 +389,59 @@ inline BOOL FtpBridgeFetch(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batc
     return ok;
 }
 
+// 递归下载一个远程目录：同样走常驻服务（**一个文件夹 = 一个队列任务**，用户要求）。
+// 与 FtpBridgeFetch 同形，只是把"一个文件"换成"一棵树"：服务侧先扫一遍树拿到文件总数，
+// 再逐个下载，并把进度聚合到同一个队列条目上。
+inline BOOL FtpBridgeFetchDir(PCWSTR site, PCWSTR remoteDir, PCWSTR localRoot, PCWSTR batchId, std::string &response)
+{
+    response.clear();
+    const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    DWORD lastError = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (pipe != INVALID_HANDLE_VALUE) break;
+        lastError = GetLastError();
+        if (lastError != ERROR_PIPE_BUSY || !WaitNamedPipeW(pipeName, 5000)) break;
+    }
+    if (pipe == INVALID_HANDLE_VALUE)
+    {
+        ProbeLog(L"[XFER] resident fetchdir bridge unavailable site='%s' dir='%s' err=%lu",
+                 site ? site : L"", remoteDir ? remoteDir : L"", lastError);
+        return FALSE;
+    }
+
+    BOOL sent = FtpBridgeWriteLine(pipe, L"FETCHDIR") &&
+                FtpBridgeWriteLine(pipe, site ? site : L"") &&
+                FtpBridgeWriteLine(pipe, remoteDir ? remoteDir : L"/") &&
+                FtpBridgeWriteLine(pipe, localRoot ? localRoot : L"") &&
+                FtpBridgeWriteLine(pipe, (batchId && batchId[0]) ? batchId : L"-");
+    // 整棵树可能很大：给足 2 小时；取消由服务侧的队列负责。
+    const ULONGLONG deadline = GetTickCount64() + 120ull * 60ull * 1000ull;
+    if (sent)
+    {
+        while (GetTickCount64() < deadline)
+        {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) break;
+            if (avail > 0)
+            {
+                char buf[1024]; DWORD got = 0;
+                if (!ReadFile(pipe, buf, sizeof(buf), &got, NULL) || got == 0) break;
+                response.append(buf, got);
+                if (response.find('\n') != std::string::npos) break;
+            }
+            else Sleep(25);
+        }
+    }
+    CloseHandle(pipe);
+    BOOL ok = sent && response.rfind("OK", 0) == 0;
+    ProbeLog(L"[XFER] resident fetchdir site='%s' dir='%s' batch='%s' sent=%d ok=%d reply='%hs'",
+             site ? site : L"", remoteDir ? remoteDir : L"", batchId ? batchId : L"-", sent, ok, response.c_str());
+    return ok;
+}
+
 // 递归修改权限：走常驻服务（与 DELETE 同一条路）。
 // 为什么不能在这里同步跑 CLI：属性页的「确定」在 Explorer 的 UI 线程上，树一大就整窗卡死，
 // 而且 RunCli 有 30 秒超时会把 CLI 直接杀掉（大目录必然超时，改到一半就断）。

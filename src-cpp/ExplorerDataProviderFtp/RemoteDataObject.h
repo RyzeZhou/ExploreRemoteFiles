@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ---------------------------------------------------------------------------
 // RemoteDataObject.h — a virtual-file IDataObject for remote items.
 //
@@ -250,17 +250,20 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Folder fetch: ONE 'cli getr' process downloads the whole tree into a temp
-// root, writing each file to <name>.rfs-part and renaming on completion (so a
-// waiter never sees a half-written file). Streams served from the local tree.
-// Refcounted: the data object + every live stream hold a ref; at 0 the process
-// is killed (if still running) and the temp tree is deleted.
+// Folder fetch: 整个目录树的下载**交给常驻服务**（一个文件夹 = 一个队列任务），
+// 下载到本地临时根目录，流再从本地树里读。
+//
+// 以前这里 spawn 一个 `cli getr` 进程：Shell DLL 自己启动 CLI，违反架构约束
+//（会话/连接/遍历/进度/取消都归常驻服务），而且每个文件夹一个进程、一次全新登录。
+// 现在只发一个 FETCHDIR 请求，服务侧扫树 + 逐个下载 + 进度聚合，桥接边界等最终回执。
+//
+// 引用计数：数据对象与每个存活流各持一份；归零时删掉临时树（没有进程要杀了）。
 // ---------------------------------------------------------------------------
 class CFolderFetch
 {
 public:
     CFolderFetch(PCWSTR site, PCWSTR remoteDir)
-        : _ref(1), _proc(NULL), _started(FALSE), _seq(0)
+        : _ref(1), _started(FALSE), _finished(FALSE), _cancelled(FALSE), _seq(0)
     {
         if (site) _site = site;
         if (remoteDir) _remoteDir = remoteDir;
@@ -273,18 +276,16 @@ public:
             _localRoot = buf;
             CreateDirectoryW(_localRoot.c_str(), NULL);
         }
+        // 一个文件夹 = 一个批次 id：队列窗口据此把它显示成**一个**任务；
+        // 同时拖多个文件夹时，每个文件夹各自一组（用户明确要的语义）。
+        StringCchPrintfW(_batchId, ARRAYSIZE(_batchId), L"dir-%u-%ld",
+                         (unsigned)GetCurrentProcessId(), _seq);
         InitializeCriticalSection(&_cs);
     }
 
     ~CFolderFetch()
     {
-        if (_proc)
-        {
-            DWORD code = STILL_ACTIVE;
-            if (GetExitCodeProcess(_proc, &code) && code == STILL_ACTIVE)
-                TerminateProcess(_proc, 1);
-            CloseHandle(_proc);
-        }
+        // 没有进程要杀了：下载跑在常驻服务里，取消走队列窗口的「取消」按钮。
         DeleteTree(_localRoot);
         DeleteCriticalSection(&_cs);
     }
@@ -304,30 +305,44 @@ public:
         _started = TRUE;
         LeaveCriticalSection(&_cs);
 
-        std::wstring cli = RfsCliPath();
-        if (cli.empty() || _localRoot.empty())
+        // 后台线程发请求并等回执：调用点（GetData）不能在这里同步等整棵树下完。
+        AddRef();      // 线程持有一份引用，直到下载结束
+        HANDLE th = CreateThread(NULL, 0, &CFolderFetch::ThreadProc, this, 0, NULL);
+        if (th)
         {
-            ProbeLog(L"[DATAOBJ] getr cannot start (cli/root empty)");
-            return;
-        }
-        std::wstring cmd = L"\"" + cli + L"\" getr \"" + _site + L"\" \"" + _remoteDir + L"\" \"" + _localRoot + L"\"";
-        std::vector<WCHAR> line(cmd.begin(), cmd.end());
-        line.push_back(0);
-        STARTUPINFOW si = { sizeof(si) };
-        PROCESS_INFORMATION pi = {};
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        if (CreateProcessW(NULL, line.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-        {
-            _proc = pi.hProcess;
-            CloseHandle(pi.hThread);
-            ProbeLog(L"[DATAOBJ] getr started site='%s' dir='%s' root='%s' pid=%u",
-                     _site.c_str(), _remoteDir.c_str(), _localRoot.c_str(), pi.dwProcessId);
+            CloseHandle(th);
         }
         else
         {
-            ProbeLog(L"[DATAOBJ] getr CreateProcess FAILED err=%u", GetLastError());
+            _finished = TRUE;
+            Release();
         }
+    }
+
+    static DWORD WINAPI ThreadProc(LPVOID param)
+    {
+        CFolderFetch *self = (CFolderFetch *)param;
+        self->RunFetch();
+        self->Release();
+        return 0;
+    }
+
+    // 下载交给常驻服务：Shell DLL 不再 spawn `cli getr` —— 会话复用、遍历、进度、
+    // 取消都归常驻服务，桥接边界只等它的最终 OK/FAIL。
+    void RunFetch()
+    {
+        if (_localRoot.empty())
+        {
+            ProbeLog(L"[DATAOBJ] fetchdir cannot start (local root empty)");
+            _finished = TRUE;
+            return;
+        }
+        std::string reply;
+        BOOL ok = FtpBridgeFetchDir(_site.c_str(), _remoteDir.c_str(), _localRoot.c_str(), _batchId, reply);
+        if (!ok && reply.find("cancelled") != std::string::npos) _cancelled = TRUE;
+        _finished = TRUE;
+        ProbeLog(L"[DATAOBJ] fetchdir(service) site='%s' dir='%s' -> '%s' batch='%s' ok=%d",
+                 _site.c_str(), _remoteDir.c_str(), _localRoot.c_str(), _batchId, ok);
     }
 
     std::wstring LocalPath(const std::wstring &rel) const
@@ -338,9 +353,8 @@ public:
         return p;
     }
 
-    // Wait until the file appears (the 'getr' process renames it into place
-    // when its download completes). Returns FALSE if the process ended without
-    // producing this file.
+    // 等文件出现。服务回执之后（_finished）再给最后一次机会，然后如实返回失败 ——
+    // 以前是靠"getr 进程退出了"判断，现在没有进程了，改看服务回执。
     BOOL WaitForFile(const std::wstring &rel)
     {
         std::wstring p = LocalPath(rel);
@@ -348,20 +362,14 @@ public:
         {
             if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES)
                 return TRUE;
-            if (_proc)
+            if (_finished)
             {
-                DWORD code = STILL_ACTIVE;
-                if (GetExitCodeProcess(_proc, &code) && code != STILL_ACTIVE)
+                for (int i = 0; i < 5; i++)
                 {
-                    // Process ended — give the final rename a brief moment to
-                    // land, then a last check.
-                    for (int i = 0; i < 5; i++)
-                    {
-                        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return TRUE;
-                        Sleep(80);
-                    }
-                    return FALSE;
+                    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return TRUE;
+                    Sleep(80);
                 }
+                return FALSE;
             }
             Sleep(80);
         }
@@ -387,8 +395,10 @@ private:
 
     LONG _ref;
     std::wstring _site, _remoteDir, _localRoot;
-    HANDLE _proc;
-    BOOL _started;
+    WCHAR _batchId[48] = {};      // 一个文件夹一个批次 id（队列里一个任务）
+    volatile BOOL _started;
+    volatile BOOL _finished;      // 服务已回执（下载结束）
+    volatile BOOL _cancelled;     // 服务回话说用户取消了
     LONG _seq;
     CRITICAL_SECTION _cs;
 };
