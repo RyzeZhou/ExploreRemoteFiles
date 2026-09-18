@@ -1,4 +1,4 @@
-﻿; ============================================================================
+; ============================================================================
 ;  易远传 (Explorer Remote Files) —— Inno Setup 安装脚本
 ;
 ;  编译：  src-setup\build-inno.ps1        （内部就是 ISCC.exe erf.iss）
@@ -12,8 +12,31 @@
 ;  与老版 install.ps1 的语义对照（都保留）：
 ;    · 仅当前用户（PrivilegesRequired=lowest），全部写 HKCU，不碰 UAC
 ;    · erf:// 协议带归属标记，已被别人占用就中止安装而不是覆盖
-;    · 装/卸前临时关掉资源管理器自动重启 + 结束常驻客户端与 CLI，见 [Code]
+;    · 装/卸前结束常驻客户端与 CLI（它们锁着 cli\*.exe、client\*.exe）
 ;    · 卸载保留站点配置与凭据；HideDesktopIcons 那种"Windows 自己的键"只动我们那一个值
+;
+;  ★ 2026-09-18 重写"资源管理器占用"这一节 —— 安装与卸载都不再终止 explorer.exe。
+;
+;  旧做法（已删除）是"先关掉 AutoRestartShell、再 taskkill /IM explorer.exe /F /T，
+;  替换完 DLL 再把 explorer 拉回来"。它在开发机上"看起来能跑"，在用户双击安装时必然出事：
+;
+;    1) Inno 的安装程序会把自己解压到临时目录再跑一遍，进程链是
+;         explorer.exe → Erf-…-Setup.exe → Erf-…-Setup.tmp（真正的安装进程）
+;       卸载器同理（explorer.exe → unins000.exe → unins000.tmp）。
+;    2) taskkill 的 /T 是"连同整棵子进程树一起杀"。于是这条命令把**安装程序自己**
+;       也杀了 —— 安装中断在写 DLL 那一步，后面的 [Registry] 段一条都没执行，
+;       导航窗格里当然就没有"易远传"；卸载则连"删注册表"都没走到，条目删不掉。
+;    3) 更糟的是 AutoRestartShell 已经被写成 0 而没人恢复它 → Windows 不会再把
+;       explorer 拉起来 → 桌面一直黑着，用户只能注销或重启。
+;    （为什么自动化测试没发现：测试都从 PowerShell 启动 Setup.exe，父进程是 pwsh，
+;      不在 explorer 的进程树里，所以 /T 波及不到测试进程。只有"人双击"才会中招。）
+;
+;  现在的做法：**一个进程都不杀**，用改名绕开"已映射文件不能覆盖/删除"这个约束 ——
+;  NTFS 允许对已被映射的文件改名（只是改目录项，文件对象仍在内存里），
+;  所以先把旧的 ExplorerDataProviderFtp.dll 改成 .old，再把新文件写到原路径即可。
+;  改名后的旧文件在下次登录时由 RunOnce 清掉（中间不需要重启，也不会黑屏）。
+;  代价只有一个：explorer 内存里还加载着旧 DLL，**新版本要等 explorer 下次启动才生效** ——
+;  所以"附加任务"里给了可选的"立即重启资源管理器"（不带 /T 的安全重启）。
 ; ============================================================================
 
 #define AppName        "易远传 (Explorer Remote Files)"
@@ -33,6 +56,11 @@
 
 [Setup]
 ; AppId 决定"应用和功能"里的身份与升级识别（卸载项注册表键名 ExplorerRemoteFs_is1），一旦发布就不能再改。
+#ifndef ExpectedDllSha256
+  ; 由 build-inno.ps1 传入：随包 DLL 的 SHA256。安装完用它自校验"到底换没换 DLL"。
+  #define ExpectedDllSha256 ""
+#endif
+
 AppId=ExplorerRemoteFs
 AppName={#AppName}
 AppVersion={#AppVersion}
@@ -75,19 +103,21 @@ Name: "startup"; Description: "登录时自动启动常驻服务（托盘显示�
 ; GUI 程序按惯例要问一句桌面快捷方式（默认勾选；中文用 Inno 自带翻译的 {cm:CreateDesktopIcon}）
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 Name: "addtopath"; Description: "把命令行工具 ExplorerRemoteFs.Cli.exe 加进 PATH"; Flags: unchecked
+; 只有"目标目录里已经有旧 DLL"（= 升级）时才有意义，所以用 Check 控制是否出现。
+; 默认不勾：这是唯一会让桌面闪一下的动作，必须由用户自己选。
+Name: "restartshell"; Description: "安装完成后重启资源管理器，让新版本扩展立即生效（桌面会闪一下，约 1 秒）"; \
+    Flags: unchecked; Check: HasExistingDll
 
 [Files]
 ; 先拷不会被占用的东西（几百 MB）：cli\、client\、说明文件。
-; 这一步**完全不碰资源管理器** —— 以前是"一上来就杀 explorer，等整包拷完才重启"，
-; 用户要面对十几秒的黑屏，纯属自找的。
+; 这一步完全不碰资源管理器，也不碰 explorer。
 Source: "{#PayloadDir}\cli\*";    DestDir: "{app}\cli";    Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDir}\client\*"; DestDir: "{app}\client"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDir}\README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
-; 扩展 DLL 是**唯一**被 explorer 映射着的文件，放到最后，并且只在写它的前后各停一次
-; explorer（BeforeInstall/AfterInstall）—— 黑屏窗口就只有这一个文件的拷贝时间（1 秒级）。
-; 全新安装时这个 DLL 还不存在，StopShellForDll 会直接返回，连停都不停。
+; 扩展 DLL 是唯一可能被 explorer 映射着的文件：写它之前先把旧的挪开（删除或改名，见
+; PrepareDllSlotForInstall）—— 这样"覆盖被占用文件"这个失败模式根本不会出现，也不需要杀 explorer。
 Source: "{#PayloadDir}\ExplorerDataProviderFtp.dll"; DestDir: "{app}"; Flags: ignoreversion; \
-    BeforeInstall: StopShellForDll; AfterInstall: StartShellAfterDll
+    BeforeInstall: PrepareDllSlotForInstall; AfterInstall: VerifyInstalledDll
 ; 翻译模板进用户配置目录，但**只在不存在时**写（升级不覆盖用户改过的翻译）
 Source: "{#PayloadDir}\explorer-translations.yaml"; DestDir: "{userappdata}\ExplorerRemoteFs"; Flags: onlyifdoesntexist uninsneveruninstall
 Source: "{#PayloadDir}\explorer-translations.example.yaml"; DestDir: "{userappdata}\ExplorerRemoteFs"; Flags: onlyifdoesntexist uninsneveruninstall
@@ -175,8 +205,9 @@ Filename: "{app}\client\RemoteFsClient.exe"; Parameters: "--background"; Flags: 
 Filename: "{app}\README.txt"; Description: "查看说明文件"; Flags: shellexec postinstall skipifsilent unchecked
 
 [UninstallRun]
-; 卸载前先结束占用文件的进程（卸载器自己也会在 [Code] 里再杀一次，双保险）
-Filename: "{cmd}"; Parameters: "/c taskkill /IM RemoteFsClient.exe /F /T"; Flags: runhidden; RunOnceId: "StopClient"
+; 卸载前先结束占用文件的进程（卸载器自己也会在 [Code] 里再杀一次，双保险）。
+; 注意这里**没有 /T**：/T 会连子进程树一起杀，而卸载器本身可能就是被调用方的子进程。
+Filename: "{cmd}"; Parameters: "/c taskkill /IM RemoteFsClient.exe /F"; Flags: runhidden; RunOnceId: "StopClient"
 Filename: "{cmd}"; Parameters: "/c taskkill /IM ExplorerRemoteFs.Cli.exe /F"; Flags: runhidden; RunOnceId: "StopCli"
 
 [UninstallDelete]
@@ -186,147 +217,211 @@ Type: filesandordirs; Name: "{app}\client"
 
 [Messages]
 ; "准备安装"页上的提醒（安装前必读）。%n 是换行。
-chinese.ReadyLabel2b=单击"安装"开始安装。%n%n注意：升级安装时，会在替换资源管理器扩展 DLL 的那几秒终止 explorer.exe —— 桌面会短暂黑屏、任务栏与文件管理器暂时不可用（通常 1–3 秒），随后自动恢复；全新安装不需要终止。卸载同理，会有单独的确认框。
-english.ReadyLabel2b=Click Install to continue.%n%nNOTE: when upgrading, explorer.exe is terminated for the 1-3 seconds it takes to replace the shell extension DLL (the desktop and taskbar disappear briefly, then come back automatically). A fresh install does not need this; uninstalling asks for its own confirmation.
+chinese.ReadyLabel2b=单击"安装"开始安装。%n%n安装过程不会终止资源管理器，也不会打断你正在进行的文件复制。%n如果是升级安装，新版本的扩展会在资源管理器下次启动时生效 —— 需要立刻生效，就在下一页勾选"重启资源管理器"。
+english.ReadyLabel2b=Click Install to continue.%n%nSetup does NOT terminate explorer.exe and does not interrupt file operations in progress.%nOn an upgrade the new shell extension takes effect the next time Explorer starts - tick "restart Explorer" on the previous page to do it now.
+chinese.FinishedLabel=安装完成。%n%n「易远传」已加入资源管理器导航窗格；如果它没有立刻出现，请重启资源管理器（任务管理器 → "Windows 资源管理器" → 重新启动）。%n%n常驻服务已在后台启动，托盘图标可见。
+english.FinishedLabel=Setup has finished installing. %n%n"ERF sites" has been added to the Explorer navigation pane; if it does not show up right away, restart Windows Explorer (Task Manager -> Windows Explorer -> Restart).%n%nThe resident service has been started in the background.
 
 [Code]
 var
-  AutoRestartSaved: Boolean;        { 我们是否改过 AutoRestartShell }
-  AutoRestartWas: Cardinal;         { 改之前的值（RegQueryDWordValue 要 Cardinal） }
-  AutoRestartExisted: Boolean;      { 改之前到底有没有这个值 }
-  ShellStopped: Boolean;            { 当前 explorer 是否被我们停了（要负责拉回来） }
+  LeftoverDll: String;   { 被挪开的旧 DLL 的完整路径（空 = 没有需要清理的） }
 
 { 让资源管理器立刻发现新的命名空间项 —— 不杀进程也能刷新 }
 procedure SHChangeNotify(wEventID: Longint; uFlags: Cardinal; dwItem1, dwItem2: Cardinal);
   external 'SHChangeNotify@shell32.dll stdcall';
 
+{ 判断桌面 shell 是否活着（0 = 没有 shell，桌面是黑的） }
+function GetShellWindow(): HWND;
+  external 'GetShellWindow@user32.dll stdcall';
+
 { ─────────────────────────────────────────────────────────────────────────
-  资源管理器（explorer.exe）处理总原则
-  硬约束：ExplorerDataProviderFtp.dll 被 explorer 映射着，映射期间既不能覆盖也不能删除。
-  但**只有这一个文件**有这个约束。所以：
-    · 安装：先拷完 cli\/client\/说明（不碰 explorer），最后写 DLL 时用 BeforeInstall/
-      AfterInstall 各停一次 —— 黑屏窗口 = 一个 400 KB 文件的拷贝时间。
-    · 卸载：Inno 的卸载器没有"删到某个文件之前"的钩子，DLL 的删除发生在中途，
-      所以只能整段停，但那段只是删文件，同样是秒级。
-  另外：杀掉 explorer 后 Windows 默认会立刻把它拉起来（AutoRestartShell），新 explorer
-  马上又把旧 DLL 读回内存 —— 于是"覆盖安装报成功、版本还是旧的"。所以停之前先关自动重启，
-  拉回来之前恢复原值（原来没有这个值就删掉，绝不在用户机器上留垃圾设置）。
+  为什么杀进程的地方**一律不带 /T**（这是本次修复的核心，别改回去）
+  taskkill /T 会连同目标进程的整棵子进程树一起杀。而双击启动时：
+      explorer.exe → Erf-…-Setup.exe（解压壳） → Erf-…-Setup.tmp（真正干活的）
+  安装程序自己就在 explorer 的子树里，于是 /T 把安装程序一起杀了：
+  安装中断在写 DLL 那一步，后面的 [Registry] 一条都没写（导航窗格没有"易远传"），
+  AutoRestartShell 被留成 0（桌面黑了就再也不回来）。卸载器同理（条目删不掉）。
   ───────────────────────────────────────────────────────────────────────── }
-procedure SaveAndDisableAutoRestart();
-begin
-  if AutoRestartSaved then
-    Exit;
-  AutoRestartExisted := RegQueryDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
-                                           'AutoRestartShell', AutoRestartWas);
-  AutoRestartSaved := True;
-  RegWriteDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon', 'AutoRestartShell', 0);
-end;
-
-procedure RestoreAutoRestart();
-begin
-  if not AutoRestartSaved then
-    Exit;
-  if AutoRestartExisted then
-    RegWriteDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
-                       'AutoRestartShell', AutoRestartWas)
-  else
-    RegDeleteValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon', 'AutoRestartShell');
-  AutoRestartSaved := False;
-end;
-
 procedure KillByName(const ExeName: String);
 var
   Code: Integer;
 begin
-  Exec(ExpandConstant('{cmd}'), '/c taskkill /IM ' + ExeName + ' /F /T >nul 2>&1', '',
+  Exec(ExpandConstant('{cmd}'), '/c taskkill /IM ' + ExeName + ' /F >nul 2>&1', '',
        SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
-procedure StartExplorer();
-var
-  Code: Integer;
-begin
-  Exec(ExpandConstant('{win}\explorer.exe'), '', '', SW_SHOWNORMAL, ewNoWait, Code);
-end;
-
-{ 结束时把一切恢复原状（中途取消/失败也要走这里） }
-procedure BringShellBack();
-begin
-  if ShellStopped then
-  begin
-    RestoreAutoRestart();
-    StartExplorer();
-    ShellStopped := False;
-  end
-  else
-    RestoreAutoRestart();
-end;
-
-{ ── 安装路径：只结束常驻服务与 CLI（它们锁着 cli\*.exe、client\*.exe），不碰 explorer ── }
-procedure StopHelpersForInstall();
+{ 常驻客户端与 CLI 会锁住 cli\*.exe / client\*.exe，装/卸前都要先结束它们。
+  它们不是资源管理器，杀掉对用户完全不可见。 }
+procedure StopHelpers();
 begin
   KillByName('RemoteFsClient.exe');
   KillByName('ExplorerRemoteFs.Cli.exe');
   Sleep(400);
 end;
 
-{ ── 写扩展 DLL 之前：只有"升级"才需要（全新安装时旧 DLL 不存在，没东西被映射）── }
-procedure StopShellForDll();
+{ 挑一个还能用的 ".old" 名字：优先复用，被占用（上次留下的、还被映射着）就换下一个。 }
+function PickFreePath(const Base: String): String;
+var
+  I: Integer;
 begin
-  if not FileExists(ExpandConstant('{app}\ExplorerDataProviderFtp.dll')) then
+  Result := Base + '.old';
+  if not FileExists(Result) then Exit;
+  if DeleteFile(Result) then Exit;
+  for I := 2 to 20 do
+  begin
+    Result := Base + '.old' + IntToStr(I);
+    if not FileExists(Result) then Exit;
+    if DeleteFile(Result) then Exit;
+  end;
+  Result := Base + '.old' + GetDateTimeString('yyyymmdd-hhnnss', '-', ':');
+end;
+
+{ ── 安装：写扩展 DLL 之前，先把旧的挪开 ──────────────────────────────────
+  先试着直接删（explorer 没加载过它时能删掉，目录最干净）；
+  删不掉说明 explorer 映射着它 —— 这时改名（对已映射文件是允许的），
+  改名后的旧文件交给下次登录的 RunOnce 清理。全程不碰 explorer。 }
+procedure PrepareDllSlotForInstall();
+var
+  Src, Dst: String;
+begin
+  Src := ExpandConstant('{app}\ExplorerDataProviderFtp.dll');
+  if not FileExists(Src) then
+    Exit;                                  { 全新安装：目标还不存在，直接写 }
+  if DeleteFile(Src) then
+  begin
+    Log('install: old extension DLL deleted');
     Exit;
-  SaveAndDisableAutoRestart();
+  end;
+  Dst := PickFreePath(Src);
+  if RenameFile(Src, Dst) then
+  begin
+    LeftoverDll := Dst;
+    Log('install: old extension DLL renamed to ' + Dst + ' (still mapped by explorer)');
+  end
+  else
+  begin
+    Log('install: WARNING cannot rename ' + Src + ' -- the copy below will fail');
+    if not WizardSilent() then
+      MsgBox('无法替换资源管理器扩展 DLL：它正被资源管理器占用。' + #13#10 + #13#10 +
+             '请重启资源管理器（任务管理器 → "Windows 资源管理器" → 重新启动）后重跑安装程序。',
+             mbError, MB_OK);
+  end;
+end;
+
+{ ── 安装：写完之后自校验"到底换没换" ─────────────────────────────────────
+  踩过的坑：explorer 占用着 DLL 时升级会"成功但不替换"，于是旧 DLL 配新 CLI，
+  取文件失败被笼统报成"执行读取操作时发生磁盘错误"。现在先挪开再写，
+  正常路径下这里必定一致；不一致就说明写失败了，必须让安装失败而不是静默放过。 }
+procedure VerifyInstalledDll();
+var
+  Expected, Actual, Target: String;
+begin
+  Expected := '{#ExpectedDllSha256}';
+  if Expected = '' then
+    Exit;                                   { 没传哈希就跳过（手工编译时） }
+  Target := ExpandConstant('{app}\ExplorerDataProviderFtp.dll');
+  if not FileExists(Target) then
+  begin
+    MsgBox('安装后找不到扩展 DLL：' + Target, mbError, MB_OK);
+    RaiseException('extension DLL missing after install');
+  end;
+  Actual := GetSHA256OfFile(Target);
+  if CompareText(Expected, Actual) <> 0 then
+  begin
+    MsgBox('扩展 DLL 没有被真正替换（安装目录里的文件与随包文件不一致）。' + #13#10 + #13#10 +
+           '最常见原因：资源管理器正占用着它。请重启资源管理器后重跑安装程序。' + #13#10 + #13#10 +
+           '期望: ' + Expected + #13#10 + '实际: ' + Actual, mbError, MB_OK);
+    Log('install: FAILED extension DLL hash mismatch');
+    Abort();   { 静默安装里 RaiseException 只报不拦（实测退出码仍是 0），Abort 才会真的终止 }
+  end;
+  Log('install: extension DLL verified, sha256=' + Actual);
+end;
+
+{ ── 卸载：先试着直接删 DLL，删不掉（explorer 映射着）就改名 ──────────────
+  卸载器按记录去删文件时，原路径上已经没有这个文件了，它会跳过；
+  .old 留给下次登录的 RunOnce。 }
+procedure ReleaseDllForUninstall();
+var
+  Src, Dst: String;
+begin
+  Src := ExpandConstant('{app}\ExplorerDataProviderFtp.dll');
+  if not FileExists(Src) then
+    Exit;
+  if DeleteFile(Src) then
+  begin
+    Log('uninstall: extension DLL deleted');
+    Exit;
+  end;
+  Dst := PickFreePath(Src);
+  if RenameFile(Src, Dst) then
+    Log('uninstall: extension DLL renamed to ' + Dst + ' (still mapped by explorer)')
+  else
+    Log('uninstall: WARNING cannot rename ' + Src);
+  LeftoverDll := Dst;
+end;
+
+{ 把残留文件交给"下次登录"清理：RunOnce 里一条 del + 一条 rd。
+  注意 RunOnce 的值是**整条命令行**，必须写全 "cmd.exe" /c —— 老版本只写了 "/c del ..."，
+  那会被当成程序名，等于什么都没清理。
+  rd 故意不带 /s：只删空目录，万一用户在下次登录前又装回来了，这里绝不会误删新装的文件。 }
+procedure ScheduleLeftoverCleanup();
+var
+  Cmd: String;
+begin
+  if LeftoverDll = '' then
+    Exit;
+  Cmd := '"' + ExpandConstant('{cmd}') + '" /c del /f /q "' + LeftoverDll + '" & rd "'
+         + ExpandConstant('{app}') + '" 2>nul';
+  RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\RunOnce', 'ErfCleanup', Cmd);
+  Log('cleanup scheduled at next logon: ' + Cmd);
+end;
+
+{ ── 可选的"立即重启资源管理器"（只有用户勾了那个任务才会走到）───────────
+  依旧不带 /T；杀之前先把 AutoRestartShell 顶成 1（万一被谁关过，
+  系统就不会把桌面拉回来 —— 那正是用户上一次看到的"黑屏不恢复"），
+  杀完盯着 shell 回没回来，5 秒还没回来就手动拉一个，绝不把用户丢在黑屏里。 }
+procedure RestartShellNow();
+var
+  Code, I: Integer;
+  Had: Boolean;
+  Prev: Cardinal;
+begin
+  Had := RegQueryDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
+                            'AutoRestartShell', Prev);
+  if Had and (Prev = 0) then
+    RegWriteDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
+                       'AutoRestartShell', 1);
+  Log('restarting explorer.exe (no /T)');
   KillByName('explorer.exe');
-  Sleep(700);
-  ShellStopped := True;
+  Sleep(1000);
+  for I := 1 to 10 do
+  begin
+    if GetShellWindow() <> 0 then
+    begin
+      Log('shell is back');
+      Break;
+    end;
+    Sleep(500);
+  end;
+  if GetShellWindow() = 0 then
+  begin
+    Log('shell did not come back by itself -- starting explorer.exe manually');
+    Exec(ExpandConstant('{win}\explorer.exe'), '', '', SW_SHOWNORMAL, ewNoWait, Code);
+    Sleep(1500);
+  end;
+  { 还回用户原来的设置（原来没有这个值就把我们加的删掉，绝不留垃圾设置） }
+  if Had then
+    RegWriteDWordValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
+                       'AutoRestartShell', Prev)
+  else
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon',
+                   'AutoRestartShell');
 end;
 
-procedure StartShellAfterDll();
+{ 升级才有意义：目标目录里已经有旧 DLL 才显示"重启资源管理器"这个任务 }
+function HasExistingDll(): Boolean;
 begin
-  BringShellBack();
-end;
-
-{ ── 卸载：整段停（DLL 的删除在文件队列中途），但这段只有几秒 ── }
-procedure StopEverythingForUninstall();
-begin
-  SaveAndDisableAutoRestart();
-  StopHelpersForInstall();
-  KillByName('explorer.exe');
-  Sleep(800);
-  ShellStopped := True;
-end;
-
-{ ─────────────────────────────────────────────────────────────────────────
-  确认框：把"会终止资源管理器"这件事讲清楚，用户点"确定"才继续。
-  静默安装（/SILENT、/VERYSILENT、/SUPPRESSMSGBOXES）不弹框，直接按默认按钮继续 ——
-  自动化与无人值守部署不能被一个对话框卡住。
-  ───────────────────────────────────────────────────────────────────────── }
-function ConfirmExplorerStop(const Action: String): Boolean;
-begin
-  Result := SuppressibleMsgBox(
-    '注意：' + Action + '过程可能需要终止资源管理器（explorer.exe）进程。' + #13#10 + #13#10 +
-    '· 升级安装与卸载时，会在替换/删除扩展 DLL 的那几秒终止它' + #13#10 +
-    '· 桌面会短暂黑屏，任务栏与文件管理器暂时不可用（通常 1–3 秒），随后自动恢复' + #13#10 +
-    '· 正在进行的文件复制/下载请等它结束后再继续' + #13#10 +
-    '· 全新安装不会终止资源管理器' + #13#10 + #13#10 +
-    '确认后继续。',
-    mbConfirmation, MB_OKCANCEL, IDOK) = IDOK;
-end;
-
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-begin
-  Result := '';
-  NeedsRestart := False;
-  { 确认只做一次，而且就在"点下安装按钮"这一步 —— 不按"这次到底要不要停 explorer"去
-    精细判断：用户读到的信息应该是稳定的，而不是"有时弹有时不弹"。真正的停与不停由
-    StopShellForDll 决定（全新安装不会停）。静默安装不弹框（见 ConfirmExplorerStop）。 }
-  if not ConfirmExplorerStop('安装') then
-    Result := '安装已取消：你选择了不终止资源管理器。扩展 DLL 无法在被占用的状态下替换。';
-end;
-
-function InitializeUninstall(): Boolean;
-begin
-  Result := ConfirmExplorerStop('卸载');
+  Result := FileExists(ExpandConstant('{app}\ExplorerDataProviderFtp.dll'));
 end;
 
 { ── erf:// 归属检查：别人占用了就中止，绝不覆盖 ── }
@@ -376,19 +471,16 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
-    StopHelpersForInstall()          { 只结束常驻服务/CLI；explorer 交给 DLL 条目的钩子 }
+    StopHelpers()                    { 只结束常驻服务/CLI；explorer 全程不动 }
   else if CurStep = ssPostInstall then
   begin
     WriteErfProtocol();
     { 新装的命名空间项要立刻出现在导航窗格里：发个关联变更通知即可，不必重启 explorer }
     SHChangeNotify($08000000, 0, 0, 0);   { SHCNE_ASSOCCHANGED }
+    ScheduleLeftoverCleanup();
+    if WizardIsTaskSelected('restartshell') then
+      RestartShellNow();
   end;
-end;
-
-procedure DeinitializeSetup();
-begin
-  { 兜底：中途取消/失败也要把 explorer 拉回来、把设置还回去 }
-  BringShellBack();
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -396,7 +488,11 @@ var
   Owner: String;
 begin
   if CurUninstallStep = usUninstall then
-    StopEverythingForUninstall()
+  begin
+    { 只结束常驻客户端与 CLI（它们锁着 cli\*.exe / client\*.exe）——桌面上什么都看不见 }
+    StopHelpers();
+    ReleaseDllForUninstall();
+  end
   else if CurUninstallStep = usPostUninstall then
   begin
     { erf:// 只有确认是我们注册的才删（别人后来抢注了就不动） }
@@ -404,11 +500,6 @@ begin
        (Owner = 'ExplorerRemoteFs') then
       RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\erf');
     SHChangeNotify($08000000, 0, 0, 0);
-    BringShellBack();
+    ScheduleLeftoverCleanup();
   end;
-end;
-
-procedure DeinitializeUninstall();
-begin
-  BringShellBack();
 end;
