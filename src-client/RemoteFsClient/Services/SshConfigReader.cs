@@ -37,6 +37,16 @@ public sealed record SshHostEntry(
 /// </summary>
 public static class SshConfigReader
 {
+    /// <summary>
+    /// 我们自己在 .ssh/config 里维护的受管块标记（见 C++ 侧 EnsureSshConfigAlias）。
+    /// 块内的 Host 是我们生成的，**不是**"用户已有的 SSH 配置"，绝不能列进绑定下拉框 ——
+    /// 否则用户会"绑定到自己"，而那块内容由我们维护、一旦私钥变更就再也不会被刷新
+    /// （2026-09-18 实测：绑成了 erf-&lt;站点&gt;，块里 IdentityFile 指向已删除的私钥，
+    ///  每次开终端都报 no such identity 然后莫名退回密码登录）。
+    /// </summary>
+    private const string ManagedBegin = "# >>> ExploreRemoteFiles managed block >>>";
+    private const string ManagedEnd = "# <<< ExploreRemoteFiles managed block <<<";
+
     public static string ConfigPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ssh", "config");
 
@@ -70,9 +80,16 @@ public static class SshConfigReader
                 hostName = null; user = null; identity = null; port = null;
             }
 
+            bool inManagedBlock = false;
             foreach (var raw in File.ReadLines(ConfigPath))
             {
                 var line = raw.Trim();
+
+                // 受管块的边界先处理：块内整段跳过（含我们生成的 Host 行）
+                if (line.Equals(ManagedBegin, StringComparison.Ordinal)) { Flush(); inManagedBlock = true; continue; }
+                if (line.Equals(ManagedEnd, StringComparison.Ordinal)) { Flush(); inManagedBlock = false; continue; }
+                if (inManagedBlock) continue;
+
                 if (line.Length == 0 || line.StartsWith('#')) continue;
 
                 // 支持 Key value / Key=value

@@ -67,8 +67,14 @@ inline void ProbeLog(const wchar_t *fmt, ...)
     if (!s_f)
     {
         // _SH_DENYNO: keep the log readable by other processes (diagnostics).
+        //
+        // ccs=UTF-8 不能省：文本模式下 fwprintf 按 CRT 的当前 locale（默认 "C"）把宽字符
+        // 转成本地代码页，**只要行里出现非 ASCII 字符，那一行就从那里被截断**。
+        // 实测（2026-09-18）：24802 行日志里含中文的行数 = 0，
+        // `[DIAG] PropSheet: hwnd=… parent=…`（ContextMenu.cpp 的取证行）只剩 "[DIAG] PropSheet: "
+        // —— 中文写在参数后面，两个 HWND 全丢了，害得 Win11 上的问题没法定位。
         const wchar_t *path = ProbeLogPath();
-        if (path[0]) s_f = _wfsopen(path, L"a", _SH_DENYNO);
+        if (path[0]) s_f = _wfsopen(path, L"a, ccs=UTF-8", _SH_DENYNO);
     }
     if (s_f)
     {
@@ -77,7 +83,7 @@ inline void ProbeLog(const wchar_t *fmt, ...)
         {
             fclose(s_f);
             const wchar_t *path = ProbeLogPath();
-            s_f = path[0] ? _wfsopen(path, L"w", _SH_DENYNO) : NULL;
+            s_f = path[0] ? _wfsopen(path, L"w, ccs=UTF-8", _SH_DENYNO) : NULL;
         }
         if (s_f)
         {

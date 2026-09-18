@@ -431,6 +431,20 @@ inline SRWLOCK &FtpCacheLock()
     return l;
 }
 
+// ── 缓存新鲜期（2026-09-18 修"缓存不持久化"）────────────────────────────────
+// 内存 TTL 原来是 30 秒：实测同一目录每 30 秒必然重拉一次远程 LIST（日志里两次
+// [BRIDGE] 的间隔是 30703 / 34750 ms，正好卡在悬崖上），而用户从进目录到离开通常
+// 远超 30 秒 —— 于是"刚刚才看过"的目录也一直在重拉。改成 5 分钟：正确性由
+// "写操作后的精确失效 + 后台预取"保证，TTL 只用来兜住"别人在远端改了东西"。
+//
+// 磁盘 TTL 原来也是 30 秒，而且过期直接 DeleteFileW —— 这是"缓存不持久化"的根因：
+// 磁盘条目与内存条目是**同一时刻**写入的（FtpCacheStore 一次写两边），
+// 所以磁盘条目年龄恒 ≥ 内存条目年龄，磁盘层永远不可能比内存层活得更久，落盘等于白做。
+// 现在磁盘快照不再因为"老"被删，只在超过 FTP_DISK_CACHE_MAX_AGE_MS 后不再用于首屏。
+#define FTP_CACHE_TTL_MS            300000ULL              // 内存新鲜期：5 分钟
+#define FTP_DISK_CACHE_MAX_AGE_MS   (24ULL * 3600 * 1000)  // 磁盘快照可用于首屏的上限：24 小时
+#define FTP_CACHE_MAX_DIRS          128                    // 内存里最多保留多少个目录快照
+
 struct FtpDiskCacheHeader { DWORD magic; DWORD version; DWORD count; };
 inline BOOL FtpMetadataCacheDirectory(PWSTR out, UINT cch)
 {
@@ -453,12 +467,18 @@ inline BOOL FtpMetadataCacheFile(PCWSTR site, PCWSTR path, PWSTR out, UINT cch)
     WCHAR dir[MAX_PATH] = {}; if (!FtpMetadataCacheDirectory(dir, ARRAYSIZE(dir))) return FALSE;
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\ExplorerRemoteFs-meta-%016llX.bin", dir, FtpMetadataCacheHash(site, path)));
 }
-inline BOOL FtpDiskCacheLoad(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &items)
+// maxAgeMs = 0 表示不限年龄；>0 且超龄时返回 FALSE，但**绝不删文件**（见上面
+// FTP_CACHE_TTL_MS 的说明：过期即删会让磁盘层永远追不上内存层）。ageMsOut 回传年龄。
+inline BOOL FtpDiskCacheLoad(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &items,
+                             ULONGLONG maxAgeMs = 0, ULONGLONG *ageMsOut = NULL)
 {
-    items.clear(); WCHAR file[MAX_PATH] = {}; if (!FtpMetadataCacheFile(site, path, file, ARRAYSIZE(file))) return FALSE;
+    items.clear(); if (ageMsOut) *ageMsOut = 0;
+    WCHAR file[MAX_PATH] = {}; if (!FtpMetadataCacheFile(site, path, file, ARRAYSIZE(file))) return FALSE;
     WIN32_FILE_ATTRIBUTE_DATA a = {}; if (!GetFileAttributesExW(file, GetFileExInfoStandard, &a)) return FALSE;
     FILETIME ft = {}; GetSystemTimeAsFileTime(&ft); ULARGE_INTEGER now = {}, written = {}; now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime; written.LowPart = a.ftLastWriteTime.dwLowDateTime; written.HighPart = a.ftLastWriteTime.dwHighDateTime;
-    if (now.QuadPart < written.QuadPart || now.QuadPart - written.QuadPart > 300000000ULL) { DeleteFileW(file); return FALSE; }
+    ULONGLONG ageMs = (now.QuadPart > written.QuadPart) ? ((now.QuadPart - written.QuadPart) / 10000ULL) : 0ULL;
+    if (ageMsOut) *ageMsOut = ageMs;
+    if (maxAgeMs && ageMs > maxAgeMs) return FALSE;
     HANDLE f = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL); if (f == INVALID_HANDLE_VALUE) return FALSE;
     FtpDiskCacheHeader head = {}; DWORD got = 0; BOOL ok = ReadFile(f, &head, sizeof(head), &got, NULL) && got == sizeof(head) && head.magic == 0x45524653 && head.version == 1 && head.count <= 100000;
     if (ok && head.count) { items.resize(head.count); DWORD bytes = head.count * (DWORD)sizeof(FTPENTRY); ok = ReadFile(f, items.data(), bytes, &got, NULL) && got == bytes; }
@@ -641,7 +661,7 @@ inline BOOL FtpCacheFindOne(PCWSTR site, PCWSTR folder, PCWSTR name, FTPENTRY *o
     for (auto const &e : FtpCacheEntries())
         if (0 == StrCmp(e.site, site) && 0 == StrCmp(e.path, key))
         {
-            if (FtpCacheFresh(now, e.tick, 30000))
+            if (FtpCacheFresh(now, e.tick, FTP_CACHE_TTL_MS))
                 for (auto const &it : e.items)
                     if (0 == StrCmp(it.szName, name))
                     {
@@ -673,7 +693,7 @@ inline BOOL FtpCachePeekAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out
     AcquireSRWLockShared(&FtpCacheLock());
     for (auto const &entry : FtpCacheEntries())
     {
-        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, 30000))
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FTP_CACHE_TTL_MS))
         {
             out = entry.items;
             ReleaseSRWLockShared(&FtpCacheLock());
@@ -829,9 +849,9 @@ inline int FtpCacheLookup(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxOut)
 {
     if (maxOut <= 0) return 0; PCWSTR key = (path && path[0]) ? path : L"/"; ULONGLONG now = GetTickCount64(); int got = 0;
     AcquireSRWLockShared(&FtpCacheLock());
-    for (auto &e : FtpCacheEntries()) if (0 == StrCmp(e.path, key) && 0 == StrCmp(e.site, site)) { if (FtpCacheFresh(now, e.tick, 30000)) { got = (int)e.items.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = e.items[i]; } break; }
+    for (auto &e : FtpCacheEntries()) if (0 == StrCmp(e.path, key) && 0 == StrCmp(e.site, site)) { if (FtpCacheFresh(now, e.tick, FTP_CACHE_TTL_MS)) { got = (int)e.items.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = e.items[i]; } break; }
     ReleaseSRWLockShared(&FtpCacheLock()); if (got) return got;
-    std::vector<FTPENTRY> disk; if (!FtpDiskCacheLoad(site, key, disk)) return 0; got = (int)disk.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = disk[i]; return got;
+    std::vector<FTPENTRY> disk; if (!FtpDiskCacheLoad(site, key, disk, FTP_DISK_CACHE_MAX_AGE_MS)) return 0; got = (int)disk.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = disk[i]; return got;
 }
 
 inline void FtpCacheStore(PCWSTR site, PCWSTR path, const FTPENTRY *items, int count)
@@ -840,8 +860,24 @@ inline void FtpCacheStore(PCWSTR site, PCWSTR path, const FTPENTRY *items, int c
     AcquireSRWLockExclusive(&FtpCacheLock()); auto &v = FtpCacheEntries();
     for (auto it = v.begin(); it != v.end();) { if (0 == StrCmp(it->path, key) && 0 == StrCmp(it->site, site)) it = v.erase(it); else ++it; }
     FtpCacheEntry e = {}; StringCchCopy(e.site, ARRAYSIZE(e.site), site); StringCchCopy(e.path, ARRAYSIZE(e.path), key); e.tick = now; for (int i = 0; i < count; ++i) e.items.push_back(items[i]); v.push_back(std::move(e));
-    for (auto it = v.begin(); it != v.end();) { if (!FtpCacheFresh(now, it->tick, 30000)) it = v.erase(it); else ++it; } while (v.size() > 32) v.erase(v.begin()); ReleaseSRWLockExclusive(&FtpCacheLock());
+    for (auto it = v.begin(); it != v.end();) { if (!FtpCacheFresh(now, it->tick, FTP_CACHE_TTL_MS)) it = v.erase(it); else ++it; } while (v.size() > FTP_CACHE_MAX_DIRS) v.erase(v.begin()); ReleaseSRWLockExclusive(&FtpCacheLock());
     FtpDiskCacheStore(site, key, items, count);
+}
+
+// 把"刚从磁盘快照读回来"的内容提升进内存缓存。磁盘命中回填是必须的：
+// 以前 FtpListCachedAll 命中磁盘后直接 return，内存仍然是冷的，于是紧接着的
+// EnumObjects（只读内存）又 miss，视图永远热不起来。
+// 不落盘 —— 内容本来就是从磁盘读出来的。
+inline void FtpCachePromote(PCWSTR site, PCWSTR path, const std::vector<FTPENTRY> &items)
+{
+    if (!site || !site[0] || items.empty()) return;
+    PCWSTR key = (path && path[0]) ? path : L"/";
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&FtpCacheLock()); auto &v = FtpCacheEntries();
+    for (auto it = v.begin(); it != v.end();) { if (0 == StrCmp(it->path, key) && 0 == StrCmp(it->site, site)) it = v.erase(it); else ++it; }
+    FtpCacheEntry e = {}; StringCchCopy(e.site, ARRAYSIZE(e.site), site); StringCchCopy(e.path, ARRAYSIZE(e.path), key); e.tick = now; e.items = items; v.push_back(std::move(e));
+    for (auto it = v.begin(); it != v.end();) { if (!FtpCacheFresh(now, it->tick, FTP_CACHE_TTL_MS)) it = v.erase(it); else ++it; } while (v.size() > FTP_CACHE_MAX_DIRS) v.erase(v.begin());
+    ReleaseSRWLockExclusive(&FtpCacheLock());
 }
 
 // Spawn the CLI bridge once per site+path per TTL, parse tab-separated items,
@@ -951,7 +987,7 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     AcquireSRWLockShared(&FtpCacheLock());
     for (auto const &entry : FtpCacheEntries())
     {
-        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, 30000))
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FTP_CACHE_TTL_MS))
         {
             out = entry.items;
             ReleaseSRWLockShared(&FtpCacheLock());
@@ -960,7 +996,13 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     }
     ReleaseSRWLockShared(&FtpCacheLock());
 
-    if (FtpDiskCacheLoad(site, key, out)) return TRUE;
+    // 磁盘快照命中：立刻用它（"关掉资源管理器窗口再打开还是热目录"就是从这儿来的），
+    // 并提升进内存，让紧接着的 EnumObjects（只读内存）也能命中。
+    if (FtpDiskCacheLoad(site, key, out, FTP_DISK_CACHE_MAX_AGE_MS))
+    {
+        FtpCachePromote(site, key, out);
+        return TRUE;
+    }
 
     FTPENTRY first = {};
     FtpListCached(site, key, &first, 1);
@@ -968,7 +1010,7 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     AcquireSRWLockShared(&FtpCacheLock());
     for (auto const &entry : FtpCacheEntries())
     {
-        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, 30000))
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FTP_CACHE_TTL_MS))
         {
             out = entry.items;
             ReleaseSRWLockShared(&FtpCacheLock());
@@ -977,4 +1019,34 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     }
     ReleaseSRWLockShared(&FtpCacheLock());
     return FALSE;
+}
+
+// 枚举用的"先内存、再磁盘"快照读取（EnumObjects 走这条）。
+//
+// 为什么必须读磁盘：EnumObjects 以前只调 FtpCachePeekAll（纯内存、明确无磁盘回退），
+// 于是"关掉资源管理器窗口再打开"必然是冷目录 —— 哪怕磁盘上的快照是几秒前刚写的，
+// 首屏也得先显示"正在载入…"占位、再等后台把同一个目录重新拉一遍。
+// 用户看到的就是"缓存完全没有持久化"。
+//
+// 保护：磁盘快照超过 8 MB（≈1.1 万项）就不在 UI 线程上搬，仍然交给后台预取 ——
+// 本地文件读虽然快，也不能让一个超大目录把资源管理器的 UI 线程占住。
+inline BOOL FtpCachePeekAllOrDisk(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out)
+{
+    if (FtpCachePeekAll(site, path, out)) return TRUE;
+
+    WCHAR file[MAX_PATH] = {};
+    if (FtpMetadataCacheFile(site, path, file, ARRAYSIZE(file)))
+    {
+        WIN32_FILE_ATTRIBUTE_DATA a = {};
+        if (GetFileAttributesExW(file, GetFileExInfoStandard, &a))
+        {
+            ULONGLONG size = ((ULONGLONG)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+            if (size > 8ULL * 1024 * 1024) { out.clear(); return FALSE; }
+        }
+    }
+
+    if (!FtpDiskCacheLoad(site, path, out, FTP_DISK_CACHE_MAX_AGE_MS) || out.empty()) return FALSE;
+    FtpCachePromote(site, path, out);   // 回填内存，后续查询直接命中
+    ProbeLog(L"[CACHE] disk snapshot hit site='%s' path='%s' n=%u", site, path, (UINT)out.size());
+    return TRUE;
 }

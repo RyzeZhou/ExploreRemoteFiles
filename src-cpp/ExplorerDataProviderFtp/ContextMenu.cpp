@@ -529,6 +529,10 @@ static void PermMakeValueFieldsFlat(HWND hDlg)
 // 只影响我们这一份属性表实例；提交一律走「确定」。
 #define ERF_IDAPPLY 0x3021
 
+// 权限页上那个提示气泡（见 PermAttachInputTooltip）。保存在这里是为了能在页面释放时
+// DestroyWindow —— 以前创建完就再也不管，每打开一次属性页就漏一个顶层窗口。
+static HWND g_permTip = NULL;
+
 static void PermHideApplyButton(HWND hDlg)
 {
     HWND w = hDlg;
@@ -536,12 +540,29 @@ static void PermHideApplyButton(HWND hDlg)
     {
         w = GetParent(w);
         if (!w) break;
+
+        // ⚠ 只允许碰**真正的属性表对话框**（#32770 且属于本进程）。
+        // 不校验的话，一旦宿主层级与预期不同（Win11 的 shell32 属性表宿主就是这样），
+        // 循环会一路向上命中"属性表窗口的 owner"——那是资源管理器自己的浏览器窗口或
+        // 共享 shell 窗口，对它 EnableWindow(FALSE)/ShowWindow(SW_HIDE) 的后果就是
+        // "其他资源管理器窗口全部变暗，必须先关掉属性页才恢复"（2026-09-18 Win11 实测症状）。
+        WCHAR cls[64] = {};
+        GetClassNameW(w, cls, ARRAYSIZE(cls));
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (0 != _wcsicmp(cls, L"#32770") || pid != GetCurrentProcessId())
+        {
+            ProbeLog(L"[DIAG] PropSheet: skip non-dialog ancestor cls='%s' pid=%lu", cls, pid);
+            continue;
+        }
+
         HWND apply = GetDlgItem(w, ERF_IDAPPLY);
         if (apply)
         {
+            // 只置灰（可恢复），**绝不 ShowWindow(SW_HIDE)**：隐藏不属于我们的窗口
+            // 后果不可预期；而且"没有改动时「应用」本来就是灰的"正是 Windows 原生行为。
             EnableWindow(apply, FALSE);
-            ShowWindow(apply, SW_HIDE);
-            ProbeLog(L"[DIAG] PropSheet: 隐藏「应用」按钮 hwnd=%p parent=%p", (void*)apply, (void*)w);
+            ProbeLog(L"[DIAG] PropSheet: apply button disabled hwnd=%p parent=%p", (void*)apply, (void*)w);
             return;
         }
     }
@@ -567,13 +588,17 @@ static void PermAttachInputTooltip(HWND hDlg)
                         L"可填名称或数字 ID（例：zhou 或 1000）；保留「名称 [ID]」原样即不修改。",
                         L"Accept a name or a numeric ID (e.g. zhou or 1000); keep \"name [ID]\" unchanged to skip.");
 
-    HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+    // owner 必须是**顶层窗口**：传子窗口（hDlg）是非法 owner，Win11 的新属性表宿主
+    // 对此更敏感 —— 提示气泡会被卷进激活链，表现为"其他资源管理器窗口像被模态挡住"。
+    // 同时不再用 WS_EX_TOPMOST / HWND_TOPMOST：一个输入提示没有理由压在所有窗口之上。
+    if (g_permTip) { DestroyWindow(g_permTip); g_permTip = NULL; }
+    HWND owner = GetAncestor(hDlg, GA_ROOT);
+    HWND tip = CreateWindowExW(0, TOOLTIPS_CLASSW, NULL,
                                WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
                                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-                               hDlg, NULL, g_hInst, NULL);
+                               owner ? owner : hDlg, NULL, g_hInst, NULL);
     if (!tip) return;
-    SetWindowPos(tip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    const int ids[] = { 3024, 3025 };
+    g_permTip = tip;    const int ids[] = { 3024, 3025 };
     for (int id : ids)
     {
         HWND ctl = GetDlgItem(hDlg, id);
@@ -1699,6 +1724,38 @@ static void AppendPsSingleQuoted(std::wstring &out, PCWSTR s)
     out += L'\'';
 }
 
+// ── 受管 SSH 别名：判断"这个别名是不是我们自己写的" ───────────────────────
+// 我们把站点信息写进 %USERPROFILE%\.ssh\config 的受管块（见 EnsureSshConfigAlias），
+// 别名由站点名**确定性**推出，所以不用读配置文件就能认出它属于我们。
+//
+// 为什么必须区分（2026-09-18 用户实测的坑）：
+//   客户端把 .ssh/config 里与站点匹配的 Host 列出来让用户绑定，而我们自己生成的
+//   受管块恰好满足"主机/端口/用户一致"，于是用户"绑定"的其实是我们上次生成的块
+//   （站点里存下 SshHostAlias=erf-<站点>）。此后每次开终端都直接用这个别名、
+//   再不刷新，块里那条 IdentityFile 一旦指向被删掉的私钥，就永远报
+//   `no such identity: …\ssh\erf_ed25519: No such file or directory` 然后莫名退回密码登录。
+static std::wstring ManagedAliasForSite(const FTPSITE &site)
+{
+    std::wstring safe;
+    for (PCWSTR p = site.name; p && *p; ++p)
+        safe += (iswalnum((wint_t)*p) || *p == L'-' || *p == L'_' || *p == L'.') ? *p : L'-';
+    if (safe.empty()) safe = L"site";
+    return L"erf-" + safe;
+}
+
+static BOOL EnsureSshConfigAlias(const FTPSITE &site, std::wstring &alias);   // 定义在下面
+static BOOL FindUserSshAliasForSite(const FTPSITE &site, std::wstring &alias); // 定义在下面
+
+// 别名是"我们自己的受管块"（或站点还没绑定别名）时，按当前站点信息把块重写一遍。
+// 用户的 Host 一律不碰。
+static void RefreshManagedAliasIfOurs(const FTPSITE &site)
+{
+    if (site.sshAlias[0] && _wcsicmp(site.sshAlias, ManagedAliasForSite(site).c_str()) != 0)
+        return;                                    // 用户自己绑的 Host：原样使用
+    std::wstring alias;
+    EnsureSshConfigAlias(site, alias);
+}
+
 // 把真正的 ssh 调用写进脚本文件，终端只负责"跑这个脚本"。
 //
 // 为什么不直接把 ssh 命令塞给 wt：Windows Terminal 有自己的命令行语法
@@ -1712,6 +1769,11 @@ static void AppendPsSingleQuoted(std::wstring &out, PCWSTR s)
 static BOOL WriteTerminalShim(const FTPSITE &site, PCWSTR remoteDir,
                               std::wstring &shimPath, std::wstring &sshCmdText)
 {
+    // 站点绑的是我们自己的受管别名（或还没绑定）时，先把 .ssh/config 里那一块按当前站点
+    // 信息重写一遍：否则一条指向"已被删掉的私钥"的 IdentityFile 会永远留在那里，
+    // 每次开终端都报 no such identity，然后莫名退回密码登录。
+    RefreshManagedAliasIfOurs(site);
+
     WCHAR local[MAX_PATH] = {};
     if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local))) return FALSE;
     std::wstring base = std::wstring(local) + L"\\ExplorerRemoteFs";
@@ -1749,10 +1811,19 @@ static BOOL WriteTerminalShim(const FTPSITE &site, PCWSTR remoteDir,
     sshCmdText = L"& ";
     AppendPsSingleQuoted(sshCmdText, sshExe);
     sshCmdText += L" -o StrictHostKeyChecking=accept-new";
+    std::wstring userAlias;
     if (site.sshAlias[0])
     {
         sshCmdText += L" ";
         AppendPsSingleQuoted(sshCmdText, site.sshAlias);
+    }
+    else if (FindUserSshAliasForSite(site, userAlias))
+    {
+        // 站点没绑定别名，但用户自己的 ~/.ssh/config 里有一条"同一台机器、同一个用户"的 Host
+        // → 直接复用它（密钥、ssh-agent、known_hosts 全部照旧），而不是退回
+        // "端口 + 私钥文件 + 交互式密码"。这正是用户要的"复用已有的 SSH 配置"。
+        sshCmdText += L" ";
+        AppendPsSingleQuoted(sshCmdText, userAlias.c_str());
     }
     else
     {
@@ -1760,8 +1831,18 @@ static BOOL WriteTerminalShim(const FTPSITE &site, PCWSTR remoteDir,
         sshCmdText += portText;
         if (site.keyPath[0])
         {
-            sshCmdText += L" -i ";
-            AppendPsSingleQuoted(sshCmdText, site.keyPath);
+            // 私钥文件可能早就不在了（换机器、清理过 %LOCALAPPDATA%、手工删过）。
+            // 直接把它交给 ssh 只会得到
+            //   "no such identity: …\ssh\erf_ed25519: No such file or directory"
+            // 然后莫名其妙地退回密码登录 —— 所以先确认文件真的在，不在就当没配过，
+            // 让 ssh 走 agent / 默认密钥 / 交互式密码。
+            if (GetFileAttributesW(site.keyPath) == INVALID_FILE_ATTRIBUTES)
+                ProbeLog(L"[TERM] PrivateKeyPath missing, ignored: '%s'", site.keyPath);
+            else
+            {
+                sshCmdText += L" -i ";
+                AppendPsSingleQuoted(sshCmdText, site.keyPath);
+            }
         }
         sshCmdText += L" ";
         AppendPsSingleQuoted(sshCmdText, target.c_str());
@@ -1792,11 +1873,7 @@ static BOOL WriteTerminalShim(const FTPSITE &site, PCWSTR remoteDir,
 // 只动我们自己标记之间的内容，其余配置原样保留。
 static BOOL EnsureSshConfigAlias(const FTPSITE &site, std::wstring &alias)
 {
-    std::wstring safe;
-    for (PCWSTR p = site.name; p && *p; ++p)
-        safe += (iswalnum((wint_t)*p) || *p == L'-' || *p == L'_' || *p == L'.') ? *p : L'-';
-    if (safe.empty()) safe = L"site";
-    alias = L"erf-" + safe;
+    alias = ManagedAliasForSite(site);
 
     WCHAR profile[MAX_PATH] = {};
     if (!GetEnvironmentVariableW(L"USERPROFILE", profile, ARRAYSIZE(profile))) return FALSE;
@@ -1836,7 +1913,14 @@ static BOOL EnsureSshConfigAlias(const FTPSITE &site, std::wstring &alias)
     block += L"    HostName " + std::wstring(site.host) + L"\r\n";
     block += L"    Port " + std::wstring(portText) + L"\r\n";
     block += L"    User " + std::wstring(site.user) + L"\r\n";
-    if (site.keyPath[0]) { block += L"    IdentityFile " + std::wstring(site.keyPath) + L"\r\n"; }
+    // 私钥文件不存在就**不要**写这一行：ssh 读到不存在的 IdentityFile 会报
+    // "no such identity: …（No such file or directory）" 然后再退回交互密码，
+    // 比不写更糟 —— 用户以为已经配好免密了。不写这一行，ssh 会正常走
+    // ssh-agent → 默认密钥（~/.ssh/id_*）→ 交互式密码。
+    if (site.keyPath[0] && GetFileAttributesW(site.keyPath) != INVALID_FILE_ATTRIBUTES)
+        block += L"    IdentityFile " + std::wstring(site.keyPath) + L"\r\n";
+    else if (site.keyPath[0])
+        ProbeLog(L"[TERM] ssh config: PrivateKeyPath missing, IdentityFile omitted: '%s'", site.keyPath);
     block += std::wstring(end.begin(), end.end()) + L"\r\n";
 
     std::string out = existing;
@@ -2188,6 +2272,163 @@ static void DeterministicGuid(PCWSTR name, WCHAR *out, UINT cch)
         hash[8], hash[9], hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]);
 }
 
+// ── 读用户自己的 ~/.ssh/config，找可以复用的 Host ─────────────────────────
+// 与 C# 侧 SshConfigReader 的语义必须一致（两边都保守）：
+//   · 跳过我们自己的受管块（那不是"用户已有的配置"，把它列出来就是让用户绑定到自己）
+//   · 主机名 / 用户名 / 端口三项全等才算匹配 —— 否则会出现"在本站点右键却登进另一台机器"
+//   · 带通配符的 Host、Match 块、Include 一律不展开
+struct SshConfigHost
+{
+    std::wstring alias;
+    std::wstring hostName;   // 没写 HostName 时，按 ssh 语义 = 别名本身
+    std::wstring user;
+    int port = 22;
+    bool managed = false;    // 落在我们的受管块里
+};
+
+static void ParseUserSshConfig(std::vector<SshConfigHost> &out)
+{
+    out.clear();
+    WCHAR profile[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"USERPROFILE", profile, ARRAYSIZE(profile))) return;
+    std::wstring cfg = std::wstring(profile) + L"\\.ssh\\config";
+    HANDLE h = CreateFileW(cfg.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    std::string raw;
+    DWORD size = GetFileSize(h, NULL);
+    if (size > 0 && size < 4u * 1024 * 1024)
+    {
+        raw.resize(size); DWORD got = 0;
+        if (ReadFile(h, &raw[0], size, &got, NULL)) raw.resize(got); else raw.clear();
+    }
+    CloseHandle(h);
+    if (raw.empty()) return;
+
+    std::wstring text;
+    int wide = MultiByteToWideChar(CP_UTF8, 0, raw.data(), (int)raw.size(), NULL, 0);
+    if (wide > 0) { text.resize((size_t)wide); MultiByteToWideChar(CP_UTF8, 0, raw.data(), (int)raw.size(), &text[0], wide); }
+
+    const std::wstring begin = L"# >>> ExploreRemoteFiles managed block >>>";
+    const std::wstring end   = L"# <<< ExploreRemoteFiles managed block <<<";
+    bool managed = false, inMatch = false, hasBlock = false;
+    SshConfigHost cur;
+    std::vector<std::wstring> names;
+
+    auto flush = [&]()
+    {
+        if (!names.empty())
+        {
+            std::wstring alias;
+            for (auto const &n : names)
+                if (n.find(L'*') == std::wstring::npos && n.find(L'?') == std::wstring::npos && n[0] != L'!')
+                { alias = n; break; }
+            if (!alias.empty())
+            {
+                SshConfigHost e = cur;
+                e.alias = alias;
+                if (e.hostName.empty()) e.hostName = alias;
+                e.managed = managed;
+                out.push_back(e);
+            }
+        }
+        names.clear(); cur = SshConfigHost(); hasBlock = false;
+    };
+
+    size_t pos = 0;
+    while (pos <= text.size())
+    {
+        size_t nl = text.find(L'\n', pos);
+        std::wstring line = text.substr(pos, (nl == std::wstring::npos ? text.size() : nl) - pos);
+        pos = (nl == std::wstring::npos) ? text.size() + 1 : nl + 1;
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' || line.back() == L'\t')) line.pop_back();
+        size_t st = 0; while (st < line.size() && (line[st] == L' ' || line[st] == L'\t')) ++st;
+        line = line.substr(st);
+
+        if (line == begin) { flush(); managed = true; continue; }
+        if (line == end)   { flush(); managed = false; continue; }
+        if (managed || line.empty() || line[0] == L'#') continue;
+
+        size_t sep = line.find_first_of(L" \t=");
+        std::wstring key = (sep == std::wstring::npos) ? line : line.substr(0, sep);
+        std::wstring val = (sep == std::wstring::npos) ? L"" : line.substr(sep + 1);
+        while (!val.empty() && (val.front() == L' ' || val.front() == L'\t' || val.front() == L'=')) val.erase(val.begin());
+
+        if (0 == _wcsicmp(key.c_str(), L"Host"))
+        {
+            flush(); inMatch = false; hasBlock = true;
+            size_t p2 = 0;
+            while (p2 < val.size())
+            {
+                size_t sp = val.find_first_of(L" \t", p2);
+                std::wstring n = val.substr(p2, (sp == std::wstring::npos ? val.size() : sp) - p2);
+                if (!n.empty()) names.push_back(n);
+                if (sp == std::wstring::npos) break;
+                p2 = sp + 1;
+            }
+        }
+        else if (0 == _wcsicmp(key.c_str(), L"Match")) { flush(); inMatch = true; }
+        else if (0 == _wcsicmp(key.c_str(), L"Include")) { /* 不展开：安全优先 */ }
+        else if (!inMatch && hasBlock)
+        {
+            if (0 == _wcsicmp(key.c_str(), L"HostName")) cur.hostName = val;
+            else if (0 == _wcsicmp(key.c_str(), L"User")) cur.user = val;
+            else if (0 == _wcsicmp(key.c_str(), L"Port")) { int p3 = _wtoi(val.c_str()); if (p3 > 0) cur.port = p3; }
+        }
+    }
+    flush();
+}
+
+// 站点没绑定别名时，先在这里找一条用户自己的 Host：找到就直接复用（主机/端口/用户全等），
+// 找不到才由我们生成受管块。这样"右键打开终端"优先用用户已有的密钥/agent/known_hosts。
+static BOOL FindUserSshAliasForSite(const FTPSITE &site, std::wstring &alias)
+{
+    std::vector<SshConfigHost> hosts;
+    ParseUserSshConfig(hosts);
+    int sitePort = site.port ? site.port : 22;
+    for (auto const &h : hosts)
+    {
+        if (h.managed) continue;
+        if (0 != _wcsicmp(h.hostName.c_str(), site.host)) continue;
+        if (0 != _wcsicmp(h.user.c_str(), site.user)) continue;
+        if (h.port != sitePort) continue;
+        alias = h.alias;
+        ProbeLog(L"[TERM] reusing user's ssh host '%s' for site '%s'", alias.c_str(), site.name);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// JSON 字符串转义：反斜杠、双引号、控制字符。
+// **凡是要放进 JSON 字符串的内容都必须走这里**，包括我们自己拼进去的包裹引号 ——
+// 旧代码只在循环里转义路径字符、把两个包裹引号加在循环外，写出的 fragment 不是合法 JSON，
+// WT 整份忽略，于是 `wt -p "ERF: <站点>"` 永远找不到 profile（用户看到"回退到本机默认路径"）。
+static void AppendJsonEscaped(std::wstring &out, PCWSTR s)
+{
+    for (PCWSTR p = s; p && *p; ++p)
+    {
+        switch (*p)
+        {
+        case L'"':  out += L"\\\""; break;
+        case L'\\': out += L"\\\\"; break;
+        case L'\n': out += L"\\n";  break;
+        case L'\r': out += L"\\r";  break;
+        case L'\t': out += L"\\t";  break;
+        default:
+            if (*p < 0x20)
+            {
+                WCHAR esc[8] = {};
+                StringCchPrintfW(esc, ARRAYSIZE(esc), L"\\u%04X", (UINT)(unsigned short)*p);
+                out += esc;
+            }
+            else
+            {
+                out += *p;
+            }
+        }
+    }
+}
+
 static BOOL WriteTerminalFragment(const FTPSITE &site, PCWSTR shimPath, std::wstring &profileName)
 {
     WCHAR local[MAX_PATH] = {};
@@ -2208,21 +2449,24 @@ static BOOL WriteTerminalFragment(const FTPSITE &site, PCWSTR shimPath, std::wst
     DeterministicGuid(site.name, guid, ARRAYSIZE(guid));
     profileName = L"ERF: " + std::wstring(site.name);
 
-    // JSON 里必须转义反斜杠与引号
-    std::wstring cmd = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"";
-    for (PCWSTR p = shimPath; p && *p; ++p)
-    {
-        if (*p == L'\\' || *p == L'"') cmd += L'\\';
-        cmd += *p;
-    }
-    cmd += L"\"";
+    // 先拼"真正要执行的命令行"（**含包裹引号**），再整体做 JSON 转义。
+    //
+    // 这里踩过一个必现的坑（2026-09-18 用户实测"wt 直接回退到本机默认路径"）：
+    // 旧代码把两个包裹引号加在转义循环**之外**，只有路径里的字符被转义，于是写出来是
+    //   "commandline": "powershell.exe … -File "C:\\…\\erf-WSL-SFTP.ps1""
+    // —— 这根本不是合法 JSON（两个裸引号提前结束了字符串），WT 对 fragment 是严格解析，
+    // 整份文件被忽略 ⇒ profile "ERF: <站点>" 不存在 ⇒ `wt -p "ERF: <站点>"` 回退到
+    // 默认 profile/默认起始目录。凡是"字符串里的引号"，都必须由转义函数统一处理。
+    std::wstring cmdRaw = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"";
+    cmdRaw += shimPath;
+    cmdRaw += L"\"";
 
     std::wstring json = L"{\r\n  \"profiles\": [\r\n    {\r\n      \"name\": \"";
-    json += profileName;
+    AppendJsonEscaped(json, profileName.c_str());
     json += L"\",\r\n      \"guid\": \"";
-    json += guid;
+    AppendJsonEscaped(json, guid);
     json += L"\",\r\n      \"hidden\": false,\r\n      \"commandline\": \"";
-    json += cmd;
+    AppendJsonEscaped(json, cmdRaw.c_str());
     json += L"\"\r\n    }\r\n  ]\r\n}\r\n";
 
     int bytes = WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(), NULL, 0, NULL, NULL);
@@ -2300,13 +2544,20 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
     else if (which == TERM_VSCODE)
     {
         // VS Code 没有"用命令行让集成终端跑一条命令"的接口，正规做法是 Remote-SSH：
-        // 复用优先：站点在服务程序里绑定了现有 SSH 配置就用它（用户自己的主机/端口/密钥/
-        // agent 设置全部照旧生效）；没绑定才写 ~/.ssh/config 的受管块。
+        // 复用优先：站点绑定了**用户自己的** SSH Host 就直接用它（主机/端口/密钥/agent 全照旧）；
+        // 绑定的是我们自己生成的受管别名（或还没绑定）时，按当前站点信息把它重写一遍 ——
+        // 这样一条指向已删除私钥的 IdentityFile 不会永远卡在那里。
         std::wstring alias;
-        if (site.sshAlias[0])
+        if (site.sshAlias[0] && _wcsicmp(site.sshAlias, ManagedAliasForSite(site).c_str()) != 0)
         {
             alias = site.sshAlias;
-            ProbeLog(L"[TERM] vscode using bound ssh alias '%s'", alias.c_str());
+            ProbeLog(L"[TERM] vscode using user's own ssh alias '%s'", alias.c_str());
+        }
+        else if (FindUserSshAliasForSite(site, alias))
+        {
+            // 用户自己的 Host 优先于我们生成的受管块 —— 否则 VS Code 连上的是
+            // "服务程序造出来的那个连接"，而不是用户已有的 SSH 配置。
+            ProbeLog(L"[TERM] vscode reusing user's ssh host '%s'", alias.c_str());
         }
         else if (!EnsureSshConfigAlias(site, alias))
         {
@@ -2644,6 +2895,10 @@ static UINT CALLBACK PermPageCallback(HWND /* hwnd */, UINT uMsg, LPPROPSHEETPAG
 {
     if (uMsg == PSPCB_RELEASE)
     {
+        // 提示气泡是我们自己创建的顶层窗口，页面释放时必须销毁 ——
+        // 以前从不销毁：每打开一次属性页就漏一个 TOOLTIPS_CLASS 窗口。
+        if (g_permTip) { DestroyWindow(g_permTip); g_permTip = NULL; }
+
         PROPMETA *pm = (PROPMETA*)ppsp->lParam;
         if (pm)
         {

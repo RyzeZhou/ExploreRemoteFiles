@@ -847,7 +847,10 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
         // FileGroupDescriptor/FileContents), so the earlier experiment of serving
         // the real children to STORAGE enumerations bought nothing but the
         // multi-second pre-count and the native transfer window (2026-09-06).
-        BOOL haveSnap = FtpCachePeekAll(m_szSiteName, m_szRemotePath, snapshot);
+        // 先内存、再磁盘快照：磁盘上那一份可能是几秒前刚写的（关窗口之前那次访问留下的），
+        // 直接拿来当首屏，用户看到的就是"热目录"，而不是"正在载入…"再重拉一遍。
+        // 纯本地文件读（带 8MB 上限保护），仍然绝不在 shell UI 线程上碰网络。
+        BOOL haveSnap = FtpCachePeekAllOrDisk(m_szSiteName, m_szRemotePath, snapshot);
         if (!haveSnap)
         {
             // Cold: never touch the network on the shell UI thread.

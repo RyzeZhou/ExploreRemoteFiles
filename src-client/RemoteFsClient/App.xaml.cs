@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -83,7 +83,11 @@ public partial class App : System.Windows.Application
         ErfNavigationRequest? pendingErfNavigation = null;
         if (erfAddress is not null)
         {
-            var sourceWindow = GetAncestor(GetForegroundWindow(), GaRoot);
+            // 这里**不要**做 GetAncestor(..., GA_ROOT)：Win11 的一个资源管理器窗口托管多个
+            // 标签页，它们共享同一个顶层 HWND，而 ShellWindows 每一项的 HWND 是标签页级的。
+            // 一旦把锚点归一成顶层窗口，后面的匹配就退化成"窗口级"，永远只能命中该窗口里
+            // 枚举序号最小的那个标签页（用户实测：在 A 标签页输入路径，却在固定的 B 标签页打开）。
+            var sourceWindow = CaptureTabAnchor();
             pendingErfNavigation = new ErfNavigationRequest(erfAddress, sourceWindow.ToInt64());
             ErfLog($"protocol entry invoked; address='{erfAddress}'; source=0x{sourceWindow.ToInt64():X}");
 
@@ -364,30 +368,53 @@ public partial class App : System.Windows.Application
         }
     }
 
+    /// <summary>
+    /// 取"当前活动标签页"的锚点窗口：前台线程的焦点子窗口（没有焦点时退到活动窗口）。
+    /// 标签页身份只存在于这种**标签页内**的子窗口里 —— 顶层 HWND 是所有标签页共享的。
+    /// </summary>
+    private static IntPtr CaptureTabAnchor()
+    {
+        try
+        {
+            var gui = new GuiThreadInfo { cbSize = Marshal.SizeOf<GuiThreadInfo>() };
+            if (GetGuiThreadInfo(0, ref gui))   // 0 = 前台线程
+            {
+                if (gui.hwndFocus != IntPtr.Zero) return gui.hwndFocus;
+                if (gui.hwndActive != IntPtr.Zero) return gui.hwndActive;
+            }
+        }
+        catch
+        {
+            // 拿不到就算了：退回前台窗口（行为与旧实现一致）
+        }
+        return GetForegroundWindow();
+    }
+
     private static bool TryNavigateForegroundExplorer(string parsingName, IntPtr sourceWindow)
     {
-        // A URI protocol handler is launched out-of-process.  By the time the
-        // resident service has warmed the remote path, Explorer may have
-        // changed foreground ownership, even though the HWND captured by the
-        // short-lived protocol shim is still the correct source browser.
-        // Prefer that original HWND, but also consider the Explorer window
-        // currently in the foreground.  Do not use only one of them: doing so
-        // was the reason a valid request fell through to ShellExecuteEx and
-        // opened a second Explorer window.
-        var candidates = new HashSet<IntPtr>();
-        var original = sourceWindow == IntPtr.Zero ? IntPtr.Zero : GetAncestor(sourceWindow, GaRoot);
-        var current = GetAncestor(GetForegroundWindow(), GaRoot);
-        if (original != IntPtr.Zero) candidates.Add(original);
-        if (current != IntPtr.Zero) candidates.Add(current);
-        if (candidates.Count == 0)
+        // 标签页定位（2026-09-18 修"在 A 标签页输入路径却在固定的 B 标签页打开"）：
+        //   · 锚点（sourceWindow）现在是**标签页级**句柄（前台线程的焦点子窗口），不再 GA_ROOT；
+        //   · 对 ShellWindows 的每一项按"精确同一句柄 → 同一标签页子树 → 同一顶层窗口"打分，
+        //     取分最高的一项，而不是"见到第一个匹配就 return"。
+        //     旧实现在多标签下所有标签页的分数都一样（都归一成同一个顶层窗口），
+        //     于是永远命中枚举序号最小的那个 —— 这正是"错误标签页比较固定"的来源。
+        // 为什么还保留"同一顶层窗口"这一档：Win10 一个窗口一个视图，锚点与标签页句柄
+        // 本来就在同一棵树里，这一档是它的正常路径，也是锚点失效时的兜底。
+        var anchor = sourceWindow;
+        var anchorRoot = anchor == IntPtr.Zero ? IntPtr.Zero : GetAncestor(anchor, GaRoot);
+        var currentRoot = GetAncestor(GetForegroundWindow(), GaRoot);
+        if (anchor == IntPtr.Zero && currentRoot == IntPtr.Zero)
         {
             ErfLog("no source or foreground window available for in-place navigation");
             return false;
         }
 
-        ErfLog($"in-place navigation candidates: source=0x{original.ToInt64():X}; current=0x{current.ToInt64():X}");
+        ErfLog($"in-place navigation anchor=0x{anchor.ToInt64():X}; anchorRoot=0x{anchorRoot.ToInt64():X}; currentRoot=0x{currentRoot.ToInt64():X}");
 
         object? shellWindows = null;
+        object? bestBrowser = null;
+        var bestTab = IntPtr.Zero;
+        var bestScore = 0;
         try
         {
             var type = Type.GetTypeFromCLSID(ShellWindowsClsid);
@@ -420,31 +447,33 @@ public partial class App : System.Windows.Application
                         shellWindows,
                         [index]);
                     if (browserObject is null) continue;
-                    var browserHandle = Convert.ToInt64(browserObject.GetType().InvokeMember(
+
+                    var tabHandle = new IntPtr(Convert.ToInt64(browserObject.GetType().InvokeMember(
                         "HWND",
                         System.Reflection.BindingFlags.GetProperty,
                         null,
                         browserObject,
-                        null));
-                    var browserWindow = GetAncestor(new IntPtr(browserHandle), GaRoot);
-                    var matched = candidates.Contains(browserWindow);
-                    ErfLog($"ShellWindows[{index}] hwnd=0x{browserWindow.ToInt64():X}; matched={matched}");
-                    if (!matched) continue;
+                        null)));
+                    var tabRoot = GetAncestor(tabHandle, GaRoot);
 
-                    // Navigate2 accepts Shell parsing names and keeps the
-                    // matched browser window/tab rather than ShellExecuteEx
-                    // creating a new Explorer window.  Invoke it exactly as
-                    // Shell.Application automation does: pass only the URL and
-                    // let COM supply the optional VARIANT arguments.  Explicit
-                    // Type.Missing values are rejected by this Explorer host.
-                    browserObject.GetType().InvokeMember(
-                        "Navigate2",
-                        System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.OptionalParamBinding,
-                        null,
-                        browserObject,
-                        [parsingName]);
-                    ErfLog($"requested in-place navigation; hwnd=0x{browserWindow.ToInt64():X}; target='{parsingName}'");
-                    return true;
+                    var score = 0;
+                    if (anchor != IntPtr.Zero && tabHandle == anchor) score = 4;
+                    else if (anchor != IntPtr.Zero && (IsChild(tabHandle, anchor) || IsChild(anchor, tabHandle))) score = 3;
+                    else if (anchorRoot != IntPtr.Zero && tabRoot == anchorRoot) score = 2;
+                    else if (currentRoot != IntPtr.Zero && tabRoot == currentRoot) score = 1;
+
+                    ErfLog($"ShellWindows[{index}] tab=0x{tabHandle.ToInt64():X} root=0x{tabRoot.ToInt64():X}; score={score}");
+                    if (score == 0) continue;
+
+                    if (score > bestScore)
+                    {
+                        if (bestBrowser is not null && Marshal.IsComObject(bestBrowser))
+                            Marshal.FinalReleaseComObject(bestBrowser);
+                        bestBrowser = browserObject;
+                        browserObject = null;          // 所有权移交给 bestBrowser，交给下面的 finally 释放
+                        bestTab = tabHandle;
+                        bestScore = score;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -462,6 +491,26 @@ public partial class App : System.Windows.Application
                         Marshal.FinalReleaseComObject(browserObject);
                 }
             }
+
+            if (bestBrowser is null)
+            {
+                ErfLog("no ShellWindows entry matched the source tab; falling back to a new window");
+                return false;
+            }
+
+            // Navigate2 accepts Shell parsing names and keeps the matched
+            // browser window/tab rather than ShellExecuteEx creating a new
+            // Explorer window.  Invoke it exactly as Shell.Application
+            // automation does: pass only the URL and let COM supply the
+            // optional VARIANT arguments.
+            bestBrowser.GetType().InvokeMember(
+                "Navigate2",
+                System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.OptionalParamBinding,
+                null,
+                bestBrowser,
+                [parsingName]);
+            ErfLog($"requested in-place navigation; tab=0x{bestTab.ToInt64():X}; score={bestScore}; target='{parsingName}'");
+            return true;
         }
         catch (Exception ex)
         {
@@ -469,6 +518,8 @@ public partial class App : System.Windows.Application
         }
         finally
         {
+            if (bestBrowser is not null && Marshal.IsComObject(bestBrowser))
+                Marshal.FinalReleaseComObject(bestBrowser);
             if (shellWindows is not null && Marshal.IsComObject(shellWindows))
                 Marshal.FinalReleaseComObject(shellWindows);
         }
@@ -520,6 +571,30 @@ public partial class App : System.Windows.Application
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetAncestor(IntPtr window, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GuiRect { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GuiThreadInfo
+    {
+        public int cbSize;
+        public uint flags;
+        public IntPtr hwndActive;
+        public IntPtr hwndFocus;
+        public IntPtr hwndCapture;
+        public IntPtr hwndMenuOwner;
+        public IntPtr hwndMoveSize;
+        public IntPtr hwndCaret;
+        public GuiRect rcCaret;
+    }
+
+    /// <summary>前台线程的焦点/活动子窗口 —— 标签页身份就藏在这里（见 CaptureTabAnchor）。</summary>
+    [DllImport("user32.dll")]
+    private static extern bool GetGuiThreadInfo(uint idThread, ref GuiThreadInfo lpgui);
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
