@@ -3,34 +3,55 @@
 # "不装安装包、直接脚本注册"的开发/排障场景，注册语义两边要保持一致，改动时都看一眼。
 # 用法：右键"使用 PowerShell 运行"，或
 #   powershell -ExecutionPolicy Bypass -File install.ps1
+#
+# 2026-09-18：不再终止资源管理器（旧版会 Stop-Process explorer，桌面黑 1–3 秒）。
+# 扩展 DLL 被 explorer 映射着时删不掉/覆盖不了，用"改名成 .old"绕开 —— 见 Move-DllAside。
+# 代价：新版本扩展要等资源管理器下次启动才生效（注销/重启，或任务管理器里重启 explorer）。
 param(
     [string]$InstallDir = "$env:LOCALAPPDATA\ExplorerRemoteFs"
 )
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-$explorerWasRunning = $null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue)
+# 已被映射的文件既不能删也不能覆盖，但**可以改名**（只是改目录项，文件对象还在内存里）。
+# 所以：先试着直接删（explorer 没加载过它时能删掉，最干净），删不掉就改名 .old，
+# 新文件随后写到原路径上。.old 交给下次登录的 RunOnce 清掉。
+function Move-DllAside([string]$DllPath, [string]$InstallDir) {
+    if (-not (Test-Path -LiteralPath $DllPath)) { return $null }
+    try { Remove-Item -LiteralPath $DllPath -Force -ErrorAction Stop; return $null } catch { }
+    $old = "$DllPath.old"
+    $n = 1
+    while ((Test-Path -LiteralPath $old) -and $n -lt 20) {
+        try { Remove-Item -LiteralPath $old -Force -ErrorAction Stop } catch { }
+        if (Test-Path -LiteralPath $old) { $n++; $old = "$DllPath.old$n" }
+    }
+    Move-Item -LiteralPath $DllPath -Destination $old -Force
+    Write-Host "==> 扩展 DLL 正被资源管理器占用，已改名为 $(Split-Path -Leaf $old)（下次登录自动清理）"
+    # RunOnce 的值是**整条命令行**，必须自己带上 cmd.exe；rd 不带 /s，绝不会误删用户重装的目录
+    $runOnce = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+    New-Item -Path $runOnce -Force | Out-Null
+    Set-ItemProperty -Path $runOnce -Name ErfCleanup -Type String `
+        -Value ('"{0}" /c del /f /q "{1}" & rd "{2}" 2>nul' -f $env:ComSpec, $old, $InstallDir)
+    return $old
+}
+
 try {
 # The resident tray service keeps the CLI/GUI exes locked (named-pipe bridge
 # host); terminate it FIRST or file copies below fail with access denied.
+# CLI 子进程一样会锁住 cli\*.dll（实测 2026-09-17：卸载后整个 cli 目录删不掉）。
 #
-# 同样要临时关掉"资源管理器自动重启"：杀掉 explorer 后 Windows 默认会立刻拉起来，
-# 新 explorer 马上把旧 DLL 映射回去 → Copy-Item 覆盖失败（实测：装完还是旧版本）。
-$winlogon = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
-$autoRestart = (Get-ItemProperty -Path $winlogon -Name AutoRestartShell -ErrorAction SilentlyContinue).AutoRestartShell
-try { New-Item -Path $winlogon -Force | Out-Null; Set-ItemProperty -Path $winlogon -Name AutoRestartShell -Value 0 -Type DWord } catch { }
+# 注意这里**没有** Stop-Process explorer：扩展 DLL 的占用改用"改名"绕开，
+# 桌面不黑屏、也不动 AutoRestartShell（旧版把它写成 0 且中途失败就再也回不来）。
 Stop-Process -Name RemoteFsClient -Force -ErrorAction SilentlyContinue
-# CLI 子进程一样会锁住 cli\*.dll（实测 2026-09-17：卸载后整个 cli 目录删不掉）
 Stop-Process -Name ExplorerRemoteFs.Cli -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
-Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 800
 
 Write-Host "==> Installing ExplorerRemoteFs to $InstallDir"
 
 # 1. Copy DLL + CLI + GUI client
 New-Item -ItemType Directory -Force -Path "$InstallDir\cli"  | Out-Null
 New-Item -ItemType Directory -Force -Path "$InstallDir\client" | Out-Null
+Move-DllAside -DllPath (Join-Path $InstallDir 'ExplorerDataProviderFtp.dll') -InstallDir $InstallDir | Out-Null
 Copy-Item "$here\ExplorerDataProviderFtp.dll" "$InstallDir\" -Force
 Copy-Item "$here\cli\*"  "$InstallDir\cli\"  -Force -Recurse
 Copy-Item "$here\client\*" "$InstallDir\client\" -Force -Recurse
@@ -141,15 +162,10 @@ Write-Host "or create %APPDATA%\ExplorerRemoteFs\connections.json manually (see 
 
 }
 finally {
-    # 恢复"资源管理器自动重启"的原值（原来没有这个值就删掉我们加的）
-    try {
-        if ($null -eq $autoRestart) { Remove-ItemProperty -Path $winlogon -Name AutoRestartShell -ErrorAction SilentlyContinue }
-        else { Set-ItemProperty -Path $winlogon -Name AutoRestartShell -Value $autoRestart -Type DWord }
-    } catch { }
-    if ($explorerWasRunning) {
-        Start-Process explorer.exe
-        Start-Sleep -Seconds 1
-    }
+    # 没有需要还原的全局设置：本脚本不碰 explorer，也不碰 AutoRestartShell。
+    # （旧版在这里把 AutoRestartShell 恢复原值并重新拉起 explorer —— 现在两者都不需要了；
+    #   顺带说明为什么旧写法危险：一旦脚本在中途被杀，那个 0 就留在用户机器上，
+    #   此后资源管理器崩了 Windows 再也不会自动把它拉回来，桌面就一直黑着。）
 }
 
 
