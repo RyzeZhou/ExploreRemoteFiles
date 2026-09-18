@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.IO.Pipes;
 using System.Text;
 using ExplorerRemoteFs.Config;
@@ -161,6 +161,34 @@ public sealed class RemoteBridgeService : IDisposable
             return;
         }
 
+        // FETCH：把远程文件下载到本地临时文件（复制 / 拖拽的下载方向）。
+        //
+        // 与 DELETE / CHMOD 完全同形，也是架构约束要求的形态：Shell DLL 只负责
+        // Shell/PIDL/视图/菜单，会话、连接、缓存、传输队列都归常驻服务。
+        // 以前是 Shell DLL 自己 CreateProcess(cli get) + WaitForSingleObject(INFINITE)：
+        // 每个文件一个进程、一次全新登录，"一次复制 10 个文件"就是 10 个进程 10 次握手，
+        // 而且复制期间 Explorer 全程卡着。现在复用 ProviderFactory 会话，下载进传输队列
+        //（有进度、可取消），桥接边界只等最终 OK/FAIL。
+        //
+        // batchId 把"同一次用户复制操作"的所有文件归到一组，队列 UI 据此折叠显示。
+        if (string.Equals(operation, "FETCH", StringComparison.Ordinal))
+        {
+            string? fetchSite = await reader.ReadLineAsync(token);
+            string? fetchRemote = await reader.ReadLineAsync(token);
+            string? fetchLocal = await reader.ReadLineAsync(token);
+            string? fetchBatch = await reader.ReadLineAsync(token);
+            if (string.IsNullOrWhiteSpace(fetchSite) || string.IsNullOrWhiteSpace(fetchRemote) ||
+                string.IsNullOrWhiteSpace(fetchLocal))
+            {
+                await writer.WriteLineAsync("FAIL: invalid fetch request");
+                return;
+            }
+            var fetchResult = await FetchAsync(fetchSite, fetchRemote, fetchLocal, fetchBatch ?? string.Empty);
+            _status?.ReportSite(fetchSite, fetchResult.StartsWith("OK", StringComparison.Ordinal));
+            await writer.WriteLineAsync(fetchResult);
+            return;
+        }
+
         string? siteName = await reader.ReadLineAsync(token);
         string? path = await reader.ReadLineAsync(token);
         if (!string.Equals(operation, "LIST", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(siteName))
@@ -265,6 +293,68 @@ public sealed class RemoteBridgeService : IDisposable
         catch (Exception ex)
         {
             ProviderFactory.Invalidate(siteName);
+            progress?.Complete(false, false, ex.Message);
+            return $"FAIL: {SanitizeBridgeError(ex.Message)}";
+        }
+        finally
+        {
+            if (gateHeld) _providerGate.Release();
+        }
+    }
+
+    /// <summary>诊断日志（%TEMP%/rfs-tasks.log，与 TransferTaskService / SshConfigReader 同一份）。</summary>
+    private static void Log(string message)
+    {
+        try
+        {
+            File.AppendAllText(Path.Combine(Path.GetTempPath(), "rfs-tasks.log"),
+                DateTime.Now.ToString("HH:mm:ss.fff") + " " + message + Environment.NewLine);
+        }
+        catch { }
+    }
+
+    /// <summary>下载一个远程文件到本地路径：与删除同构 —— 跑在常驻服务的 Provider 会话上、
+    /// 进传输队列（带进度与「取消」），完成后把 OK / FAIL 回给 Explorer。
+    ///
+    /// 取消语义（用户实测过的坑）：用户在队列里点「取消」时回 <c>FAIL: cancelled</c>，
+    /// 扩展侧据此**不再重试** —— 否则复制引擎的重试会让同一个文件过一会儿又自己下起来。</summary>
+    private async Task<string> FetchAsync(string siteName, string remotePath, string localPath, string batchId)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        OperationHandle? progress = null;
+        bool gateHeld = false;
+        try
+        {
+            var connection = FindConnection(siteName);
+            var remote = NormalizeRemotePath(remotePath);
+            if (string.IsNullOrWhiteSpace(localPath))
+                return "FAIL: missing local path";
+
+            progress = _operationQueue?.Begin(siteName, remote,
+                RemoteOperationQueueWindow.OperationKind.Download,
+                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } },
+                batchId);
+            progress?.Update(0, 0, Ui.IsEnglish ? "Waiting for remote connection" : "等待远程连接");
+
+            await _providerGate.WaitAsync(cancellation.Token);
+            gateHeld = true;
+            var fs = ProviderFactory.Get(connection);
+            var fileName = System.IO.Path.GetFileName(localPath);
+            await Task.Run(() => fs.Download(remote, localPath,
+                (done, total) => progress?.Update(done, total, fileName), false), cancellation.Token);
+
+            progress?.Complete(true, false, null);
+            Log($"fetch ok site='{siteName}' remote='{remote}' -> '{localPath}' batch='{batchId}'");
+            return "OK";
+        }
+        catch (OperationCanceledException)
+        {
+            progress?.Complete(false, true, null);
+            Log($"fetch cancelled site='{siteName}' remote='{remotePath}' batch='{batchId}'");
+            return "FAIL: cancelled";
+        }
+        catch (Exception ex)
+        {
             progress?.Complete(false, false, ex.Message);
             return $"FAIL: {SanitizeBridgeError(ex.Message)}";
         }

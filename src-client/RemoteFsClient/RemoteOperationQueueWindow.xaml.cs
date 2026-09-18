@@ -22,20 +22,25 @@ namespace RemoteFsClient;
 public partial class RemoteOperationQueueWindow : Window
 {
     /// <summary>操作种类，决定条目文案与颜色。</summary>
-    public enum OperationKind { Delete, Chmod }
+    public enum OperationKind { Delete, Chmod, Download }
 
     private readonly string _site;
     private readonly ObservableCollection<Entry> _entries = new();
+    /// <summary>UI 上按"一次用户操作"分组的视图（见 BatchGroup）。</summary>
+    private readonly ObservableCollection<BatchGroup> _groups = new();
     private readonly DispatcherTimer _autoClose;
     private bool _allowClose;
 
     public string Site => _site;
 
+    /// <summary>自检用：当前的分组视图（见 QueueSelfTest 的"一次复制 = 一个任务组"用例）。</summary>
+    internal IReadOnlyList<BatchGroup> GroupsForTest => _groups;
+
     public RemoteOperationQueueWindow(string site)
     {
         InitializeComponent();
         _site = site;
-        Entries.ItemsSource = _entries;
+        Groups.ItemsSource = _groups;
 
         Title = Ui.T("OpQueueTitle").Replace("{0}", site);
         TitleText.Text = Title;
@@ -65,13 +70,27 @@ public partial class RemoteOperationQueueWindow : Window
     }
 
     /// <summary>追加一个条目，返回它的句柄（服务层用它回报进度/结果）。</summary>
-    public Entry AddEntry(string path, OperationKind kind, Action cancel)
+    public Entry AddEntry(string path, OperationKind kind, Action cancel, string batchId = "")
     {
-        var entry = new Entry(path, kind, cancel);
+        var entry = new Entry(path, kind, cancel, batchId);
         // 条目自己发生变化就刷新汇总/任务栏：不依赖调用方记得再调一次 Refresh
         // （自检就抓到过这个漏洞——直接 Complete 会让汇总一直停在"进行中"）。
         entry.Changed = Refresh;
         _entries.Add(entry);
+
+        // 按批次归组：**一次复制 = 一个可折叠的任务**（用户明确要求）。
+        // batchId 由 Shell 扩展在"一次复制操作"里生成（一个数据对象一个 id），
+        // 服务侧原样透传；没有批次的单发操作（删除 / 改权限）各自成一组，
+        // 展开后与原来看不出区别。
+        var key = string.IsNullOrEmpty(batchId) ? "single-" + _entries.Count.ToString() : batchId;
+        var group = _groups.FirstOrDefault(g => g.BatchId == key);
+        if (group is null)
+        {
+            group = new BatchGroup(key, kind);
+            _groups.Insert(0, group);          // 最新的一组排在最上面
+        }
+        group.Entries.Add(entry);
+
         _autoClose.Stop();
         Refresh();
         return entry;
@@ -80,6 +99,9 @@ public partial class RemoteOperationQueueWindow : Window
     /// <summary>重算标题、汇总、按钮可用性与任务栏进度。UI 线程专用。</summary>
     public void Refresh()
     {
+        // 组头（"下载 · 3 个文件" + 组内汇总）跟着一起刷 —— Entry 状态一变就会走到这里。
+        foreach (var g in _groups) g.Update();
+
         int active = _entries.Count(e => !e.IsFinished);
         int done = _entries.Count(e => e.IsFinished && e.Succeeded);
         int failed = _entries.Count(e => e.IsFinished && !e.Succeeded && !e.WasCancelled);
@@ -183,6 +205,75 @@ public partial class RemoteOperationQueueWindow : Window
     }
 
     /// <summary>队列里的一个条目。所有 setter 都通知绑定（进度条/状态/按钮）。</summary>
+    /// <summary>一次用户操作（例如"复制这几个文件"）在队列里的分组。
+    /// 同批次的条目折叠在一个 Expander 里 —— 用户要求：一次复制是一个任务，
+    /// 任务内每个文件可展开查看。</summary>
+    public sealed class BatchGroup : INotifyPropertyChanged
+    {
+        private bool _isExpanded = true;
+        private string _headerText = "";
+        private string _summaryText = "";
+
+        public string BatchId { get; }
+        public OperationKind Kind { get; }
+        public ObservableCollection<Entry> Entries { get; } = new();
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+        private void Raise([CallerMemberName] string? name = null) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+        internal BatchGroup(string batchId, OperationKind kind)
+        {
+            BatchId = batchId;
+            Kind = kind;
+            Update();
+        }
+
+        /// <summary>展开/收起（两向绑定）。</summary>
+        public bool IsExpanded
+        {
+            get => _isExpanded;
+            set { if (_isExpanded != value) { _isExpanded = value; Raise(); } }
+        }
+
+        /// <summary>组头：种类 + 文件数。只读属性 → XAML 里必须显式 Mode=OneWay：
+        /// RangeBase.Value 那次事故（默认 TwoWay 绑到只读属性 → XamlParseException 把常驻服务整个带崩）
+        /// 对任何只读属性都成立。</summary>
+        public string HeaderText
+        {
+            get => _headerText;
+            private set { _headerText = value; Raise(); }
+        }
+
+        /// <summary>组内汇总：还有几个在跑，或完成/失败/取消各几个。</summary>
+        public string SummaryText
+        {
+            get => _summaryText;
+            private set { _summaryText = value; Raise(); }
+        }
+
+        internal void Update()
+        {
+            var label = Kind switch
+            {
+                OperationKind.Delete => Ui.T("OpKindDelete"),
+                OperationKind.Chmod => Ui.T("OpKindChmod"),
+                _ => Ui.T("OpKindDownload"),
+            };
+            HeaderText = Ui.T("OpBatchHeader").Replace("{0}", label).Replace("{1}", Entries.Count.ToString());
+
+            int finished = Entries.Count(e => e.IsFinished);
+            int failed = Entries.Count(e => e.IsFinished && !e.Succeeded && !e.WasCancelled);
+            int cancelled = Entries.Count(e => e.WasCancelled);
+            SummaryText = finished < Entries.Count
+                ? Ui.T("OpQueueRunning").Replace("{0}", (Entries.Count - finished).ToString())
+                                        .Replace("{1}", finished.ToString())
+                : Ui.T("OpQueueFinished").Replace("{0}", Math.Max(0, Entries.Count - failed - cancelled).ToString())
+                                         .Replace("{1}", failed.ToString())
+                                         .Replace("{2}", cancelled.ToString());
+        }
+    }
+
     public sealed class Entry : INotifyPropertyChanged
     {
         private readonly Action _cancel;
@@ -195,6 +286,8 @@ public partial class RemoteOperationQueueWindow : Window
 
         public string Path { get; }
         public OperationKind Kind { get; }
+        /// <summary>同一次用户复制操作的所有文件共用一个批次 id —— 队列 UI 按它折叠成一组。</summary>
+        public string BatchId { get; }
         public long Done { get; private set; }
         public long Total { get; private set; }
         public bool IsFinished { get; private set; }
@@ -202,12 +295,20 @@ public partial class RemoteOperationQueueWindow : Window
         public bool WasCancelled { get; private set; }
         public string? Detail { get; private set; }
 
-        public string KindLabel => Kind == OperationKind.Delete ? Ui.T("OpKindDelete") : Ui.T("OpKindChmod");
+        public string KindLabel => Kind switch
+        {
+            OperationKind.Delete => Ui.T("OpKindDelete"),
+            OperationKind.Chmod => Ui.T("OpKindChmod"),
+            _ => Ui.T("OpKindDownload"),
+        };
 
         // 用全名：本项目同时引用了 WinForms（托盘图标），Brush/Color 会与 System.Drawing 撞名。
-        public System.Windows.Media.Brush KindBrush => Kind == OperationKind.Delete
-            ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xB0, 0x30, 0x2C))    // 删除：偏红，破坏性
-            : new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x1F, 0x5C, 0x99));   // 改权限：偏蓝
+        public System.Windows.Media.Brush KindBrush => Kind switch
+        {
+            OperationKind.Delete => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xB0, 0x30, 0x2C)),   // 删除：偏红，破坏性
+            OperationKind.Chmod => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x1F, 0x5C, 0x99)),    // 改权限：偏蓝
+            _ => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x1E, 0x7A, 0x3C)),                     // 下载：偏绿
+        };
 
         public string Status
         {
@@ -239,10 +340,11 @@ public partial class RemoteOperationQueueWindow : Window
             private set => Set(ref _canCancel, value);
         }
 
-        internal Entry(string path, OperationKind kind, Action cancel)
+        internal Entry(string path, OperationKind kind, Action cancel, string batchId = "")
         {
             Path = path;
             Kind = kind;
+            BatchId = batchId;
             _cancel = cancel;
             _status = Ui.T("OpQueued");   // 先"排队中"，真正开始连远端时服务层会改成"等待远程连接"
             _cancelLabel = Ui.T("OpCancel");

@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Text;
 using RemoteFsClient.Services;
 
@@ -132,5 +132,35 @@ internal static class QueueSelfTest
         toCancel.Complete(false, true, null);
 
         window.CloseForSelfTest();
+
+        // ── 一次复制 = 一个可折叠的任务组（用户明确要求）
+        // 服务侧是逐文件下载，但 UI 必须按"一次用户操作"折叠：同一个 batchId 的多个文件
+        // 归到一个 Expander 里，组头写明种类与文件数。
+        var copyWindow = new RemoteOperationQueueWindow("WSL-SFTP");
+        copyWindow.ShowInTaskbar = false;
+        copyWindow.Left = -32000;
+        copyWindow.Top = -32000;
+        copyWindow.Show();
+        const string batchA = "batch-A";
+        const string batchB = "batch-B";
+        copyWindow.AddEntry("/a/1.txt", RemoteOperationQueueWindow.OperationKind.Download, () => { }, batchA);
+        copyWindow.AddEntry("/a/2.txt", RemoteOperationQueueWindow.OperationKind.Download, () => { }, batchA);
+        copyWindow.AddEntry("/a/3.txt", RemoteOperationQueueWindow.OperationKind.Download, () => { }, batchA);
+        copyWindow.AddEntry("/b/1.txt", RemoteOperationQueueWindow.OperationKind.Download, () => { }, batchB);
+        Pump(copyWindow);
+
+        Check(copyWindow.GroupsForTest.Count == 2,
+              $"一次复制的 3 个文件折叠成一个任务组：分组数={copyWindow.GroupsForTest.Count}（期望 2）");
+        var groupA = copyWindow.GroupsForTest.FirstOrDefault(g => g.BatchId == batchA);
+        Check(groupA is not null && groupA.Entries.Count == 3,
+              $"同批次的文件都在同一组里：{(groupA is null ? -1 : groupA.Entries.Count)} 个（期望 3）");
+        Check(groupA is not null && groupA.HeaderText.Contains("3"),
+              $"组头写明种类与文件数：{groupA?.HeaderText}");
+        Check(copyWindow.GroupsForTest.All(g => g.IsExpanded), "新组默认展开（进度立刻可见）");
+        groupA?.Entries[0].Complete(true, false, null);
+        copyWindow.Refresh();
+        Check(groupA is not null && groupA.SummaryText.Length > 0,
+              $"组头带组内汇总：{groupA?.SummaryText}");
+        copyWindow.Close();
     }
 }

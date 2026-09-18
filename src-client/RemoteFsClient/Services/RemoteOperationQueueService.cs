@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 using System.Windows.Threading;
 
 namespace RemoteFsClient.Services;
@@ -16,7 +16,8 @@ public sealed class RemoteOperationQueueService
     public RemoteOperationQueueService(Dispatcher dispatcher) => _dispatcher = dispatcher;
 
     public OperationHandle Begin(string site, string path,
-                                 RemoteOperationQueueWindow.OperationKind kind, Action cancel) =>
+                                 RemoteOperationQueueWindow.OperationKind kind, Action cancel,
+                                 string batchId = "") =>
         _dispatcher.Invoke(() =>
         {
             if (!_windows.TryGetValue(site, out var window) || !window.IsVisible)
@@ -36,7 +37,7 @@ public sealed class RemoteOperationQueueService
                 window.WindowState = WindowState.Normal;
             }
 
-            var entry = window.AddEntry(path, kind, cancel);
+            var entry = window.AddEntry(path, kind, cancel, batchId);
             window.Activate();
             return new OperationHandle(_dispatcher, window, entry);
         });

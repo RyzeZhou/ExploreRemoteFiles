@@ -34,28 +34,18 @@ inline std::wstring RfsCliPath()
     return p;
 }
 
-// Synchronous `cli get <site> <remote> <local>`; TRUE on success. (Top-level
-// single-file copies still use this — one job per file.)
-inline BOOL RfsFetchToFile(PCWSTR site, PCWSTR remote, PCWSTR local)
+// 单文件下载：**交给常驻服务**（见 FtpBridgeFetch 的说明）。
+// 这里不再 CreateProcess(cli get) + WaitForSingleObject(INFINITE)：
+// Shell DLL 不启动 CLI，会话复用 / 传输队列 / 进度 / 取消都归常驻服务。
+// batchId 让"同一次复制"的所有文件在队列里归到一组。
+// reply 回传服务的原话（"FAIL: cancelled" 用来区分"用户取消"和"瞬时失败"）。
+inline BOOL RfsFetchToFile(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &reply)
 {
-    std::wstring cli = RfsCliPath();
-    if (cli.empty() || GetFileAttributesW(cli.c_str()) == INVALID_FILE_ATTRIBUTES) return FALSE;
-    std::wstring cmd = L"\"" + cli + L"\" get \"" + site + L"\" \"" + remote + L"\" \"" + local + L"\"";
-    std::vector<WCHAR> line(cmd.begin(), cmd.end());
-    line.push_back(0);
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {};
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(NULL, line.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-        return FALSE;
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    ProbeLog(L"[DATAOBJ] fetch '%s' -> '%s' exit=%u", remote, local, code);
-    return code == 0;
+    reply.clear();
+    BOOL ok = FtpBridgeFetch(site, remote, local, batchId, reply);
+    ProbeLog(L"[DATAOBJ] fetch(service) '%s' -> '%s' batch='%s' ok=%d",
+             remote, local, batchId ? batchId : L"-", ok);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,9 +55,10 @@ inline BOOL RfsFetchToFile(PCWSTR site, PCWSTR remote, PCWSTR local)
 class CRemoteStream : public IStream
 {
 public:
-    CRemoteStream(PCWSTR site, PCWSTR remote, ULONGLONG size)
+    CRemoteStream(PCWSTR site, PCWSTR remote, ULONGLONG size, PCWSTR batchId)
         : _ref(1), _site(site ? site : L""), _remote(remote ? remote : L""),
-          _size(size), _pos(0), _h(INVALID_HANDLE_VALUE), _done(FALSE)
+          _batchId(batchId ? batchId : L""),
+          _size(size), _pos(0), _h(INVALID_HANDLE_VALUE), _done(FALSE), _cancelled(FALSE)
     {
     }
 
@@ -181,6 +172,7 @@ private:
     BOOL Ensure()
     {
         if (_done) return _h != INVALID_HANDLE_VALUE;
+        if (_cancelled) return FALSE;      // 用户取消过：不再发起下载（复制引擎重试也不理）
         _done = TRUE;
         WCHAR tmp[MAX_PATH] = {}, dir[MAX_PATH] = {};
         if (!GetTempPathW(ARRAYSIZE(tmp), tmp)) return FALSE;
@@ -198,8 +190,11 @@ private:
                  _site.c_str(), _remote.c_str(), (unsigned long long)_size, _local.c_str());
         // 下载失败不"一次定终身"：先重试一次再放弃，并且把 _done 放回去，
         // 这样复制引擎的重试（Win11 上实测会重建传输源很多次）能真的再试一回。
-        // 动机：一次瞬时失败（客户端刚重启、桥接还没起来、CLI 冷启动慢）不该把
+        // 动机：一次瞬时失败（客户端刚重启、桥接还没起来、服务还在建连接）不该把
         // 整个复制判成 STG_E_READFAULT，用户看到的就是"执行读取操作时发生磁盘错误"。
+        //
+        // 但**用户取消**是另一回事：服务回 "FAIL: cancelled" 时必须立刻放弃且不再重试，
+        // 否则就是用户实测到的"在队列里点了取消，同一个文件过一会儿又自己开始下载一遍"。
         BOOL fetched = FALSE;
         for (int attempt = 0; attempt < 2 && !fetched; ++attempt)
         {
@@ -208,15 +203,22 @@ private:
                 ProbeLog(L"[DL] retrying download (attempt %d) remote='%s'", attempt + 1, _remote.c_str());
                 Sleep(300);
             }
-            fetched = RfsFetchToFile(_site.c_str(), _remote.c_str(), _local.c_str());
+            std::string reply;
+            fetched = RfsFetchToFile(_site.c_str(), _remote.c_str(), _local.c_str(), _batchId.c_str(), reply);
+            if (!fetched && reply.find("cancelled") != std::string::npos)
+            {
+                _cancelled = TRUE;
+                ProbeLog(L"[DL] cancelled by user; not retrying remote='%s'", _remote.c_str());
+                break;
+            }
         }
         if (!fetched)
         {
-            ProbeLog(L"[DL] Ensure FAILED: download failed site='%s' remote='%s' local='%s' exists=%d",
+            ProbeLog(L"[DL] Ensure FAILED: download failed site='%s' remote='%s' local='%s' exists=%d cancelled=%d",
                      _site.c_str(), _remote.c_str(), _local.c_str(),
-                     (int)PathFileExistsW(_local.c_str()));
+                     (int)PathFileExistsW(_local.c_str()), (int)_cancelled);
             _local.clear();
-            _done = FALSE;               // 允许后续 Read 再试，而不是永久失败
+            if (!_cancelled) _done = FALSE;   // 允许后续 Read 再试；用户取消则永久失败
             return FALSE;
         }
         _h = CreateFileW(_local.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
@@ -239,9 +241,11 @@ private:
 
     LONG _ref;
     std::wstring _site, _remote, _local;
+    std::wstring _batchId;      // 同一次复制操作共用，队列窗口据此折叠成一组
     ULONGLONG _size, _pos;
     HANDLE _h;
     BOOL _done;
+    BOOL _cancelled;            // 用户在队列里取消过 → 不再发起新的下载
     BOOL _loggedFirstRead = FALSE;
 };
 
@@ -796,11 +800,12 @@ public:
                 return S_OK;
             }
 
-            // Top-level single file: one 'get' per file.
+            // 顶层单文件：下载交给常驻服务（会话复用 + 传输队列 + 可取消），
+            // 不再"一个文件一个 CLI 进程"。
             std::wstring remote = it.folder;
             if (!remote.empty() && remote[remote.size() - 1] != L'/') remote += L'/';
             remote += it.name;
-            CRemoteStream *stream = new (std::nothrow) CRemoteStream(it.site.c_str(), remote.c_str(), it.size);
+            CRemoteStream *stream = new (std::nothrow) CRemoteStream(it.site.c_str(), remote.c_str(), it.size, _batchId);
             if (!stream) return E_OUTOFMEMORY;
             medium->tymed = TYMED_ISTREAM;
             medium->pstm = stream;
@@ -846,13 +851,21 @@ public:
     STDMETHODIMP EnumDAdvise(IEnumSTATDATA **) override { return OLE_E_ADVISENOTSUPPORTED; }
 
 private:
-    CRemoteDataObject() : _ref(1) {}
+    CRemoteDataObject() : _ref(1)
+    {
+        // 一次复制操作 = 一个数据对象 = 一个批次 id。
+        // 队列窗口按它把"同一次复制出来的多个文件"折叠成一个任务组
+        //（用户要求：一次复制是一个任务，任务内每个文件可展开查看）。
+        StringCchPrintfW(_batchId, ARRAYSIZE(_batchId), L"%u-%llu",
+                         (unsigned)GetCurrentProcessId(), GetTickCount64());
+    }
     ~CRemoteDataObject()
     {
         for (size_t i = 0; i < _fetches.size(); i++) _fetches[i]->Release();
     }
 
     LONG _ref;
+    WCHAR _batchId[48] = {};        // 本次复制的批次 id（见构造函数）
     std::vector<Item> _tops;        // what the user selected
     std::vector<Item> _items;       // flattened tree (built on first GetData)
     std::vector<CFolderFetch *> _fetches;   // top-level folder contexts (owned)

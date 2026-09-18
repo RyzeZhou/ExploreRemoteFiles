@@ -325,6 +325,70 @@ inline BOOL FtpBridgeDelete(PCWSTR site, PCWSTR path, BOOL recursive, std::strin
     return ok;
 }
 
+// 下载文件：走常驻服务（与 DELETE / CHMOD 同一条路）。
+//
+// 这里曾经是 `CreateProcess(cli get …)` + `WaitForSingleObject(INFINITE)`，三个问题：
+//   1) Shell DLL 自己启动 CLI —— 违反架构约束（docs/ERF_RESIDENT_SERVICE_ARCHITECTURE.md：
+//      Explorer NSE 只做 Shell/PIDL/视图/列/属性/菜单/本地元数据；会话、凭据、Provider 连接、
+//      缓存、传输队列都归常驻服务）；
+//   2) 每个文件一个 CLI 进程 = 每文件一次冷启动 + 一次全新的 SFTP 登录，
+//      "一次复制 10 个文件"就是 10 个进程、10 次握手、10 条互不相干的队列任务；
+//   3) 同步等到整份文件下完，复制期间 Explorer 一直卡着。
+// 现在只发一个 FETCH，服务复用已有 Provider 会话、把下载放进传输队列（有进度、可取消），
+// 我们只等最终 OK/FAIL —— 与 IFileOperation 的删除完全同形。
+//
+// batchId：同一次用户复制操作的所有文件共用一个，队列窗口据此把它们折叠成一组
+//（用户要求：一次复制 = 一个任务，任务内每个文件可展开查看）。
+inline BOOL FtpBridgeFetch(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &response)
+{
+    response.clear();
+    const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    DWORD lastError = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (pipe != INVALID_HANDLE_VALUE) break;
+        lastError = GetLastError();
+        if (lastError != ERROR_PIPE_BUSY || !WaitNamedPipeW(pipeName, 5000)) break;
+    }
+    if (pipe == INVALID_HANDLE_VALUE)
+    {
+        ProbeLog(L"[XFER] resident fetch bridge unavailable site='%s' remote='%s' err=%lu",
+                 site ? site : L"", remote ? remote : L"", lastError);
+        return FALSE;
+    }
+
+    BOOL sent = FtpBridgeWriteLine(pipe, L"FETCH") &&
+                FtpBridgeWriteLine(pipe, site ? site : L"") &&
+                FtpBridgeWriteLine(pipe, remote ? remote : L"") &&
+                FtpBridgeWriteLine(pipe, local ? local : L"") &&
+                FtpBridgeWriteLine(pipe, (batchId && batchId[0]) ? batchId : L"-");
+    // 大文件要给够时间；取消由服务侧的队列负责（用户点「取消」→ 服务中断下载 → 回 FAIL: cancelled）
+    const ULONGLONG deadline = GetTickCount64() + 30ull * 60ull * 1000ull;
+    if (sent)
+    {
+        while (GetTickCount64() < deadline)
+        {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) break;
+            if (avail > 0)
+            {
+                char buf[1024]; DWORD got = 0;
+                if (!ReadFile(pipe, buf, sizeof(buf), &got, NULL) || got == 0) break;
+                response.append(buf, got);
+                if (response.find('\n') != std::string::npos) break;
+            }
+            else Sleep(25);
+        }
+    }
+    CloseHandle(pipe);
+    BOOL ok = sent && response.rfind("OK", 0) == 0;
+    ProbeLog(L"[XFER] resident fetch site='%s' remote='%s' batch='%s' sent=%d ok=%d reply='%hs'",
+             site ? site : L"", remote ? remote : L"", batchId ? batchId : L"-", sent, ok, response.c_str());
+    return ok;
+}
+
 // 递归修改权限：走常驻服务（与 DELETE 同一条路）。
 // 为什么不能在这里同步跑 CLI：属性页的「确定」在 Explorer 的 UI 线程上，树一大就整窗卡死，
 // 而且 RunCli 有 30 秒超时会把 CLI 直接杀掉（大目录必然超时，改到一半就断）。

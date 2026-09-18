@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using System.IO;
 
 namespace RemoteFsClient.Services;
@@ -203,6 +203,8 @@ public static class Ui
                                       "Operations are still running. Cancel them or wait before closing."),
             ["OpKindDelete"] = ("删除", "Delete"),
             ["OpKindChmod"] = ("递归改权限", "Recursive permissions"),
+            ["OpKindDownload"] = ("下载", "Download"),
+            ["OpBatchHeader"] = ("{0} · {1} 个文件", "{0} · {1} files"),
             ["OpCancel"] = ("取消", "Cancel"),
             ["OpCancelAll"] = ("全部取消", "Cancel all"),
             ["OpClose"] = ("关闭", "Close"),
