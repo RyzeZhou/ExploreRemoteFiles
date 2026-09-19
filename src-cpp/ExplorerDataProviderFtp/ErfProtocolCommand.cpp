@@ -39,7 +39,7 @@ static bool IsErfAddress(PCWSTR address, std::wstring *target)
     // the former resident-client handler.
     if (!decoded.empty())
     {
-        HRESULT hr = UrlUnescapeW(&decoded[0], NULL, URL_UNESCAPE_INPLACE);
+        HRESULT hr = UrlUnescapeW(&decoded[0], NULL, NULL, URL_UNESCAPE_INPLACE);
         if (FAILED(hr)) return false;
         decoded.resize(wcslen(decoded.c_str()));
     }
