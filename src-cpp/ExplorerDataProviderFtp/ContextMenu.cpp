@@ -1,4 +1,4 @@
-// Context menu for the FTP Microsoft-Core namespace.
+﻿// Context menu for the FTP Microsoft-Core namespace.
 // WinSCP-grade verbs: Open / Edit / Download / Copy-to-clipboard / path-name
 // copies / server-side copy & move / rename / delete / custom commands / properties.
 #include <windows.h>
@@ -444,11 +444,9 @@ static void FormatMtimeString(DWORD mtime, PWSTR out, UINT cch)
     else StringCchCopy(out,cch,L"-");
 }
 
-static BOOL ReadRemoteMeta(PCWSTR site, PCWSTR folder, PCWSTR name, REMOTEMETA *meta)
+// 从"已经拿到的列表"里填元数据 —— 走网络和走缓存两条路共用这一段。
+static BOOL ReadRemoteMetaFromList(const std::vector<FTPENTRY> &entries, PCWSTR name, REMOTEMETA *meta)
 {
-    if (!name || !name[0]) return FALSE;
-    std::vector<FTPENTRY> entries;
-    if (!FtpListCachedAll(site, folder, entries)) return FALSE;
     for (auto const &item : entries)
     {
         if (0 != StrCmp(item.szName, name)) continue;
@@ -473,6 +471,28 @@ static BOOL ReadRemoteMeta(PCWSTR site, PCWSTR folder, PCWSTR name, REMOTEMETA *
         return TRUE;
     }
     return FALSE;
+}
+
+// **可能阻塞**：会同步拉远程列表（FtpListCachedAll 走命名管道，冷目录最坏几秒）。
+// 只给"用户明确在等"的路径用（例如右键菜单里点了「属性」再弹模态框）。
+static BOOL ReadRemoteMeta(PCWSTR site, PCWSTR folder, PCWSTR name, REMOTEMETA *meta)
+{
+    if (!name || !name[0]) return FALSE;
+    std::vector<FTPENTRY> entries;
+    if (!FtpListCachedAll(site, folder, entries)) return FALSE;
+    return ReadRemoteMetaFromList(entries, name, meta);
+}
+
+// **绝不阻塞**：只读内存 + 磁盘快照（FtpCachePeekAllOrDisk 是纯本地读，带 8MB 上限，
+// 不碰网络也不碰管道）。属性页必须用这个 ——
+// AddPages 跑在 Explorer 的 UI 线程上，同步等远程会让整个 shell 无响应，
+// 用户看到的就是"其他资源管理器窗口一起变暗、必须先关掉属性页"。
+static BOOL ReadRemoteMetaCached(PCWSTR site, PCWSTR folder, PCWSTR name, REMOTEMETA *meta)
+{
+    if (!name || !name[0]) return FALSE;
+    std::vector<FTPENTRY> entries;
+    if (!FtpCachePeekAllOrDisk(site, folder, entries)) return FALSE;
+    return ReadRemoteMetaFromList(entries, name, meta);
 }
 
 // ---- chmod write-back: properties dialog + prompt dialog -------------------
@@ -3026,11 +3046,22 @@ public:
         JoinPath(sel.folder, sel.names[0], pm->path, ARRAYSIZE(pm->path));
         pm->notify = sel.notify ? ILCloneFull(sel.notify) : NULL;
         if (sel.notify) CoTaskMemFree(sel.notify);
-        if (!ReadRemoteMeta(sel.site, sel.folder, sel.names[0], &pm->meta))
+        // 属性页在 Explorer 的 UI 线程上：这里**绝不能**同步等远程。只读缓存；
+        // 未命中就后台预热，页面用空值先开出来（比让整个 shell 卡几秒好得多）。
+        BOOL haveMeta = ReadRemoteMetaCached(sel.site, sel.folder, sel.names[0], &pm->meta);
+        const FTPSITE *siteItem = haveMeta ? NULL : FtpSiteFind(sel.names[0]);
+        if (!haveMeta && sel.folder[0])
+        {
+            // 远程目录里的项但缓存未命中（冷目录）：预热 + 用空元数据开权限页。
+            FtpPrefetchQuiet(sel.site, sel.folder, NULL);
+            ProbeLog(L"[DIAG] PropSheet: meta cache miss, opening with empty values site='%s' path='%s' name='%s'",
+                     sel.site, sel.folder, sel.names[0]);
+        }
+        else if (!haveMeta)
         {
             // Site-picker item (level 0): not a remote file — show a read-only
             // connection info page instead of a Permissions page.
-            const FTPSITE *s = FtpSiteFind(sel.names[0]);
+            const FTPSITE *s = siteItem;
             if (!s)
             {
                 CoTaskMemFree(pm);
