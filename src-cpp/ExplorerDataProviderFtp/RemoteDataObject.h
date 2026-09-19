@@ -38,16 +38,16 @@ inline std::wstring RfsCliPath()
 // 这里不再 CreateProcess(cli get) + WaitForSingleObject(INFINITE)：
 // Shell DLL 不启动 CLI，会话复用 / 传输队列 / 进度 / 取消都归常驻服务。
 // batchId 让"同一次复制"的所有文件在队列里归到一组。
-// reply 回传服务的原话（"FAIL: cancelled" 用来区分"用户取消"和"瞬时失败"）。
-inline BOOL RfsFetchToFile(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &reply)
+// The typed result keeps a user cancellation distinct from every retryable or
+// permanent download failure all the way to the IStream boundary.
+inline FtpBridgeFetchState RfsFetchToFile(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &reply)
 {
     reply.clear();
-    BOOL ok = FtpBridgeFetch(site, remote, local, batchId, reply);
-    ProbeLog(L"[DATAOBJ] fetch(service) '%s' -> '%s' batch='%s' ok=%d",
-             remote, local, batchId ? batchId : L"-", ok);
-    return ok;
+    FtpBridgeFetchState state = FtpBridgeFetch(site, remote, local, batchId, reply);
+    ProbeLog(L"[DATAOBJ] fetch(service) '%s' -> '%s' batch='%s' state=%d",
+             remote, local, batchId ? batchId : L"-", (int)state);
+    return state;
 }
-
 // ---------------------------------------------------------------------------
 // Lazy stream: downloads once, then serves the local temp file.
 // (Top-level single-file path.)
@@ -57,8 +57,9 @@ class CRemoteStream : public IStream
 public:
     CRemoteStream(PCWSTR site, PCWSTR remote, ULONGLONG size, PCWSTR batchId)
         : _ref(1), _site(site ? site : L""), _remote(remote ? remote : L""),
-          _batchId(batchId ? batchId : L""),
-          _size(size), _pos(0), _h(INVALID_HANDLE_VALUE), _done(FALSE), _cancelled(FALSE)
+          _batchId(batchId ? batchId : L""), _size(size), _pos(0),
+          _h(INVALID_HANDLE_VALUE), _done(FALSE), _fetchStarted(FALSE),
+          _downloadReady(FALSE), _cancelled(FALSE), _cancelRequested(FALSE)
     {
     }
 
@@ -81,13 +82,19 @@ public:
         LONG n = InterlockedDecrement(&_ref);
         if (n == 0)
         {
-            // 复制被取消：Explorer 读了一部分就放手了（正常读完是 _done = TRUE）。
-            // 只"不再读"是不够的 —— 服务侧会把文件甚至整棵树继续下完，队列里还挂着任务。
-            // 只统计"读过但没读完"，免得把 Stat / 探测用的空流也误判成取消。
-            if (!_done && !_cancelled && _pos > 0 && !_batchId.empty())
+            // CFSTR_FILECONTENTS is prefetched before the first byte reaches the
+            // copy engine. _pos == 0 and _done == TRUE therefore do NOT mean the
+            // download completed. A released stream after FETCH began is Explorer's
+            // cancellation signal and must stop the resident service job.
+            if (_fetchStarted && !_downloadReady && !_cancelled && !_cancelRequested && !_batchId.empty())
             {
+                _cancelRequested = TRUE;
+                ProbeLog(L"[DL] cancel requested by stream release batch='%s' remote='%s' pos=%llu",
+                         _batchId.c_str(), _remote.c_str(), (unsigned long long)_pos);
                 std::string reply;
-                FtpBridgeCancel(_batchId.c_str(), reply);
+                BOOL confirmed = FtpBridgeCancel(_batchId.c_str(), reply);
+                ProbeLog(L"[DL] cancel request confirmed=%d batch='%s' reply='%hs'",
+                         (int)confirmed, _batchId.c_str(), reply.c_str());
             }
             delete this;
         }
@@ -100,8 +107,12 @@ public:
         if (!pv) return STG_E_INVALIDPOINTER;
         if (!Ensure())
         {
-            // 这一条是"执行读取操作时发生磁盘错误"（STG_E_READFAULT）的真正出口：
-            // 失败其实发生在把远程文件取到本地那一步，被这里一律报成了读取错误。
+            if (_cancelled)
+            {
+                ProbeLog(L"[DL] Read cancelled site='%s' remote='%s' batch='%s'",
+                         _site.c_str(), _remote.c_str(), _batchId.c_str());
+                return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+            }
             ProbeLog(L"[DL] Read FAILED at Ensure site='%s' remote='%s' local='%s'",
                      _site.c_str(), _remote.c_str(), _local.c_str());
             return STG_E_READFAULT;
@@ -127,7 +138,7 @@ public:
 
     STDMETHODIMP Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *newPos) override
     {
-        if (!Ensure()) return STG_E_READFAULT;
+        if (!Ensure()) return _cancelled ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : STG_E_READFAULT;
         LARGE_INTEGER zero = {};
         if (!SetFilePointerEx(_h, move, &zero, origin)) return STG_E_INVALIDFUNCTION;
         _pos = (ULONGLONG)zero.QuadPart;
@@ -138,7 +149,7 @@ public:
     STDMETHODIMP CopyTo(IStream *dst, ULARGE_INTEGER cb, ULARGE_INTEGER *read, ULARGE_INTEGER *written) override
     {
         if (!dst) return STG_E_INVALIDPOINTER;
-        if (!Ensure()) return STG_E_READFAULT;
+        if (!Ensure()) return _cancelled ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : STG_E_READFAULT;
         std::vector<BYTE> buf(64 * 1024);
         ULONGLONG totalRead = 0, totalWritten = 0;
         while (totalRead < cb.QuadPart)
@@ -147,9 +158,12 @@ public:
             if (want64 > cb.QuadPart - totalRead) want64 = cb.QuadPart - totalRead;
             ULONG want = (ULONG)want64;
             ULONG got = 0;
-            if (FAILED(Read(buf.data(), want, &got)) || got == 0) break;
+            HRESULT hrRead = Read(buf.data(), want, &got);
+            if (FAILED(hrRead)) return hrRead;
+            if (got == 0) break;
             ULONG put = 0;
-            if (FAILED(dst->Write(buf.data(), got, &put))) break;
+            HRESULT hrWrite = dst->Write(buf.data(), got, &put);
+            if (FAILED(hrWrite)) return hrWrite;
             totalRead += got;
             totalWritten += put;
             if (put != got) break;
@@ -183,8 +197,9 @@ private:
     BOOL Ensure()
     {
         if (_done) return _h != INVALID_HANDLE_VALUE;
-        if (_cancelled) return FALSE;      // 用户取消过：不再发起下载（复制引擎重试也不理）
+        if (_cancelled || _cancelRequested) return FALSE; // cancellation is terminal; never retry it
         _done = TRUE;
+        _fetchStarted = TRUE;
         WCHAR tmp[MAX_PATH] = {}, dir[MAX_PATH] = {};
         if (!GetTempPathW(ARRAYSIZE(tmp), tmp)) return FALSE;
         StringCchCopyW(dir, ARRAYSIZE(dir), tmp);
@@ -197,15 +212,12 @@ private:
                          PathFindFileNameW(_remote.c_str()));
         _local = name;
         DeleteFileW(_local.c_str());
-        ProbeLog(L"[DL] Ensure start site='%s' remote='%s' size=%llu -> '%s'",
-                 _site.c_str(), _remote.c_str(), (unsigned long long)_size, _local.c_str());
-        // 下载失败不"一次定终身"：先重试一次再放弃，并且把 _done 放回去，
-        // 这样复制引擎的重试（Win11 上实测会重建传输源很多次）能真的再试一回。
-        // 动机：一次瞬时失败（客户端刚重启、桥接还没起来、服务还在建连接）不该把
-        // 整个复制判成 STG_E_READFAULT，用户看到的就是"执行读取操作时发生磁盘错误"。
-        //
-        // 但**用户取消**是另一回事：服务回 "FAIL: cancelled" 时必须立刻放弃且不再重试，
-        // 否则就是用户实测到的"在队列里点了取消，同一个文件过一会儿又自己开始下载一遍"。
+        ULARGE_INTEGER freeBytes = {};
+        BOOL hasFreeBytes = GetDiskFreeSpaceExW(dir, &freeBytes, NULL, NULL);
+        ProbeLog(L"[DL] Ensure start site='%s' remote='%s' size=%llu free=%llu has_free=%d -> '%s' batch='%s'",
+                 _site.c_str(), _remote.c_str(), (unsigned long long)_size,
+                 (unsigned long long)freeBytes.QuadPart, (int)hasFreeBytes, _local.c_str(), _batchId.c_str());
+
         BOOL fetched = FALSE;
         for (int attempt = 0; attempt < 2 && !fetched; ++attempt)
         {
@@ -215,11 +227,12 @@ private:
                 Sleep(300);
             }
             std::string reply;
-            fetched = RfsFetchToFile(_site.c_str(), _remote.c_str(), _local.c_str(), _batchId.c_str(), reply);
-            if (!fetched && reply.find("cancelled") != std::string::npos)
+            FtpBridgeFetchState state = RfsFetchToFile(_site.c_str(), _remote.c_str(), _local.c_str(), _batchId.c_str(), reply);
+            fetched = (state == FtpBridgeFetchState::Done);
+            if (state == FtpBridgeFetchState::Cancelled)
             {
                 _cancelled = TRUE;
-                ProbeLog(L"[DL] cancelled by user; not retrying remote='%s'", _remote.c_str());
+                ProbeLog(L"[DL] cancelled terminal; not retrying batch='%s' remote='%s'", _batchId.c_str(), _remote.c_str());
                 break;
             }
         }
@@ -228,8 +241,9 @@ private:
             ProbeLog(L"[DL] Ensure FAILED: download failed site='%s' remote='%s' local='%s' exists=%d cancelled=%d",
                      _site.c_str(), _remote.c_str(), _local.c_str(),
                      (int)PathFileExistsW(_local.c_str()), (int)_cancelled);
+            DeleteFileW(_local.c_str());       // existing policy: no partial data-object cache
             _local.clear();
-            if (!_cancelled) _done = FALSE;   // 允许后续 Read 再试；用户取消则永久失败
+            if (!_cancelled) _done = FALSE;    // ordinary failure may still be retried
             return FALSE;
         }
         _h = CreateFileW(_local.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
@@ -238,6 +252,7 @@ private:
         {
             ProbeLog(L"[DL] Ensure FAILED: cannot open local '%s' err=%lu",
                      _local.c_str(), (unsigned long)GetLastError());
+            DeleteFileW(_local.c_str());
             _local.clear();
             return FALSE;
         }
@@ -247,19 +262,22 @@ private:
             ProbeLog(L"[DL] Ensure ok local='%s' size_on_disk=%lld expected=%llu",
                      _local.c_str(), (long long)li.QuadPart, (unsigned long long)_size);
         }
+        _downloadReady = TRUE;
         return TRUE;
     }
 
     LONG _ref;
     std::wstring _site, _remote, _local;
-    std::wstring _batchId;      // 同一次复制操作共用，队列窗口据此折叠成一组
+    std::wstring _batchId;
     ULONGLONG _size, _pos;
     HANDLE _h;
-    BOOL _done;
-    BOOL _cancelled;            // 用户在队列里取消过 → 不再发起新的下载
+    BOOL _done;                 // Ensure has begun; not equivalent to a completed download
+    BOOL _fetchStarted;         // a FETCH job exists and can be cancelled by stream release
+    BOOL _downloadReady;        // local file opened successfully
+    BOOL _cancelled;            // explicit CANCELLED terminal state from FETCHSTATUS
+    BOOL _cancelRequested;      // stream-release cancellation was sent to the service
     BOOL _loggedFirstRead = FALSE;
 };
-
 // ---------------------------------------------------------------------------
 // Folder fetch: 整个目录树的下载**交给常驻服务**（一个文件夹 = 一个队列任务），
 // 下载到本地临时根目录，流再从本地树里读。
@@ -349,13 +367,12 @@ public:
             return;
         }
         std::string reply;
-        BOOL ok = FtpBridgeFetchDir(_site.c_str(), _remoteDir.c_str(), _localRoot.c_str(), _batchId, reply);
-        if (!ok && reply.find("cancelled") != std::string::npos) _cancelled = TRUE;
+        FtpBridgeFetchState state = FtpBridgeFetchDir(_site.c_str(), _remoteDir.c_str(), _localRoot.c_str(), _batchId, reply);
+        if (state == FtpBridgeFetchState::Cancelled) _cancelled = TRUE;
         _finished = TRUE;
-        ProbeLog(L"[DATAOBJ] fetchdir(service) site='%s' dir='%s' -> '%s' batch='%s' ok=%d",
-                 _site.c_str(), _remoteDir.c_str(), _localRoot.c_str(), _batchId, ok);
+        ProbeLog(L"[DATAOBJ] fetchdir(service) site='%s' dir='%s' -> '%s' batch='%s' state=%d",
+                 _site.c_str(), _remoteDir.c_str(), _localRoot.c_str(), _batchId, (int)state);
     }
-
     std::wstring LocalPath(const std::wstring &rel) const
     {
         std::wstring p = _localRoot;

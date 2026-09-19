@@ -174,6 +174,7 @@ public sealed class FtpFileSystem : IRemoteFileSystem
     public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false,
                          CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         EnsureConnected();
         if (_client is null) return;
         // 取消检查放在进度回调里（FluentFTP 在下载循环中调用它）：抛异常即中断下载，

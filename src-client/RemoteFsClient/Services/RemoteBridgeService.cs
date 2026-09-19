@@ -221,11 +221,11 @@ public sealed class RemoteBridgeService : IDisposable
             var jobId = await reader.ReadLineAsync(token);
             if (jobId is not null && _fetchJobs.TryGetValue(jobId, out var job))
             {
-                switch (job.State)
+                switch ((FetchJobState)Volatile.Read(ref job.State))
                 {
-                    case "done": await writer.WriteLineAsync("DONE"); break;
-                    case "cancelled": await writer.WriteLineAsync("CANCELLED"); break;
-                    case "failed": await writer.WriteLineAsync("FAILED " + job.Message); break;
+                    case FetchJobState.Done: await writer.WriteLineAsync("DONE"); break;
+                    case FetchJobState.Cancelled: await writer.WriteLineAsync("CANCELLED"); break;
+                    case FetchJobState.Failed: await writer.WriteLineAsync("FAILED " + job.Message); break;
                     default: await writer.WriteLineAsync($"RUNNING {job.Done} {job.Total}"); break;
                 }
             }
@@ -241,9 +241,13 @@ public sealed class RemoteBridgeService : IDisposable
         //（我们的流没读完就被释放了）。只"不再读流"不够 —— 服务侧照样会把整棵树下完。
         if (string.Equals(operation, "CANCEL", StringComparison.Ordinal))
         {
-            var cancelBatch = await reader.ReadLineAsync(token);
-            var cancelledCount = _transfers?.CancelBatch(cancelBatch ?? string.Empty) ?? 0;
-            await writer.WriteLineAsync("OK " + cancelledCount);
+            var cancelBatch = await reader.ReadLineAsync(token) ?? string.Empty;
+            // The bridge owns the actual work item. Cancelling only the UI row is
+            // racy: a just-started FETCH may not have posted its row yet.
+            int cancelledJobs = CancelFetchJobs(cancelBatch);
+            int cancelledTasks = _transfers?.CancelBatch(cancelBatch) ?? 0;
+            Log($"cancel request batch='{cancelBatch}' jobs={cancelledJobs} queueRows={cancelledTasks}");
+            await writer.WriteLineAsync("OK " + cancelledJobs);
             return;
         }
 
@@ -365,12 +369,17 @@ public sealed class RemoteBridgeService : IDisposable
 
     /// <summary>一个后台下载任务（单文件或整棵目录树）。
     /// 存在的理由：桥接请求必须**立刻**返回，不能占着管道实例等下载完。</summary>
+    // FETCHSTATUS is a typed protocol boundary. Do not infer a user cancel from
+    // an exception message: cancellation is a terminal state owned by the job.
+    private enum FetchJobState { Running, Done, Failed, Cancelled }
+    private readonly record struct FetchResult(FetchJobState State, string Message);
+
     private sealed class FetchJob
     {
         public string Id = "";
         public string Site = "", Remote = "", Local = "", BatchId = "";
         public long Done, Total;
-        public volatile string State = "running";   // running | done | failed | cancelled
+        public int State = (int)FetchJobState.Running;
         public string Message = "";
         public readonly CancellationTokenSource Cts = new();
     }
@@ -386,21 +395,23 @@ public sealed class RemoteBridgeService : IDisposable
             Site = site, Remote = remote, Local = local, BatchId = batchId,
         };
         _fetchJobs[job.Id] = job;
+        Log($"fetch queued id='{job.Id}' site='{site}' remote='{remote}' temp='{local}' batch='{batchId}' kind={(isDir ? "dir" : "file")} free={AvailableBytes(local)}");
         _ = Task.Run(async () =>
         {
             try
             {
-                var result = isDir
+                FetchResult result = isDir
                     ? await FetchDirAsync(job)
                     : await FetchAsync(job);
-                if (result.StartsWith("OK", StringComparison.Ordinal)) job.State = "done";
-                else if (result.Contains("cancelled", StringComparison.OrdinalIgnoreCase)) job.State = "cancelled";
-                else { job.State = "failed"; job.Message = result; }
+                job.Message = result.Message;
+                Volatile.Write(ref job.State, (int)result.State);
+                Log($"fetch terminal id='{job.Id}' batch='{job.BatchId}' state={result.State} message='{result.Message}'");
             }
             catch (Exception ex)
             {
-                job.State = "failed";
                 job.Message = SanitizeBridgeError(ex.Message);
+                Volatile.Write(ref job.State, (int)FetchJobState.Failed);
+                Log($"fetch unhandled id='{job.Id}' batch='{job.BatchId}' exception='{SanitizeBridgeError(ex.ToString())}'");
             }
             finally
             {
@@ -411,6 +422,44 @@ public sealed class RemoteBridgeService : IDisposable
         return job;
     }
 
+    private int CancelFetchJobs(string batchId)
+    {
+        if (string.IsNullOrWhiteSpace(batchId)) return 0;
+        int count = 0;
+        foreach (FetchJob job in _fetchJobs.Values)
+        {
+            if (!string.Equals(job.BatchId, batchId, StringComparison.Ordinal) ||
+                (FetchJobState)Volatile.Read(ref job.State) != FetchJobState.Running) continue;
+            try
+            {
+                job.Cts.Cancel();
+                count++;
+                Log($"cancel requested id='{job.Id}' batch='{batchId}' temp='{job.Local}'");
+            }
+            catch (ObjectDisposedException) { }
+        }
+        return count;
+    }
+
+    private static bool DeleteIncompleteFetchOutput(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return true;
+            File.Delete(path);
+            return !File.Exists(path);
+        }
+        catch { return false; }
+    }
+    private static long AvailableBytes(string path)
+    {
+        try
+        {
+            string? root = Path.GetPathRoot(Path.GetFullPath(path));
+            return string.IsNullOrEmpty(root) ? -1 : new DriveInfo(root).AvailableFreeSpace;
+        }
+        catch { return -1; }
+    }
     /// <summary>诊断日志（%TEMP%/rfs-tasks.log，与 TransferTaskService / SshConfigReader 同一份）。</summary>
     private static void Log(string message)
     {
@@ -427,94 +476,88 @@ public sealed class RemoteBridgeService : IDisposable
     /// 归属：**传输队列**（上传/下载属于传输；删除/改权限/改所有者才属于操作队列）。
     /// `BeginManagedTask` 正是为"不由 CLI 进程执行的传输"准备的：它的取消回调直接接
     /// 我们的 CancellationToken，所以取消能真正中断一个正在下载的大文件。</summary>
-    private async Task<string> FetchAsync(FetchJob job)
+    private async Task<FetchResult> FetchAsync(FetchJob job)
     {
         var siteName = job.Site; var remotePath = job.Remote; var localPath = job.Local; var batchId = job.BatchId;
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, job.Cts.Token);
         TransferTask? task = null;
         try
         {
+            cancellation.Token.ThrowIfCancellationRequested();
             var connection = FindConnection(siteName);
             var remote = NormalizeRemotePath(remotePath);
-            if (string.IsNullOrWhiteSpace(localPath))
-                return "FAIL: missing local path";
-
+            if (string.IsNullOrWhiteSpace(localPath)) return new(FetchJobState.Failed, "missing local path");
             var fileName = System.IO.Path.GetFileName(localPath);
             task = _transfers?.BeginManagedTask("download", siteName, fileName, remote,
                 () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } }, batchId);
-
-            // 只读操作：用**独立** Provider 实例（ProviderFactory.Create），不复用池里那条会话，
-            // 也不持有 _providerGate —— 否则一个大文件的下载会把浏览用的 LIST 全堵在门外。
             using var fs = ProviderFactory.Create(connection);
             await Task.Run(() =>
             {
+                cancellation.Token.ThrowIfCancellationRequested();
                 fs.EnsureConnected();
-                fs.Download(remote, localPath,
-                    (done, total) =>
-                    {
-                        job.Done = done; job.Total = total;
-                        if (task is not null) _transfers?.UpdateManagedTask(task, done, total, fileName);
-                    },
-                    false, cancellation.Token);
+                cancellation.Token.ThrowIfCancellationRequested();
+                fs.Download(remote, localPath, (done, total) =>
+                {
+                    job.Done = done; job.Total = total;
+                    if (task is not null) _transfers?.UpdateManagedTask(task, done, total, fileName);
+                }, false, cancellation.Token);
             }, cancellation.Token);
-
+            // A CANCEL racing the final progress callback still wins over success.
+            cancellation.Token.ThrowIfCancellationRequested();
             if (task is not null) _transfers?.CompleteManagedTask(task, true, null);
-            Log($"fetch ok site='{siteName}' remote='{remote}' -> '{localPath}' batch='{batchId}'");
-            return "OK";
+            Log($"fetch done id='{job.Id}' site='{siteName}' remote='{remote}' temp='{localPath}' bytes={job.Total} free={AvailableBytes(localPath)} batch='{batchId}'");
+            return new(FetchJobState.Done, "");
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
             if (task is not null) _transfers?.CompleteManagedTask(task, false, null, cancelled: true);
-            Log($"fetch cancelled site='{siteName}' remote='{remotePath}' batch='{batchId}'");
-            return "FAIL: cancelled";
+            bool cleaned = DeleteIncompleteFetchOutput(localPath);
+            Log($"fetch cancelled id='{job.Id}' site='{siteName}' remote='{remotePath}' temp='{localPath}' cleaned={cleaned} bytes={job.Done}/{job.Total} free={AvailableBytes(localPath)} batch='{batchId}'");
+            return new(FetchJobState.Cancelled, "");
         }
         catch (Exception ex)
         {
-            if (task is not null) _transfers?.CompleteManagedTask(task, false, ex.Message);
-            Log($"fetch failed site='{siteName}' remote='{remotePath}': {ex.Message}");
-            return $"FAIL: {SanitizeBridgeError(ex.Message)}";
+            string message = SanitizeBridgeError(ex.Message);
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, message);
+            bool cleaned = DeleteIncompleteFetchOutput(localPath);
+            Log($"fetch failed id='{job.Id}' site='{siteName}' remote='{remotePath}' temp='{localPath}' cleaned={cleaned} bytes={job.Done}/{job.Total} free={AvailableBytes(localPath)} batch='{batchId}' exception='{SanitizeBridgeError(ex.ToString())}'");
+            return new(FetchJobState.Failed, message);
         }
     }
-
     /// <summary>递归下载一个远程目录到本地根：**一个文件夹 = 一个队列任务**（用户要求），
     /// 同时拖多个文件夹时每个文件夹各自一组。
     ///
     /// 与 FetchAsync 一样进**传输队列**；先扫一遍树拿到文件总数，再逐个下载，
     /// 进度聚合到同一个任务上（与 DELETE 的"先列树再执行"同一套路）。</summary>
-    private async Task<string> FetchDirAsync(FetchJob job)
+    private async Task<FetchResult> FetchDirAsync(FetchJob job)
     {
         var siteName = job.Site; var remoteDir = job.Remote; var localRoot = job.Local; var batchId = job.BatchId;
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, job.Cts.Token);
         TransferTask? task = null;
+        int downloaded = 0, failed = 0;
         try
         {
+            cancellation.Token.ThrowIfCancellationRequested();
             var connection = FindConnection(siteName);
             var remote = NormalizeRemotePath(remoteDir);
-            if (string.IsNullOrWhiteSpace(localRoot))
-                return "FAIL: missing local root";
-
+            if (string.IsNullOrWhiteSpace(localRoot)) return new(FetchJobState.Failed, "missing local root");
             var folderName = System.IO.Path.GetFileName(remote.TrimEnd('/'));
             if (string.IsNullOrEmpty(folderName)) folderName = remote;
             task = _transfers?.BeginManagedTask("download", siteName, folderName, remote,
                 () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } }, batchId);
             _transfers?.UpdateManagedTask(task!, 0, 0, Ui.IsEnglish ? "Scanning remote folder" : "正在扫描远程目录");
-
             using var fs = ProviderFactory.Create(connection);
-            int downloaded = 0, failed = 0;
-
             await Task.Run(() =>
             {
+                cancellation.Token.ThrowIfCancellationRequested();
                 fs.EnsureConnected();
-
+                cancellation.Token.ThrowIfCancellationRequested();
                 var files = new List<(string Remote, string Local)>();
                 CollectRemoteFiles(fs, remote, localRoot, files, cancellation.Token);
-
                 int total = files.Count;
                 job.Done = 0; job.Total = total;
-                if (task is not null)
-                    _transfers?.UpdateManagedTask(task, 0, total,
-                        Ui.IsEnglish ? $"0 / {total} files" : $"0 / {total} 个文件");
-
+                if (task is not null) _transfers?.UpdateManagedTask(task, 0, total,
+                    Ui.IsEnglish ? $"0 / {total} files" : $"0 / {total} 个文件");
                 foreach (var file in files)
                 {
                     cancellation.Token.ThrowIfCancellationRequested();
@@ -528,36 +571,34 @@ public sealed class RemoteBridgeService : IDisposable
                     catch (OperationCanceledException) { throw; }
                     catch (Exception ex)
                     {
-                        // 单个文件失败不判死整棵树：记下来最后一起报，用户至少拿到能拿到的。
                         failed++;
-                        Log($"fetchdir: '{file.Remote}' failed: {ex.Message}");
+                        Log($"fetchdir item failed id='{job.Id}' remote='{file.Remote}' exception='{SanitizeBridgeError(ex.ToString())}'");
                     }
                     job.Done = downloaded + failed;
-                    if (task is not null)
-                        _transfers?.UpdateManagedTask(task, downloaded + failed, total,
-                            Ui.IsEnglish ? $"{downloaded} / {total} files" : $"{downloaded} / {total} 个文件");
+                    if (task is not null) _transfers?.UpdateManagedTask(task, downloaded + failed, total,
+                        Ui.IsEnglish ? $"{downloaded} / {total} files" : $"{downloaded} / {total} 个文件");
                 }
             }, cancellation.Token);
-
-            if (task is not null)
-                _transfers?.CompleteManagedTask(task, failed == 0, failed == 0 ? null : $"{failed} file(s) failed");
-            Log($"fetchdir done site='{siteName}' remote='{remote}' -> '{localRoot}' files={downloaded} failed={failed} batch='{batchId}'");
-            return failed == 0 ? "OK" : $"FAIL: {failed} file(s) failed";
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (task is not null) _transfers?.CompleteManagedTask(task, failed == 0, failed == 0 ? null : $"{failed} file(s) failed");
+            string message = failed == 0 ? "" : $"{failed} file(s) failed";
+            Log($"fetchdir done id='{job.Id}' site='{siteName}' remote='{remote}' temp='{localRoot}' files={downloaded} failed={failed} free={AvailableBytes(localRoot)} batch='{batchId}'");
+            return new(failed == 0 ? FetchJobState.Done : FetchJobState.Failed, message);
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
             if (task is not null) _transfers?.CompleteManagedTask(task, false, null, cancelled: true);
-            Log($"fetchdir cancelled site='{siteName}' remote='{remoteDir}' batch='{batchId}'");
-            return "FAIL: cancelled";
+            Log($"fetchdir cancelled id='{job.Id}' site='{siteName}' remote='{remoteDir}' temp='{localRoot}' files={downloaded}/{job.Total} free={AvailableBytes(localRoot)} batch='{batchId}'");
+            return new(FetchJobState.Cancelled, "");
         }
         catch (Exception ex)
         {
-            if (task is not null) _transfers?.CompleteManagedTask(task, false, ex.Message);
-            Log($"fetchdir failed site='{siteName}' remote='{remoteDir}': {ex.Message}");
-            return $"FAIL: {SanitizeBridgeError(ex.Message)}";
+            string message = SanitizeBridgeError(ex.Message);
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, message);
+            Log($"fetchdir failed id='{job.Id}' site='{siteName}' remote='{remoteDir}' temp='{localRoot}' files={downloaded}/{job.Total} free={AvailableBytes(localRoot)} batch='{batchId}' exception='{SanitizeBridgeError(ex.ToString())}'");
+            return new(FetchJobState.Failed, message);
         }
     }
-
     /// <summary>把远程目录树摊平成 (远程, 本地) 文件列表；本地目录顺手建出来。
     /// 符号链接当叶项目处理（不跟随目标），与 DELETE 的规则一致。</summary>
     private static void CollectRemoteFiles(IRemoteFileSystem fs, string remoteDir, string localDir,
@@ -709,8 +750,14 @@ public sealed class RemoteBridgeService : IDisposable
         plan.Add(new DeletePlanItem(directory, true));
     }
 
-    private static string SanitizeBridgeError(string message) =>
-        (message ?? "remote delete failed").Replace('\r', ' ').Replace('\n', ' ');
+    private static string SanitizeBridgeError(string message)
+    {
+        string clean = (message ?? "remote operation failed").Replace('\r', ' ').Replace('\n', ' ');
+        // Diagnostic logs retain the exception chain but must never persist a
+        // credential if a provider includes one in a connection-string error.
+        return System.Text.RegularExpressions.Regex.Replace(
+            clean, "(?i)\\b(password|pwd|passphrase)\\s*=\\s*[^\\s;,'\\\"]+", "$1=***");
+    }
 
     private sealed record DeletePlanItem(string Path, bool IsDirectory);
 

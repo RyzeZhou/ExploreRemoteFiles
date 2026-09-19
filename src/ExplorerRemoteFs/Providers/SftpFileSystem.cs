@@ -216,6 +216,7 @@ public sealed class SftpFileSystem : IRemoteFileSystem
     public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false,
                          CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         EnsureConnected();
         if (_client is null) return;
         long total = 0;

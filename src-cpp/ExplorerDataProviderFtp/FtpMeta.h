@@ -427,61 +427,93 @@ inline BOOL FtpBridgeCancel(PCWSTR batchId, std::string &line)
     BOOL sent = FtpBridgeWriteLine(pipe, L"CANCEL") && FtpBridgeWriteLine(pipe, batchId);
     BOOL got = sent && FtpBridgeReadReply(pipe, line, 5000);
     CloseHandle(pipe);
-    ProbeLog(L"[XFER] cancel batch='%s' got=%d reply='%hs'", batchId, (int)got, line.c_str());
-    return got;
+    BOOL confirmed = got && line.rfind("OK ", 0) == 0;
+    ProbeLog(L"[XFER] cancel batch='%s' sent=%d confirmed=%d reply='%hs'",
+             batchId, (int)sent, (int)confirmed, line.c_str());
+    return confirmed;
 }
+// Explicit protocol outcome. Cancellation is not an error string: callers must
+// not accidentally retry it as a transient download failure.
+enum class FtpBridgeFetchState
+{
+    Failed,
+    Done,
+    Cancelled,
+};
 
 // 发起 + 等待完成。等待期间**不占管道**（每秒一次短查询），所以：
 //   · 浏览请求不会被下载堵住；
-//   · 用户在传输队列里点「取消」→ 服务侧中断下载 → 这里立刻拿到 CANCELLED。
-inline BOOL FtpBridgeFetchWait(PCWSTR op, PCWSTR site, PCWSTR remote, PCWSTR local,
-                               PCWSTR batchId, std::string &response)
+//   · 用户在传输队列里点「取消」→ 服务侧中断下载 → 这里拿到明确 CANCELLED 终态。
+inline FtpBridgeFetchState FtpBridgeFetchWait(PCWSTR op, PCWSTR site, PCWSTR remote, PCWSTR local,
+                                              PCWSTR batchId, std::string &response)
 {
     response.clear();
     std::string jobId;
     if (!FtpBridgeFetchStart(op, site, remote, local, batchId, jobId))
     {
         response = "FAIL: cannot start fetch";
-        return FALSE;
+        return FtpBridgeFetchState::Failed;
     }
 
     const ULONGLONG started = GetTickCount64();
     const ULONGLONG deadline = started + 120ull * 60ull * 1000ull;
+    ProbeLog(L"[XFER] fetch started op='%s' remote='%s' batch='%s' job=%hs",
+             op, remote ? remote : L"", batchId ? batchId : L"-", jobId.c_str());
     int tick = 0;
     for (;;)
     {
         Sleep(200);
-        if (GetTickCount64() > deadline) { response = "FAIL: timeout"; return FALSE; }
-        if (++tick % 5) continue;                       // 约每秒查一次
+        if (GetTickCount64() > deadline)
+        {
+            response = "FAIL: timeout";
+            ProbeLog(L"[XFER] fetch terminal=failed reason=timeout job=%hs elapsed=%llu",
+                     jobId.c_str(), GetTickCount64() - started);
+            return FtpBridgeFetchState::Failed;
+        }
+        if (++tick % 5) continue;
 
         std::wstring wideJob(jobId.begin(), jobId.end());
         std::string st;
-        if (!FtpBridgeFetchStatus(wideJob.c_str(), st)) continue;   // 查询失败：下次再试
+        if (!FtpBridgeFetchStatus(wideJob.c_str(), st)) continue;
         if (st.rfind("DONE", 0) == 0)
         {
             response = "OK";
-            ProbeLog(L"[XFER] fetch done op='%s' remote='%s' job=%hs elapsed=%llu",
+            ProbeLog(L"[XFER] fetch terminal=done op='%s' remote='%s' job=%hs elapsed=%llu",
                      op, remote ? remote : L"", jobId.c_str(), GetTickCount64() - started);
-            return TRUE;
+            return FtpBridgeFetchState::Done;
         }
-        if (st.rfind("CANCELLED", 0) == 0) { response = "FAIL: cancelled"; return FALSE; }
-        if (st.rfind("FAILED", 0) == 0) { response = st; return FALSE; }
-        if (st.rfind("UNKNOWN", 0) == 0) { response = "FAIL: job lost"; return FALSE; }
+        if (st.rfind("CANCELLED", 0) == 0)
+        {
+            response = "CANCELLED";
+            ProbeLog(L"[XFER] fetch terminal=cancelled job=%hs elapsed=%llu", jobId.c_str(), GetTickCount64() - started);
+            return FtpBridgeFetchState::Cancelled;
+        }
+        if (st.rfind("FAILED", 0) == 0)
+        {
+            response = st;
+            ProbeLog(L"[XFER] fetch terminal=failed job=%hs reply='%hs' elapsed=%llu",
+                     jobId.c_str(), st.c_str(), GetTickCount64() - started);
+            return FtpBridgeFetchState::Failed;
+        }
+        if (st.rfind("UNKNOWN", 0) == 0)
+        {
+            response = "FAIL: job lost";
+            ProbeLog(L"[XFER] fetch terminal=failed reason=job-lost job=%hs elapsed=%llu",
+                     jobId.c_str(), GetTickCount64() - started);
+            return FtpBridgeFetchState::Failed;
+        }
     }
 }
 
-// 下载一个文件（单文件路径）。语义同以前：TRUE=已下载到本地。
-inline BOOL FtpBridgeFetch(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &response)
+inline FtpBridgeFetchState FtpBridgeFetch(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &response)
 {
     return FtpBridgeFetchWait(L"FETCH", site, remote, local, batchId, response);
 }
 
-// 递归下载一个目录树（一个文件夹 = 一个传输任务）。
-inline BOOL FtpBridgeFetchDir(PCWSTR site, PCWSTR remoteDir, PCWSTR localRoot, PCWSTR batchId, std::string &response)
+inline FtpBridgeFetchState FtpBridgeFetchDir(PCWSTR site, PCWSTR remoteDir, PCWSTR localRoot, PCWSTR batchId, std::string &response)
 {
     return FtpBridgeFetchWait(L"FETCHDIR", site, remoteDir, localRoot, batchId, response);
 }
-
 // 递归修改权限：走常驻服务（与 DELETE 同一条路）。
 // 为什么不能在这里同步跑 CLI：属性页的「确定」在 Explorer 的 UI 线程上，树一大就整窗卡死，
 // 而且 RunCli 有 30 秒超时会把 CLI 直接杀掉（大目录必然超时，改到一半就断）。
