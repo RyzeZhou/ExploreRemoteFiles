@@ -19,9 +19,10 @@ Win11 的 `rfs-shell-watch.log` 记录了属性窗口存在期间 Explorer 的 `
 
 ## 修复
 
-- `ShowRemotePropertiesModeless` 成为文件和目录属性共用入口：只读本地元数据缓存、冷缓存由
-  `MetaWarmThread` 回填、使用 `CreateDialogParamW(..., NULL, ...)` 创建无 owner 的顶层 modeless
-  窗口。选中文件路径不再同步访问远端，也不再调用 `DialogBoxParamW`。
+- `ShowRemotePropertiesSheetModeless` 成为文件和目录属性共用入口：只读本地元数据缓存、冷缓存由
+  `MetaWarmThread` 回填，并创建 `IDD_PERMPAGE` 的 `PSH_MODELESS` 标准 `PropertySheetW`（parent 为
+  `NULL`）。因此自定义菜单路径也统一为白底、有“文件属性”标签的原生属性表；选中文件路径不再同步访问远端，
+  也不再调用 `DialogBoxParamW` 或无标签的 `IDD_PERMBOX`。
 - 新增 `CErfProtocolCommand`，并以 `erf\shell\open\command\DelegateExecute` 注册为 in-process
   `IExecuteCommand`。它从 `IObjectWithSite` 获取**发起地址栏请求的** `IShellBrowser`，解析目标 PIDL
   后调用 `BrowseObject(..., SBSP_SAMEBROWSER | SBSP_ABSOLUTE)`；不再以共享 HWND 猜测标签。
@@ -46,7 +47,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\src-setup\build-inno.ps1
    `erf:<site>:/<path>`。预期：第二个标签原地变成目标目录，第一个标签不变；日志有
    `[ERF-DELEGATE] SetSite present=1` 与 `BrowseObject same-browser hr=0x00000000`。
 2. 对一个缓存命中和一个缓存未命中的远程小文件分别点“属性”。预期：所有 Explorer 窗口始终可点击；
-   日志有 `properties modeless ... owner=NULL`，不会再出现该菜单路径的 `DialogBoxParamW`。
+   日志有 `properties standard-sheet modeless ... owner=NULL`，不会再出现该菜单路径的 `DialogBoxParamW` 或 `PermDlg init`。
 3. 可选执行安装器注册回归：
 
 ```powershell

@@ -1002,38 +1002,10 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
     return FALSE;
 }
 
-// 打开属性页必须一直留在 Explorer UI 线程的非阻塞路径上：只读取本地缓存，
-// 冷缓存由后台线程补齐。尤其不能把 Explorer HWND 传给 DialogBoxParamW 或
-// CreateDialogParamW —— 前者会显式禁用 owner，后者会把页面作为 Explorer 的
-// owned popup；Win11 的标签式 Explorer 会把这种激活/禁用链扩散到同一宿主的
-// 其他窗口。这里刻意创建无 owner 的顶层 modeless 页面。
-static void ShowRemotePropertiesModeless(PCWSTR site, PCWSTR folder, PCWSTR name,
-                                         PCWSTR fullPath, BOOL canSetOwner)
-{
-    if (!site || !site[0] || !folder || !name || !name[0] || !fullPath || !fullPath[0]) return;
-
-    PROPMETA *pm=(PROPMETA*)CoTaskMemAlloc(sizeof(*pm));
-    if(!pm) return;
-    ZeroMemory(pm,sizeof(*pm));
-    pm->refs = 1;
-    pm->modeless = TRUE;
-    pm->canSetOwner = canSetOwner;
-    StringCchCopy(pm->site, ARRAYSIZE(pm->site), site);
-    StringCchCopy(pm->folder, ARRAYSIZE(pm->folder), folder);
-    StringCchCopy(pm->name, ARRAYSIZE(pm->name), name);
-    StringCchCopy(pm->path, ARRAYSIZE(pm->path), fullPath);
-
-    BOOL haveMeta = ReadRemoteMetaCached(site, folder, name, &pm->meta);
-    ProbeLog(L"[PROBE] properties modeless cache=%d owner=NULL site='%s' folder='%s' name='%s' path='%s'",
-             (int)haveMeta, site, folder, name, fullPath);
-    HWND dlg=CreateDialogParamW(g_hInst, MAKEINTRESOURCEW(IDD_PERMBOX), NULL, PermDlgProc, (LPARAM)pm);
-    if(dlg){
-        ShowWindow(dlg,SW_SHOWNORMAL); SetForegroundWindow(dlg);
-        if(!haveMeta) MetaWarmStart(pm);      // 冷缓存：后台取，回来 PostMessage 刷新
-    }
-    else PropMetaRelease(pm);
-}
-
+// 所有自定义“属性”入口都使用下面的标准属性表页；不再创建 IDD_PERMBOX
+// 那种无标签的自定义对话框。声明放在这里，让背景菜单助手可先调用它。
+static void ShowRemotePropertiesSheetModeless(PCWSTR site, PCWSTR folder, PCWSTR name,
+                                              PCWSTR fullPath, BOOL canSetOwner);
 // Background-menu helpers. The folder PIDL represents the current directory,
 // so its metadata is found by listing the parent directory and selecting its leaf.
 static void ShowCurrentFolderProperties(HWND hwnd, PCWSTR site, PCWSTR folder)
@@ -1050,7 +1022,7 @@ static void ShowCurrentFolderProperties(HWND hwnd, PCWSTR site, PCWSTR folder)
     else { *slash = L'\0'; StringCchCopy(parent, ARRAYSIZE(parent), full); }
 
     (void)hwnd;  // 不可作为 owner：Win11 会把 owned-popup 链关联到 Explorer。
-    ShowRemotePropertiesModeless(site, parent, name, folder, SiteCanSetOwner(site));
+    ShowRemotePropertiesSheetModeless(site, parent, name, folder, SiteCanSetOwner(site));
 }
 
 static void PopulateSiteInfo(HWND hDlg, PCWSTR site)
@@ -2923,7 +2895,7 @@ public:
         // 不同步 ReadRemoteMeta，也不用 DialogBoxParamW：两者都会把 Explorer 的
         // UI 路径拖进网络等待或 owner-modal 禁用状态。modeless 页先展示缓存，
         // 缓存未命中时由 MetaWarmThread 异步补齐。
-        ShowRemotePropertiesModeless(sel.site, sel.folder, sel.names[0], path,
+        ShowRemotePropertiesSheetModeless(sel.site, sel.folder, sel.names[0], path,
                                      SiteCanSetOwner(sel.site));
         break; }
     case MENU_TERMINAL:
@@ -3123,6 +3095,63 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
     return FALSE;
 }
 
+// 右键菜单/背景菜单的“属性”过去创建 IDD_PERMBOX：它是灰底、无标签的
+// 自定义对话框；早期更以 Explorer HWND 调 DialogBoxParamW，因而会锁住
+// 同一宿主的其他窗口。这里改为与 Explorer 原生属性一致的 PropertySheet：
+// 使用 IDD_PERMPAGE、标准标签页和按钮，但 PSH_MODELESS + NULL parent，
+// 所以它既有第二张截图的外观，又不会禁用任何 Explorer 窗口。
+static void ShowRemotePropertiesSheetModeless(PCWSTR site, PCWSTR folder, PCWSTR name,
+                                              PCWSTR fullPath, BOOL canSetOwner)
+{
+    if (!site || !site[0] || !folder || !name || !name[0] || !fullPath || !fullPath[0]) return;
+
+    PROPMETA *pm = (PROPMETA*)CoTaskMemAlloc(sizeof(*pm));
+    if (!pm) return;
+    ZeroMemory(pm, sizeof(*pm));
+    pm->refs = 1;
+    pm->modeless = TRUE;
+    pm->canSetOwner = canSetOwner;
+    StringCchCopy(pm->site, ARRAYSIZE(pm->site), site);
+    StringCchCopy(pm->folder, ARRAYSIZE(pm->folder), folder);
+    StringCchCopy(pm->name, ARRAYSIZE(pm->name), name);
+    StringCchCopy(pm->path, ARRAYSIZE(pm->path), fullPath);
+
+    const BOOL haveMeta = ReadRemoteMetaCached(site, folder, name, &pm->meta);
+    PROPSHEETPAGE psp = {};
+    psp.dwSize = sizeof(psp);
+    psp.dwFlags = PSP_USECALLBACK | PSP_USETITLE;
+    psp.pszTitle = PropertyDialogTitle(&pm->meta);
+    psp.hInstance = g_hInst;
+    psp.pszTemplate = MAKEINTRESOURCEW(IDD_PERMPAGE);
+    psp.pfnDlgProc = PermPageProc;
+    psp.lParam = (LPARAM)pm;
+    psp.pfnCallback = PermPageCallback;
+
+    PROPSHEETHEADER psh = {};
+    psh.dwSize = sizeof(psh);
+    psh.dwFlags = PSH_MODELESS | PSH_PROPSHEETPAGE;
+    psh.hwndParent = NULL;  // no Explorer owner: never enter the owner-modal disable chain
+    psh.hInstance = g_hInst;
+    psh.pszCaption = PropertyDialogTitle(&pm->meta);
+    psh.nPages = 1;
+    psh.ppsp = &psp;
+
+    ProbeLog(L"[PROBE] properties standard-sheet modeless cache=%d owner=NULL site='%s' folder='%s' name='%s' path='%s'",
+             (int)haveMeta, site, folder, name, fullPath);
+    HWND sheet = (HWND)PropertySheetW(&psh);
+    if (sheet && sheet != (HWND)-1)
+    {
+        ShowWindow(sheet, SW_SHOWNORMAL);
+        SetForegroundWindow(sheet);
+        if (!haveMeta) MetaWarmStart(pm);
+    }
+    else
+    {
+        // PropertySheet owns the PSP_USECALLBACK page once called and releases
+        // its lParam through PermPageCallback, including failure paths.
+        ProbeLog(L"[PROBE] properties standard-sheet create failed err=%lu", GetLastError());
+    }
+}
 class CFolderViewImplPropSheet : public IShellPropSheetExt, public IShellExtInit
 {
 public:
