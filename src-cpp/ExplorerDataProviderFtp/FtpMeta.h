@@ -14,6 +14,12 @@
 #include <vector>
 #include <algorithm>
 #include "ProbeLog.h"
+// Module lifetime: worker threads below must pin the DLL (DllCanUnloadNow
+// only counts COM objects; an unpinned background thread that outlives the
+// last object crashed hosts AFTER unload: svchost _unloaded 0xc0000005,
+// 2026-09-20). Same declarations as Utils.h; repeated here to avoid a cycle.
+void DllAddRef();
+void DllRelease();
 
 // Display language for strings created directly by the Explorer extension.
 // zh-CN and en-US are built into the binary. Other language codes are read
@@ -756,6 +762,7 @@ static DWORD WINAPI FtpRefreshThreadProc(LPVOID p)
         ILFree(c->pidl);
     }
     delete c;
+    DllRelease();
     return 0;
 }
 inline void FtpRefreshDirBackground(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
@@ -765,10 +772,12 @@ inline void FtpRefreshDirBackground(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE
     StringCchCopy(c->site, ARRAYSIZE(c->site), site ? site : L"");
     StringCchCopy(c->folder, ARRAYSIZE(c->folder), (folder && folder[0]) ? folder : L"/");
     c->pidl = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    DllAddRef();
     HANDLE h = CreateThread(NULL, 0, FtpRefreshThreadProc, c, 0, NULL);
     if (h) CloseHandle(h);
     else
     {
+        DllRelease();
         if (c->pidl) ILFree(c->pidl);
         delete c;
         FtpCacheClear();
@@ -958,11 +967,14 @@ inline void FtpNotifyUpdateDir(PIDLIST_ABSOLUTE notifyPidl)
         {
             SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)p, NULL);
             ILFree((PIDLIST_ABSOLUTE)p);
+            DllRelease();
             return 0;
         }
     };
+    DllAddRef();   // 2026-09-20: pin the module until the runner below returns
     HANDLE h = CreateThread(NULL, 0, Runner::Run, ILCloneFull(notifyPidl), 0, NULL);
     if (h) CloseHandle(h);
+    else DllRelease();
 }
 
 // Background prefetch: replace the (possibly stale or empty) cache with the
@@ -1104,6 +1116,7 @@ static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
     FtpPrefetchNotifyFire(c->key);
     FtpPrefetchEnd(c->key);
     delete c;
+    DllRelease();
     return 0;
 }
 inline void FtpPrefetchQuiet(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl = NULL)
@@ -1119,10 +1132,12 @@ inline void FtpPrefetchQuiet(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notify
     StringCchCopy(c->folder, ARRAYSIZE(c->folder), dir);
     StringCchCopy(c->key, ARRAYSIZE(c->key), key);
     c->notifyPidl = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    DllAddRef();
     HANDLE h = CreateThread(NULL, 0, FtpPrefetchThreadProc, c, 0, NULL);
     if (h) CloseHandle(h);
     else
     {
+        DllRelease();
         if (c->notifyPidl) ILFree(c->notifyPidl);
         FtpPrefetchEnd(key);
         delete c;
