@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // Shared PIDL-external FTP metadata cache for the Microsoft-core namespace.
 // Keyed by directory path; short TTL; cleared after successful mutations.
 // Explorer process performs no network I/O (spawns the CLI bridge), but we
@@ -634,7 +634,10 @@ inline SRWLOCK &FtpCacheLock()
 #define FTP_DISK_CACHE_MAX_AGE_MS   (24ULL * 3600 * 1000)  // 磁盘快照可用于首屏的上限：24 小时
 #define FTP_CACHE_MAX_DIRS          128                    // 内存里最多保留多少个目录快照
 
-struct FtpDiskCacheHeader { DWORD magic; DWORD version; DWORD count; };
+// v2 (2026-09-20): carries the site+folder identity so a load NEVER serves a
+// listing that belongs to another key. v1 files (case-folded-hash era) are
+// rejected on load and deleted: accepting them would re-serve B listing for b.
+struct FtpDiskCacheHeader { DWORD magic; DWORD version; DWORD count; WCHAR site[64]; WCHAR folder[600]; };
 inline BOOL FtpMetadataCacheDirectory(PWSTR out, UINT cch)
 {
     if (!out || !cch) return FALSE; out[0] = 0; DWORD cb = cch * sizeof(WCHAR);
@@ -647,8 +650,12 @@ inline BOOL FtpMetadataCacheDirectory(PWSTR out, UINT cch)
 }
 inline ULONGLONG FtpMetadataCacheHash(PCWSTR site, PCWSTR path)
 {
+    // NOTE (2026-09-20): NO case folding here. Remote paths are case-sensitive
+    // (Linux servers); the old tolower folded "B" and "b" onto ONE cache file,
+    // so navigating to b showed B stale listing. Site names keep their own
+    // comparison rules at lookup time; the file name must distinguish every key.
     ULONGLONG h = 1469598103934665603ULL; const WCHAR *parts[] = { site ? site : L"", L"|", (path && path[0]) ? path : L"/" };
-    for (int i = 0; i < 3; ++i) for (const WCHAR *p = parts[i]; *p; ++p) { h ^= (ULONGLONG)towlower(*p); h *= 1099511628211ULL; }
+    for (int i = 0; i < 3; ++i) for (const WCHAR *p = parts[i]; *p; ++p) { h ^= (ULONGLONG)(*p); h *= 1099511628211ULL; }
     return h;
 }
 inline BOOL FtpMetadataCacheFile(PCWSTR site, PCWSTR path, PWSTR out, UINT cch)
@@ -669,16 +676,32 @@ inline BOOL FtpDiskCacheLoad(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &it
     if (ageMsOut) *ageMsOut = ageMs;
     if (maxAgeMs && ageMs > maxAgeMs) return FALSE;
     HANDLE f = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL); if (f == INVALID_HANDLE_VALUE) return FALSE;
-    FtpDiskCacheHeader head = {}; DWORD got = 0; BOOL ok = ReadFile(f, &head, sizeof(head), &got, NULL) && got == sizeof(head) && head.magic == 0x45524653 && head.version == 1 && head.count <= 100000;
+    FtpDiskCacheHeader head = {}; DWORD got = 0;
+    BOOL ok = ReadFile(f, &head, sizeof(head), &got, NULL) && got == sizeof(head) &&
+              head.magic == 0x45524653 && head.version == 2 && head.count <= 100000 &&
+              0 == StrCmp(head.site, site ? site : L"") &&
+              0 == StrCmp(head.folder, (path && path[0]) ? path : L"/");
     if (ok && head.count) { items.resize(head.count); DWORD bytes = head.count * (DWORD)sizeof(FTPENTRY); ok = ReadFile(f, items.data(), bytes, &got, NULL) && got == bytes; }
-    CloseHandle(f); if (!ok) items.clear(); return ok;
+    CloseHandle(f);
+    if (!ok)
+    {
+        items.clear();
+        // Stale v1 (case-folded era), foreign-identity or truncated file: drop
+        // it so the next load refetches. Store is atomic (temp + move), so a
+        // present-but-unreadable file is never a half-written one.
+        DeleteFileW(file);
+    }
+    return ok;
 }
 inline void FtpDiskCacheStore(PCWSTR site, PCWSTR path, const FTPENTRY *items, int count)
 {
     if (count < 0 || count > 100000 || (count && !items)) return; WCHAR file[MAX_PATH] = {}, temp[MAX_PATH] = {}; if (!FtpMetadataCacheFile(site, path, file, ARRAYSIZE(file))) return;
     if (FAILED(StringCchPrintfW(temp, ARRAYSIZE(temp), L"%s.%lu.%lu.tmp", file, GetCurrentProcessId(), GetCurrentThreadId()))) return;
     HANDLE f = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL); if (f == INVALID_HANDLE_VALUE) return;
-    FtpDiskCacheHeader head = { 0x45524653, 1, (DWORD)count }; DWORD wrote = 0; BOOL ok = WriteFile(f, &head, sizeof(head), &wrote, NULL) && wrote == sizeof(head);
+    FtpDiskCacheHeader head = {}; head.magic = 0x45524653; head.version = 2; head.count = (DWORD)count;
+    StringCchCopy(head.site, ARRAYSIZE(head.site), site ? site : L"");
+    StringCchCopy(head.folder, ARRAYSIZE(head.folder), (path && path[0]) ? path : L"/");
+    DWORD wrote = 0; BOOL ok = WriteFile(f, &head, sizeof(head), &wrote, NULL) && wrote == sizeof(head);
     if (ok && count) { DWORD bytes = (DWORD)count * (DWORD)sizeof(FTPENTRY); ok = WriteFile(f, items, bytes, &wrote, NULL) && wrote == bytes; }
     CloseHandle(f); if (ok) MoveFileExW(temp, file, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH); DeleteFileW(temp);
 }

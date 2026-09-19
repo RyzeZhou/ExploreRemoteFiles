@@ -161,6 +161,33 @@ public sealed class TransferTaskService
     private CancellationTokenSource? _cts;
     private readonly Dictionary<string, Action> _managedCancels = new(StringComparer.Ordinal);
 
+    // ---- progress coalescing (2026-09-20: "service GUI frozen during copy") --
+    // The transfer reports progress per chunk; each report was BeginInvoke'd to
+    // the UI thread at Normal priority, which outranks Input — a fast transfer
+    // saturated the dispatcher and pause/cancel clicks starved. Coalesce to at
+    // most one UI push per task per 150ms; completion always goes through.
+    private readonly object _progressGate = new();
+    private readonly Dictionary<string, DateTime> _lastProgressPush = new(StringComparer.Ordinal);
+    private static readonly TimeSpan ProgressPushInterval = TimeSpan.FromMilliseconds(150);
+
+    /// <summary>True when this progress report may be pushed to the UI thread.</summary>
+    private bool ShouldPushProgress(string id)
+    {
+        lock (_progressGate)
+        {
+            var now = DateTime.UtcNow;
+            if (_lastProgressPush.TryGetValue(id, out var last) && (now - last) < ProgressPushInterval)
+                return false;
+            _lastProgressPush[id] = now;
+            return true;
+        }
+    }
+
+    private void ForgetProgress(string id)
+    {
+        lock (_progressGate) { _lastProgressPush.Remove(id); }
+    }
+
     // ---- batch bookkeeping -------------------------------------------------
     // A "batch" is one USER-level operation. Copying a folder runs one CLI job
     // per file and the shell launches them with small gaps, so "every listed
@@ -238,6 +265,7 @@ public sealed class TransferTaskService
     {
         string[] f = line.Split('\t');
         if (f.Length < 3) return;
+        if (f[0] == "P" && f.Length >= 4 && !ShouldPushProgress(f[1])) return;  // coalesce per-chunk flood
         if (f[0] == "B" && f.Length >= 8)
             Log("BEGIN id=" + f[1] + " server=" + f[3] + " dir=" + f[2] + " name=" + f[4] + " total=" + f[7] + " pid=" + (f.Length > 8 ? f[8] : "-"));
         else if (f[0] == "E" && f.Length >= 3)
@@ -276,6 +304,7 @@ public sealed class TransferTaskService
                 }
                 case "E" when f.Length >= 3:
                 {
+                    ForgetProgress(f[1]);
                     TransferTask? task = Find(f[1]);
                     if (task is null) break;
                     bool ok = string.Equals(f[2], "done", StringComparison.Ordinal);
@@ -381,6 +410,7 @@ public sealed class TransferTaskService
     {
         if (!_dispatcher.CheckAccess())
         {
+            if (!ShouldPushProgress(task.Id)) return;  // coalesce per-chunk flood; completion bypasses via Finish
             _dispatcher.BeginInvoke(() => UpdateManagedTask(task, done, total, current));
             return;
         }
@@ -397,6 +427,7 @@ public sealed class TransferTaskService
             return;
         }
         _managedCancels.Remove(task.Id);
+        ForgetProgress(task.Id);
         if (task.IsFinished) return;
         if (cancelled)
         {
