@@ -987,25 +987,98 @@ inline void FtpPrefetchEnd(PCWSTR key)
     v.erase(std::remove(v.begin(), v.end(), std::wstring(key)), v.end());
     ReleaseSRWLockExclusive(&FtpPrefetchLock());
 }
+// Pending UPDATEDIR notifications for keys that are ALREADY being prefetched.
+// Race fixed 2026-09-20: mkdir/rename start a prefetch WITHOUT a notify PIDL;
+// the view re-enumeration that follows calls FtpPrefetchQuiet WITH one, but the
+// in-flight dedup used to drop it on the floor — the prefetch then completed
+// silently and the view stayed on the "loading..." placeholder forever (mkdir
+// showed nothing / the new directory looked empty). Late notifies are queued
+// here and ALL fired when the in-flight fetch completes.
+inline SRWLOCK &FtpPrefetchNotifyLock()
+{
+    static SRWLOCK l = SRWLOCK_INIT;
+    return l;
+}
+struct FtpPrefetchNotify
+{
+    std::wstring key;
+    PIDLIST_ABSOLUTE pidl;   // cloned, freed on fire
+};
+inline std::vector<FtpPrefetchNotify> &FtpPrefetchNotifyPending()
+{
+    static std::vector<FtpPrefetchNotify> v;
+    return v;
+}
+inline void FtpPrefetchNotifyAdd(PCWSTR key, PIDLIST_ABSOLUTE pidl)
+{
+    if (!key || !key[0] || !pidl) return;
+    PIDLIST_ABSOLUTE c = ILCloneFull(pidl);
+    if (!c) return;
+    AcquireSRWLockExclusive(&FtpPrefetchNotifyLock());
+    auto &v = FtpPrefetchNotifyPending();
+    int same = 0;
+    for (auto &n : v) if (n.key == key && ++same >= 8) break;
+    if (same >= 8)
+    {
+        // Bound the queue: stale views may pile up; drop the oldest for this key.
+        for (auto it = v.begin(); it != v.end(); ++it)
+            if (it->key == key) { ILFree(it->pidl); v.erase(it); break; }
+    }
+    FtpPrefetchNotify n; n.key = key; n.pidl = c;
+    v.push_back(n);
+    ReleaseSRWLockExclusive(&FtpPrefetchNotifyLock());
+}
+// Fire every pending notify for key. Caller holds no locks (SHChangeNotify out).
+inline void FtpPrefetchNotifyFire(PCWSTR key)
+{
+    std::vector<PIDLIST_ABSOLUTE> fire;
+    AcquireSRWLockExclusive(&FtpPrefetchNotifyLock());
+    auto &v = FtpPrefetchNotifyPending();
+    for (auto it = v.begin(); it != v.end();)
+    {
+        if (it->key == key) { fire.push_back(it->pidl); it = v.erase(it); }
+        else ++it;
+    }
+    ReleaseSRWLockExclusive(&FtpPrefetchNotifyLock());
+    for (auto p : fire)
+    {
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)p, NULL);
+        ILFree(p);
+    }
+}
 
 static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
 {
     FtpPrefetchCtx *c = static_cast<FtpPrefetchCtx *>(p);
-    std::vector<FTPENTRY> warm;
-    if (!FtpListCachedAll(c->site, c->folder, warm) || warm.empty())
+    // A stuck in-flight key makes every later enumeration return the loading
+    // placeholder forever, so the key MUST be released on every exit path —
+    // including a C++ exception escaping the listing below. catch(...) here
+    // keeps the key set consistent; the view simply retries on next navigate.
+    try
     {
-        // Transient bridge/network hiccup: the optimistic patch entries would
-        // otherwise linger with guessed metadata. Retry once after a beat.
-        Sleep(300);
-        warm.clear();
-        FtpListCachedAll(c->site, c->folder, warm);
+        std::vector<FTPENTRY> warm;
+        if (!FtpListCachedAll(c->site, c->folder, warm) || warm.empty())
+        {
+            // Transient bridge/network hiccup: the optimistic patch entries would
+            // otherwise linger with guessed metadata. Retry once after a beat.
+            Sleep(300);
+            warm.clear();
+            FtpListCachedAll(c->site, c->folder, warm);
+        }
+        ProbeLog(L"[MUT] quiet prefetch site='%s' path='%s' n=%u", c->site, c->folder, (UINT)warm.size());
     }
-    ProbeLog(L"[MUT] quiet prefetch site='%s' path='%s' n=%u", c->site, c->folder, (UINT)warm.size());
+    catch (...)
+    {
+        ProbeLog(L"[MUT] quiet prefetch threw site='%s' path='%s'", c->site, c->folder);
+    }
+    // Notify even when the fetch failed: the view re-enumerates (cold again ->
+    // a fresh prefetch) instead of sitting on a stale placeholder.
     if (c->notifyPidl)
     {
         SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, c->notifyPidl, NULL);
         ILFree(c->notifyPidl);
     }
+    FtpPrefetchNotifyFire(c->key);
     FtpPrefetchEnd(c->key);
     delete c;
     return 0;
@@ -1016,7 +1089,7 @@ inline void FtpPrefetchQuiet(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notify
     PCWSTR dir = (folder && folder[0]) ? folder : L"/";
     WCHAR key[700] = {};
     StringCchPrintf(key, ARRAYSIZE(key), L"%s|%s", site, dir);
-    if (!FtpPrefetchBegin(key)) return;   // already being fetched
+    if (!FtpPrefetchBegin(key)) { FtpPrefetchNotifyAdd(key, notifyPidl); return; }  // already being fetched
     FtpPrefetchCtx *c = new (std::nothrow) FtpPrefetchCtx{};
     if (!c) { FtpPrefetchEnd(key); return; }
     StringCchCopy(c->site, ARRAYSIZE(c->site), site);

@@ -1,4 +1,4 @@
-<#
+﻿<#
   ERF 状态诊断 / 洁净清理
 
   默认只诊断，不改任何东西：
@@ -26,7 +26,17 @@ $Clsid = [ordered]@{
     Props    = '{5DD84779-FEF1-46A3-8FCF-9F1A9603BB8F}'   # 属性页
     Protocol = '{A970407D-FE36-4C49-A433-61E605D9DDEA}'   # erf: 协议处理器
 }
-$InstallDir = 'D:\Program\ExplorerRemoteFs'
+$InstallDirFallback = 'D:\Program\ExplorerRemoteFs'
+# 安装目录不写死：从四个 CLSID 的 InprocServer32 反推（四者应一致），取不到才回退旧路径。
+$InstallDir = $InstallDirFallback
+$fromReg = @()
+foreach ($c in $Clsid.Values) {
+    $v = (Get-ItemProperty -LiteralPath "HKCU:\Software\Classes\CLSID\$c\InprocServer32" -ErrorAction SilentlyContinue).'(default)'
+    if ($v) { $fromReg += Split-Path -Parent $v }
+}
+$fromReg = @($fromReg | Sort-Object -Unique)
+if ($fromReg.Count -eq 1) { $InstallDir = $fromReg[0] }
+elseif ($fromReg.Count -gt 1) { Write-Host "  注意：四个 CLSID 指向不同目录：$($fromReg -join ' ; ')" -ForegroundColor Yellow }
 $RegKeys = @(
     'HKCU:\Software\Classes\erf',
     'HKCU:\Software\Classes\RemoteFsMicrosoftCoreType',

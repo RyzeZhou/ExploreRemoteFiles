@@ -1,4 +1,4 @@
-﻿param([string]$OutputPath = (Join-Path $PSScriptRoot 'ExplorerDataProviderFtp.dll'))
+param([string]$OutputPath = (Join-Path $PSScriptRoot 'ExplorerDataProviderFtp.dll'))
 
 $ErrorActionPreference = 'Stop'
 
@@ -38,18 +38,21 @@ $env:INCLUDE = "$($msvc.FullName)\include;$sdkRoot\Include\$ver\shared;$sdkRoot\
 $env:LIB     = "$($msvc.FullName)\lib\x64;$sdkRoot\Lib\$ver\ucrt\x64;$sdkRoot\Lib\$ver\um\x64"
 
 Set-Location $PSScriptRoot
-Remove-Item *.obj,*.res,*.exp,*.lib,*.pdb -ErrorAction SilentlyContinue
+Remove-Item *.obj,*.res,*.exp,*.lib,*.pdb,*.map -ErrorAction SilentlyContinue
 $cpps = @('Category.cpp','ContextMenu.cpp','Dll.cpp','ErfProtocolCommand.cpp','ExplorerDataProvider.cpp','FVCommands.cpp','Utils.cpp')
 & rc.exe /nologo /dUNICODE /d_UNICODE /fo ExplorerDataProvider.res ExplorerDataProvider.rc
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'ExplorerDataProvider.res'))) {
     throw 'Windows resource compilation failed; see rc.exe diagnostics above.'
 }
-foreach($cpp in $cpps){ cl.exe /nologo /c /EHsc /MD /std:c++17 /W3 /utf-8 /D_WINDOWS /D_USRDLL /DUNICODE /D_UNICODE $cpp; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE} }
+foreach($cpp in $cpps){ cl.exe /nologo /c /EHa /MD /std:c++17 /W3 /utf-8 /D_WINDOWS /D_USRDLL /DUNICODE /D_UNICODE $cpp; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE} }
 $objs=$cpps | ForEach-Object {[IO.Path]::GetFileNameWithoutExtension($_)+'.obj'}
 $outDir = Split-Path -Parent $OutputPath
 if ($outDir) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
 $implib = [IO.Path]::ChangeExtension($OutputPath, '.lib')
 $pdb = [IO.Path]::ChangeExtension($OutputPath, '.pdb')
+$map = [IO.Path]::ChangeExtension($OutputPath, '.map')
 # gdi32: SetBkMode/GetSysColorBrush —— 属性页只读值框要画成静态文本的观感。
-link.exe /nologo /DLL /OUT:"$OutputPath" /IMPLIB:"$implib" /PDB:"$pdb" /DEF:ExplorerDataProvider.def /MACHINE:X64 $objs ExplorerDataProvider.res propsys.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib uuid.lib comctl32.lib comdlg32.lib uxtheme.lib
+# /DEBUG：只有它才能让 /PDB 真正生成符号；/MAP：把崩溃 RVA 映射回函数，便于取证。
+# 注意：/DEBUG 会把 /OPT 默认改成 NOREF,NOICF，必须显式改回 REF,ICF，否则代码布局与发布版不一致。
+link.exe /nologo /DLL /DEBUG /OPT:REF /OPT:ICF /OUT:"$OutputPath" /IMPLIB:"$implib" /PDB:"$pdb" /MAP:"$map" /DEF:ExplorerDataProvider.def /MACHINE:X64 $objs ExplorerDataProvider.res propsys.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib uuid.lib comctl32.lib comdlg32.lib uxtheme.lib
 exit $LASTEXITCODE

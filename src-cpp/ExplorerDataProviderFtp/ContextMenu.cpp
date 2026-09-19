@@ -1253,26 +1253,135 @@ static BOOL StartEditWatch(PCWSTR site, PCWSTR remote, PCWSTR local,
     CoTaskMemFree(c);
     return FALSE;
 }
+// ---- async transfer worker (2026-09-20: symptom "copy/download blocks Explorer") --
+// Menu verbs (download / open / edit / copy-to-clipboard) used to run RunCli(get)
+// synchronously on the Explorer UI thread, so any slow file froze the whole shell
+// with no progress UI. Architecture says transfers stay off the shell thread, so
+// the blocking GET phase now runs here on a worker thread. UI-thread-only steps
+// (save dialog, temp-dir prep) stay inline in the callers; worker-thread message
+// boxes use a NULL owner so a possibly-dead Explorer HWND is never touched.
+struct DownloadJob
+{
+    std::wstring site;
+    std::wstring remote;
+    std::wstring local;
+    int kind;
+};
+static DWORD WINAPI DownloadJobProc(LPVOID p)
+{
+    DownloadJob *j = static_cast<DownloadJob *>(p);
+    if (RunCli(j->site.c_str(), L"get", j->remote.c_str(), j->local.c_str(), NULL) != 0)
+    {
+        MessageBoxW(NULL, ExplorerText(L"error.download_failed", L"下载失败。", L"Download failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        delete j;
+        return 1;
+    }
+    if (j->kind == 1)
+    {
+        if ((INT_PTR)ShellExecuteW(NULL, L"open", j->local.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+        {
+            MessageBoxW(NULL, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+            DeleteFileW(j->local.c_str());
+        }
+    }
+    else if (j->kind == 2)
+    {
+        if (!LaunchConfiguredEditor(NULL, j->local.c_str()))
+        {
+            MessageBoxW(NULL, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+            DeleteFileW(j->local.c_str());
+        }
+        else if (!StartEditWatch(j->site.c_str(), j->remote.c_str(), j->local.c_str(), FALSE, NULL))
+            MessageBoxW(NULL, ExplorerText(L"error.edit_watch_failed", L"已打开文件，但无法启动自动上传监视。", L"The file was created and opened, but automatic upload monitoring could not start."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
+    }
+    delete j;
+    return 0;
+};
+static void StartDownloadJob(PCWSTR site, PCWSTR remote, PCWSTR local, int kind)
+{
+    DownloadJob *j = new (std::nothrow) DownloadJob();
+    if (!j) return;
+    j->site = site ? site : L""; j->remote = remote ? remote : L""; j->local = local ? local : L"";
+    j->kind = kind;
+    HANDLE h = CreateThread(NULL, 0, DownloadJobProc, j, 0, NULL);
+    if (h) CloseHandle(h);
+    else delete j;
+}
+struct DownloadBatch
+{
+    std::wstring site;
+    std::wstring dir;
+    std::vector<std::pair<std::wstring, std::wstring>> files;
+};
+static DWORD WINAPI DownloadBatchProc(LPVOID p)
+{
+    DownloadBatch *b = static_cast<DownloadBatch *>(p);
+    int ok = 0;
+    for (auto &f : b->files)
+        if (RunCli(b->site.c_str(), L"get", f.first.c_str(), f.second.c_str(), NULL) == 0) ++ok;
+    WCHAR msg[512];
+    StringCchPrintf(msg, ARRAYSIZE(msg), ExplorerText(L"info.downloaded_to", L"已下载 %d 个文件到：\n%s", L"Downloaded %d files to:\n%s"), ok, b->dir.c_str());
+    MessageBoxW(NULL, msg, ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONINFORMATION);
+    delete b;
+    return 0;
+}
+struct ClipJob
+{
+    std::wstring site;
+    std::wstring dir;
+    std::wstring folder;
+    std::vector<std::wstring> names;
+};
+static DWORD WINAPI ClipJobProc(LPVOID p)
+{
+    ClipJob *j = static_cast<ClipJob *>(p);
+    std::vector<std::wstring> paths;
+    WCHAR local[MAX_PATH];
+    WCHAR full[700];
+    for (auto &nm : j->names)
+    {
+        StringCchPrintf(local, ARRAYSIZE(local), L"%s%s", j->dir.c_str(), nm.c_str());
+        JoinPath(j->folder.c_str(), nm.c_str(), full, ARRAYSIZE(full));
+        if (RunCli(j->site.c_str(), L"get", full, local, NULL) == 0) paths.push_back(local);
+    }
+    if (paths.empty())
+    {
+        MessageBoxW(NULL, ExplorerText(L"error.copy_to_clipboard_failed", L"无法下载选中的项目，未复制到剪贴板。", L"The selected item(s) could not be downloaded, so nothing was copied to the clipboard."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+    }
+    else
+    {
+        SIZE_T sz = sizeof(DROPFILES) + 2;
+        for (auto &t : paths) sz += (t.size() + 1) * sizeof(WCHAR);
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, sz);
+        if (h)
+        {
+            DROPFILES *df = (DROPFILES*)GlobalLock(h);
+            df->pFiles = sizeof(DROPFILES); df->fWide = TRUE; df->pt.x = 0; df->pt.y = 0;
+            WCHAR *dst = (WCHAR*)((BYTE*)df + sizeof(DROPFILES));
+            for (auto &t : paths) { StringCchCopy(dst, (sz - ((BYTE*)dst - (BYTE*)df)) / 2, t.c_str()); dst += t.size() + 1; }
+            *dst = 0;
+            GlobalUnlock(h);
+            if (OpenClipboard(NULL)) { EmptyClipboard(); SetClipboardData(CF_HDROP, h); CloseClipboard(); }
+            else GlobalFree(h);
+        }
+    }
+    delete j;
+    return 0;
+}
 static void OpenRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, BOOL edit)
 {
+    (void)hwnd;  // worker-thread messages use a NULL owner (see DownloadJobProc).
     WCHAR full[700]; JoinPath(folder,name,full,ARRAYSIZE(full));
     WCHAR local[MAX_PATH];
     if(!TempLocalPath(L"Open",site,name,local,ARRAYSIZE(local))) return;
-    if(RunCli(site,L"get",full,local,NULL)!=0){ MessageBoxW(hwnd,ExplorerText(L"error.download_failed",L"下载失败。",L"Download failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR); return; }
-    BOOL opened = edit ? LaunchConfiguredEditor(hwnd, local)
-                       : ((INT_PTR)ShellExecuteW(hwnd, L"open", local, NULL, NULL, SW_SHOWNORMAL) > 32);
-    if(!opened){ MessageBoxW(hwnd,ExplorerText(L"error.open_failed",L"打开失败。",L"Open failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR); DeleteFileW(local); return; }
-    if(edit){
-        if (!StartEditWatch(site, full, local, FALSE, NULL))
-            MessageBoxW(hwnd, ExplorerText(L"error.edit_watch_failed", L"已打开文件，但无法启动自动上传监视。", L"The file was opened, but automatic upload monitoring could not start."),
-                        ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
-    }
+    // The blocking GET runs on a worker thread (2026-09-20); Explorer returns at once.
+    StartDownloadJob(site, full, local, edit ? 2 : 1);
 }
 static void DownloadFiles(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count)
 {
     WCHAR dir[MAX_PATH];
     if(!TempDir(L"Download",site,dir,ARRAYSIZE(dir))) return;
-    // Save dialog for single file
+    // Save dialog for single file (must stay on the UI thread)
     if(count==1){
         WCHAR local[MAX_PATH]; StringCchPrintf(local,ARRAYSIZE(local),L"%s%s",dir,names[0]);
         WCHAR filter[64] = {}; StringCchPrintf(filter, ARRAYSIZE(filter), L"%s%c*.*%c", ExplorerText(L"filter.all_files", L"所有文件", L"All files"), 0, 0);
@@ -1280,57 +1389,38 @@ static void DownloadFiles(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, 
         ofn.lpstrFile=local; ofn.nMaxFile=ARRAYSIZE(local); ofn.Flags=OFN_OVERWRITEPROMPT; ofn.lpstrTitle=ExplorerText(L"dialog.download_to",L"下载到",L"Download to");
         if(!GetSaveFileNameW(&ofn)) return;
         WCHAR full[700]; JoinPath(folder,names[0],full,ARRAYSIZE(full));
-        if(RunCli(site,L"get",full,local,NULL)!=0) MessageBoxW(hwnd,ExplorerText(L"error.download_failed",L"下载失败。",L"Download failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
+        StartDownloadJob(site, full, local, 0);
         return;
     }
-    // Multiple: save into the temp folder (already keyed by site).
+    // Multiple: one worker thread downloads sequentially, then reports once.
+    DownloadBatch *b = new (std::nothrow) DownloadBatch();
+    if (!b) return;
+    b->site = site ? site : L""; b->dir = dir;
     for(int i=0;i<count;i++){
         WCHAR full[700]; JoinPath(folder,names[i],full,ARRAYSIZE(full));
         WCHAR local[MAX_PATH]; StringCchPrintf(local,ARRAYSIZE(local),L"%s%s",dir,names[i]);
-        RunCli(site,L"get",full,local,NULL);
+        b->files.emplace_back(full, local);
     }
-    WCHAR msg[512]; StringCchPrintf(msg,ARRAYSIZE(msg),ExplorerText(L"info.downloaded_to",L"已下载 %d 个文件到：\n%s",L"Downloaded %d files to:\n%s"),count,dir);
-    MessageBoxW(hwnd,msg,ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONINFORMATION);
+    HANDLE h = CreateThread(NULL, 0, DownloadBatchProc, b, 0, NULL);
+    if (h) CloseHandle(h);
+    else delete b;
 }
 static void CopyClipboard(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count)
 {
+    (void)hwnd;  // worker-thread messages use a NULL owner (see ClipJobProc).
     WCHAR dir[MAX_PATH];
     if(!TempDir(L"Clip",site,dir,ARRAYSIZE(dir))) return;
     CleanupDir(dir);
-    // Download each file into temp dir; only successful downloads are offered to Explorer.
-    PCWSTR *paths=(PCWSTR*)CoTaskMemAlloc(sizeof(PCWSTR)*count);
-    if(!paths) return;
-    WCHAR *buf=(WCHAR*)CoTaskMemAlloc(sizeof(WCHAR)*MAX_PATH*count);
-    if(!buf){ CoTaskMemFree(paths); return; }
-    int copied=0;
-    for(int i=0;i<count;i++){
-        WCHAR *local=&buf[copied*MAX_PATH];
-        StringCchPrintf(local,MAX_PATH,L"%s%s",dir,names[i]);
-        WCHAR full[700]; JoinPath(folder,names[i],full,ARRAYSIZE(full));
-        if(RunCli(site,L"get",full,local,NULL)!=0) continue;
-        paths[copied++]=local;
-    }
-    if(!copied){
-        MessageBoxW(hwnd,ExplorerText(L"error.copy_to_clipboard_failed",L"无法下载选中的项目，未复制到剪贴板。",L"The selected item(s) could not be downloaded, so nothing was copied to the clipboard."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-        CoTaskMemFree(paths); CoTaskMemFree(buf); return;
-    }
-    // Build CF_HDROP.
-    SIZE_T sz=sizeof(DROPFILES)+2;
-    for(int i=0;i<copied;i++) sz+=(wcslen(paths[i])+1)*sizeof(WCHAR);
-    HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,sz);
-    if(h){
-        DROPFILES *df=(DROPFILES*)GlobalLock(h);
-        df->pFiles=sizeof(DROPFILES); df->fWide=TRUE; df->pt.x=0; df->pt.y=0;
-        WCHAR *p=(WCHAR*)((BYTE*)df+sizeof(DROPFILES));
-        for(int i=0;i<copied;i++){ StringCchCopy(p,(sz-((BYTE*)p-(BYTE*)df))/2,paths[i]); p+=wcslen(paths[i])+1; }
-        *p=0;
-        GlobalUnlock(h);
-        if(OpenClipboard(hwnd)){ EmptyClipboard(); SetClipboardData(CF_HDROP,h); CloseClipboard(); }
-        else GlobalFree(h);
-    }
-    CoTaskMemFree(paths); CoTaskMemFree(buf);
-}
-enum COPYTARGET { COPY_ORIGINAL = 0, COPY_SAME_SITE = 1, COPY_OTHER_SITE = 2, COPY_LOCAL_FOLDER = 3 };
+    // Downloads run on a worker thread (2026-09-20); the CF_HDROP offer is
+    // built there after the files land, so Explorer never blocks on GET.
+    ClipJob *j = new (std::nothrow) ClipJob();
+    if (!j) return;
+    j->site = site ? site : L""; j->dir = dir; j->folder = folder ? folder : L"";
+    for (int k = 0; k < count; k++) j->names.push_back(names[k]);
+    HANDLE h = CreateThread(NULL, 0, ClipJobProc, j, 0, NULL);
+    if (h) CloseHandle(h);
+    else delete j;
+}enum COPYTARGET { COPY_ORIGINAL = 0, COPY_SAME_SITE = 1, COPY_OTHER_SITE = 2, COPY_LOCAL_FOLDER = 3 };
 typedef struct {
     WCHAR sourceSite[64]; WCHAR sourceFolder[600]; PCWSTR *names; int count;
     COPYTARGET target; WCHAR targetSite[64]; WCHAR targetPath[700];

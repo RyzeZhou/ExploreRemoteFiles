@@ -211,25 +211,6 @@ static DWORD ModeFromString(const WCHAR *pszMode)
     }
     return mode;
 }
-static BOOL RunFtpList(PCWSTR site, PCWSTR path, ITEMDATA *out, int maxItems)
-{
-    FTPENTRY entries[MAX_OBJS] = {};
-    int n = FtpListCached(site, path, entries, maxItems > MAX_OBJS ? MAX_OBJS : maxItems);
-    for (int i = 0; i < n; i++)
-    {
-        ITEMDATA &item = out[i];
-        item.nLevel = 0;
-        item.dwMode  = entries[i].dwMode;
-        item.dwMtime = entries[i].dwMtime;
-        item.dwSize  = entries[i].dwSize;
-        StringCchCopy(item.szOwner, ARRAYSIZE(item.szOwner), entries[i].szOwner);
-        StringCchCopy(item.szGroup, ARRAYSIZE(item.szGroup), entries[i].szGroup);
-        item.fIsFolder  = entries[i].fIsFolder;
-        item.fIsSymlink = entries[i].fIsSymlink;
-        StringCchCopy(item.szName, ARRAYSIZE(item.szName), entries[i].szName);
-    }
-    return n > 0 ? n : 0;
-}
 
 static int RunFtpOperation(PCWSTR site, PCWSTR verb, PCWSTR path1, PCWSTR path2)
 {
@@ -610,7 +591,8 @@ ULONG CFolderViewImplFolder::Release()
 //  Translates a display name into an item identifier list.
 HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR pszName,
                                                 ULONG *pchEaten, PIDLIST_RELATIVE *ppidl, ULONG *pdwAttributes)
-{
+try
+{   // 2026-09-20 stop-the-bleed: no exception may ever escape back into the shell. /EHa lets catch(...) also catch SEH; the fault is logged by the VEH and the call fails cleanly.
     if (!pszName || !ppidl) return E_INVALIDARG;
     *ppidl = NULL;
     ProbeLog(L"[PARSE] enter level=%d name='%s'", m_nLevel, pszName);
@@ -813,13 +795,21 @@ HRESULT CFolderViewImplFolder::ParseDisplayName(HWND hwnd, IBindCtx *pbc, PWSTR 
     ProbeLog(L"[PARSE] NOT-FOUND level=%d site='%s' path='%s' name='%s' items=%u", m_nLevel, m_szSiteName, m_szRemotePath, component, (UINT)items.size());
     return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
 }
+catch (...)
+{
+    // Stack overflow cannot be continued from, but the 466KB-frame
+    // root cause is fixed; this guard converts any other escaping
+    // fault into a clean failure instead of an Explorer crash.
+    return E_FAIL;
+}
 
 //  Allows a client to determine the contents of a folder by
 //  creating an item identifier enumeration object and returning
 //  its IEnumIDList interface. The methods supported by that
 //  interface can then be used to enumerate the folder's contents.
 HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnumIDList **ppenumIDList)
-{
+try
+{   // 2026-09-20 stop-the-bleed: no exception may ever escape back into the shell. /EHa lets catch(...) also catch SEH; the fault is logged by the VEH and the call fails cleanly.
     if (!ppenumIDList) return E_POINTER;
     *ppenumIDList = NULL;
     ProbeLog(L"[ENUM] level=%d site='%s' path='%s' flags=0x%X", m_nLevel, m_szSiteName, m_szRemotePath, grfFlags);
@@ -950,12 +940,20 @@ HRESULT CFolderViewImplFolder::EnumObjects(HWND /* hwnd */, DWORD grfFlags, IEnu
     }
     return hr;
 }
+catch (...)
+{
+    // Stack overflow cannot be continued from, but the 466KB-frame
+    // root cause is fixed; this guard converts any other escaping
+    // fault into a clean failure instead of an Explorer crash.
+    return E_FAIL;
+}
 
 
 //  Factory for handlers for the specified item.
 HRESULT CFolderViewImplFolder::BindToObject(PCUIDLIST_RELATIVE pidl,
                                             IBindCtx *pbc, REFIID riid, void **ppv)
-{
+try
+{   // 2026-09-20 stop-the-bleed: no exception may ever escape back into the shell. /EHa lets catch(...) also catch SEH; the fault is logged by the VEH and the call fails cleanly.
     *ppv = NULL;
     const ULONGLONG tNav = GetTickCount64();   // nav timing probe
     // (hot-path probe removed 2026-09-02: fired per navigation, log IO froze Explorer)
@@ -1011,6 +1009,13 @@ HRESULT CFolderViewImplFolder::BindToObject(PCUIDLIST_RELATIVE pidl,
     }
     ProbeLog(L"[NAV] BindToObject level=%d elapsed=%llu hr=0x%08X iid1=0x%08X pidl=%p", m_nLevel, GetTickCount64() - tNav, hr, riid.Data1, pidl);
     return hr;
+}
+catch (...)
+{
+    // Stack overflow cannot be continued from, but the 466KB-frame
+    // root cause is fixed; this guard converts any other escaping
+    // fault into a clean failure instead of an Explorer crash.
+    return E_FAIL;
 }
 
 HRESULT CFolderViewImplFolder::BindToStorage(PCUIDLIST_RELATIVE pidl,
@@ -1393,7 +1398,8 @@ private:
 
 //  Called by the Shell to create the View Object and return it.
 HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **ppv)
-{
+try
+{   // 2026-09-20 stop-the-bleed: no exception may ever escape back into the shell. /EHa lets catch(...) also catch SEH; the fault is logged by the VEH and the call fails cleanly.
     *ppv = NULL;
     ProbeLog(L"[SAMPLE] CreateViewObject riid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X level=%d", riid.Data1, riid.Data2, riid.Data3, riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3], riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7], m_nLevel);
 
@@ -1491,10 +1497,18 @@ HRESULT CFolderViewImplFolder::CreateViewObject(HWND hwnd, REFIID riid, void **p
     }
     return hr;
 }
+catch (...)
+{
+    // Stack overflow cannot be continued from, but the 466KB-frame
+    // root cause is fixed; this guard converts any other escaping
+    // fault into a clean failure instead of an Explorer crash.
+    return E_FAIL;
+}
 
 //  Retrieves the attributes of one or more file objects or subfolders.
 HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY apidl, ULONG *rgfInOut)
-{
+try
+{   // 2026-09-20 stop-the-bleed: no exception may ever escape back into the shell. /EHa lets catch(...) also catch SEH; the fault is logged by the VEH and the call fails cleanly.
     // If SFGAO_FILESYSTEM is returned, GetDisplayNameOf(SHGDN_FORPARSING) on that item MUST
     // return a filesystem path.
     if (!rgfInOut || !apidl || cidl == 0) return E_INVALIDARG;
@@ -1542,12 +1556,20 @@ HRESULT CFolderViewImplFolder::GetAttributesOf(UINT cidl, PCUITEMID_CHILD_ARRAY 
     *rgfInOut = common;
     return S_OK;
 }
+catch (...)
+{
+    // Stack overflow cannot be continued from, but the 466KB-frame
+    // root cause is fixed; this guard converts any other escaping
+    // fault into a clean failure instead of an Explorer crash.
+    return E_FAIL;
+}
 
 //  Retrieves an OLE interface that can be used to carry out
 //  actions on the specified file objects or folders.
 HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHILD_ARRAY apidl,
                                              REFIID riid, UINT * /* prgfInOut */, void **ppv)
-{
+try
+{   // 2026-09-20 stop-the-bleed: no exception may ever escape back into the shell. /EHa lets catch(...) also catch SEH; the fault is logged by the VEH and the call fails cleanly.
     *ppv = NULL;
     HRESULT hr;
 
@@ -1742,10 +1764,18 @@ HRESULT CFolderViewImplFolder::GetUIObjectOf(HWND hwnd, UINT cidl, PCUITEMID_CHI
     }
     return hr;
 }
+catch (...)
+{
+    // Stack overflow cannot be continued from, but the 466KB-frame
+    // root cause is fixed; this guard converts any other escaping
+    // fault into a clean failure instead of an Explorer crash.
+    return E_FAIL;
+}
 
 //  Retrieves the display name for the specified file object or subfolder.
 HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shgdnFlags, STRRET *pName)
-{
+try
+{   // 2026-09-20 stop-the-bleed: no exception may ever escape back into the shell. /EHa lets catch(...) also catch SEH; the fault is logged by the VEH and the call fails cleanly.
     ProbeLog(L"[NAME] GetDisplayNameOf flags=0x%X", shgdnFlags);
     HRESULT hr = S_OK;
     if (shgdnFlags & (SHGDN_FORPARSING | SHGDN_FORADDRESSBAR))
@@ -1847,12 +1877,20 @@ HRESULT CFolderViewImplFolder::GetDisplayNameOf(PCUITEMID_CHILD pidl, SHGDNF shg
     }
     return hr;
 }
+catch (...)
+{
+    // Stack overflow cannot be continued from, but the 466KB-frame
+    // root cause is fixed; this guard converts any other escaping
+    // fault into a clean failure instead of an Explorer crash.
+    return E_FAIL;
+}
 
 //  Sets the display name of a file object or subfolder, changing
 //  the item identifier in the process.
 HRESULT CFolderViewImplFolder::SetNameOf(HWND hwnd, PCUITEMID_CHILD pidl,
                                          PCWSTR pszName, DWORD /* uFlags */, PITEMID_CHILD *ppidlOut)
-{
+try
+{   // 2026-09-20 stop-the-bleed: no exception may ever escape back into the shell. /EHa lets catch(...) also catch SEH; the fault is logged by the VEH and the call fails cleanly.
     if (ppidlOut) *ppidlOut = NULL;
     if (!pidl || !pszName || !pszName[0]) return E_INVALIDARG;
     WCHAR oldName[MAX_PATH], oldPath[600], newPath[600];
@@ -1884,6 +1922,13 @@ HRESULT CFolderViewImplFolder::SetNameOf(HWND hwnd, PCUITEMID_CHILD pidl,
     FtpNotifyUpdateDir(m_pidl);
     FtpPrefetchQuiet(m_szSiteName, m_szRemotePath);
     return SUCCEEDED(hr) ? S_OK : hr;
+}
+catch (...)
+{
+    // Stack overflow cannot be continued from, but the 466KB-frame
+    // root cause is fixed; this guard converts any other escaping
+    // fault into a clean failure instead of an Explorer crash.
+    return E_FAIL;
 }
 
 //  IPersist method
@@ -2523,6 +2568,7 @@ CFolderViewImplEnumIDList::CFolderViewImplEnumIDList(DWORD grfFlags, int nLevel,
     m_cRef(1), m_grfFlags(grfFlags), m_nLevel(nLevel), m_nItem(0), m_fSeeded(FALSE), m_pFolder(pFolderViewImplShellFolder)
 {
     m_pFolder->AddRef();
+    DllAddRef();   // 2026-09-20: pin the DLL while Explorer may hold this enumerator
     StringCchCopy(m_szSite, ARRAYSIZE(m_szSite), pszSite ? pszSite : L"");
     StringCchCopy(m_szPath, ARRAYSIZE(m_szPath), pszPath ? pszPath : L"/");
 }
@@ -2536,6 +2582,7 @@ void CFolderViewImplEnumIDList::SeedData(std::vector<ITEMDATA> &&data)
 CFolderViewImplEnumIDList::~CFolderViewImplEnumIDList()
 {
     m_pFolder->Release();
+    DllRelease();
 }
 
 HRESULT CFolderViewImplEnumIDList::QueryInterface(REFIID riid, void **ppv)
@@ -2596,8 +2643,14 @@ HRESULT CFolderViewImplEnumIDList::Initialize()
     if (m_nLevel == 1)
     {
         // Enumerating children of level 0 (the site picker): list configured sites.
-        FTPSITE sites[MAX_OBJS] = {};
-        int n = FtpSitesGet(sites, ARRAYSIZE(sites));
+        // NOTE (2026-09-20 stack-overflow fix): this buffer MUST live on the heap.
+        // A 256-entry FTPSITE array is ~466KB; as a stack local it made EVERY
+        // Initialize() call reserve half a megabyte of stack (the frame covers all
+        // branches in /Od builds) and overflowed Explorer threads on deep call
+        // chains: delete via IFileOperation -> EnumObjects -> Initialize ->
+        // __chkstk -> 0xC00000FD (dump 2026-09-19, fault rva 0x4D737).
+        std::vector<FTPSITE> sites(MAX_OBJS);
+        int n = FtpSitesGet(sites.data(), (int)sites.size());
         m_aData.reserve(n);
         for (int i = 0; i < n; i++)
         {
@@ -2749,7 +2802,7 @@ class CFolderViewCB : public IShellFolderViewCB,
                       public IFolderViewSettings
 {
 public:
-    CFolderViewCB() : _cRef(1) { }
+    CFolderViewCB() : _cRef(1) { DllAddRef(); }
 
     // IUnknown
     IFACEMETHODIMP QueryInterface(REFIID riid, void **ppv)
@@ -2769,6 +2822,7 @@ public:
         long cRef = InterlockedDecrement(&_cRef);
         if (0 == cRef)
         {
+            DllRelease();
             delete this;
         }
         return cRef;
