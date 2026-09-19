@@ -165,7 +165,9 @@ Root: HKCU; Subkey: "Software\Classes\CLSID\{#PropsClsid}\InprocServer32"; Value
 Root: HKCU; Subkey: "Software\Classes\CLSID\{#PropsClsid}\InprocServer32"; ValueType: string; ValueName: "ThreadingModel"; \
     ValueData: "Apartment"; Flags: uninsdeletevalue
 
-; ── erf: DelegateExecute：在发起地址栏请求的当前标签页内导航 ───────────────
+; ── erf: 协议处理器的 CLSID（in-process 导航用；当前**不**挂 DelegateExecute）──
+;    保留 CLSID 注册是为了 Win11 分支将来启用时不必改安装结构。
+;    Win11 的 XAML 地址栏目前不把 URI 交给 IExecuteCommand，详见 WriteErfProtocol。
 Root: HKCU; Subkey: "Software\Classes\CLSID\{#ErfProtocolClsid}"; ValueType: string; ValueName: ""; \
     ValueData: "ERF protocol current-tab navigation"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\CLSID\{#ErfProtocolClsid}\InprocServer32"; ValueType: string; ValueName: ""; \
@@ -455,18 +457,57 @@ begin
   end;
 end;
 
+{ Windows 11 = 10.0 build 22000 及以上；Win10 同样是 10.0 但 build 更低。
+  Explorer 的地址栏在 Win11 上被 WinUI 3 重写（XAML），URL 协议的调用链与 Win10 不同，
+  所以注册要按版本分流。 }
+function IsWindows11OrGreater(): Boolean;
+var
+  Version: Cardinal;
+begin
+  Version := GetWindowsVersion;
+  Result := (Version >= $0A000000) and ((Version and $0000FFFF) >= 22000);
+end;
+
 { erf:// 的注册项由 [Code] 写，卸载时也只有"确认是我们写的"才删 }
 procedure WriteErfProtocol();
+var
+  CommandLine: String;
 begin
   RegWriteStringValue(HKCU, 'Software\Classes\erf', '', 'URL: Explorer Remote Files');
   RegWriteStringValue(HKCU, 'Software\Classes\erf', 'URL Protocol', '');
   RegWriteStringValue(HKCU, 'Software\Classes\erf', 'ERF.HandlerOwner', 'ExplorerRemoteFs');
-  { DelegateExecute is in-process in Explorer and receives the originating tab site. }
-  RegWriteStringValue(HKCU, 'Software\Classes\erf\shell\open\command', 'DelegateExecute',
-                      '{A970407D-FE36-4C49-A433-61E605D9DDEA}');
-  { Keep the command as the non-Explorer fallback used when no Shell site exists. }
-  RegWriteStringValue(HKCU, 'Software\Classes\erf\shell\open\command', '',
-                      '"' + ExpandConstant('{app}\client\RemoteFsClient.exe') + '" --open-erf "%1"');
+
+  { 命令行通道：Shell 用 CreateProcess 执行它，URI 经 %1 交给常驻客户端。
+    两个 Windows 版本都实测可用 —— 地址一定能到达，代价是客户端认不出发起标签。 }
+  CommandLine := '"' + ExpandConstant('{app}\client\RemoteFsClient.exe') + '" --open-erf "%1"';
+  RegWriteStringValue(HKCU, 'Software\Classes\erf\shell\open\command', '', CommandLine);
+
+  { 先无条件清掉 DelegateExecute：旧版本或手工实验可能留下它，而两个分支当前都不要。 }
+  RegDeleteValue(HKCU, 'Software\Classes\erf\shell\open\command', 'DelegateExecute');
+
+  if IsWindows11OrGreater() then
+  begin
+    Log('ERF: windows-version=' + IntToStr(GetWindowsVersion) + ' branch=win11 (command-line channel)');
+    { ── Windows 11 ─────────────────────────────────────────────────────
+      本来的目标：用 DelegateExecute 在**发起地址栏请求的那个标签页**原地导航。
+      2026-09-19 Win11 实测否掉了这条路：新地址栏走 COM 时只调 SetSite 与 Execute，
+      **从不调 IExecuteCommand::SetParameters**（把 command 默认值改成 "%1" 也一样），
+      in-process handler 拿不到 URI，Shell 报「参数错误」——比只走命令行更糟
+      （命令行至少能直达，只是跳固定标签）。
+      所以在调研出 Win11 正确的 in-process 通道之前，Win11 与 Win10 一样走命令行：
+      **不注册 DelegateExecute**。调研有结论后只改这一支。
+
+      ⚠ 将来在这里写回 DelegateExecute 时，注意 command 默认值**不能**简化成 "%1"：
+      DelegateExecute 万一创建失败，Shell 会退回来执行这条命令，若它只是 "%1"，
+      就会再次 ShellExecute 同一个 URI，形成自我递归。 }
+  end
+  else
+  begin
+    Log('ERF: windows-version=' + IntToStr(GetWindowsVersion) + ' branch=win10 (command-line channel)');
+    { ── Windows 10 ─────────────────────────────────────────────────────
+      经典地址栏（ToolbarWindow32）会把 URI 交给协议 handler，命令行通道已验证可用。
+      保持与历史一致：不引入 COM 路径。 }
+  end;
 end;
 
 function NeedsAddPath(Param: String): Boolean;

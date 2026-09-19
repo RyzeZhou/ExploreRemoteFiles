@@ -176,7 +176,9 @@ Check 'ctx handler registered (file)' ($null -ne (RegDefault "$hk\RemoteFsFileTy
 Check 'file open verb' ((RegDefault "$hk\RemoteFsFileType\shell\open\command") -like "*ExplorerRemoteFs.Cli.exe*open*") (RegDefault "$hk\RemoteFsFileType\shell\open\command")
 Check 'erf:// owner marker' ((RegValue "$hk\erf" 'ERF.HandlerOwner') -eq 'ExplorerRemoteFs') (RegValue "$hk\erf" 'ERF.HandlerOwner')
 Check 'erf:// handler command' ((RegDefault "$hk\erf\shell\open\command") -like "*--open-erf*") (RegDefault "$hk\erf\shell\open\command")
-Check 'erf:// DelegateExecute current-tab handler' ((RegValue "$hk\erf\shell\open\command" 'DelegateExecute') -eq $erfDelegate) (RegValue "$hk\erf\shell\open\command" 'DelegateExecute')
+# Win11 的 XAML 地址栏不把 URI 交给 IExecuteCommand（SetParameters 从不被调用），
+# 所以当前**故意不注册** DelegateExecute，两个平台都走命令行通道。见 erf.iss 的分支说明。
+Check 'erf:// no DelegateExecute (command-line channel only)' ($null -eq (RegValue "$hk\erf\shell\open\command" 'DelegateExecute')) (RegValue "$hk\erf\shell\open\command" 'DelegateExecute')
 Check 'Winlogon AutoRestartShell not written' ($null -eq (RegValue $winlogon 'AutoRestartShell')) (RegValue $winlogon 'AutoRestartShell')
 # shell 真的认这个条目吗（会实例化我们的 in-proc 扩展）
 Check 'shell sees the namespace entry' (NamespaceVisible $folder) 'enumerated Desktop namespace via Shell.Application'
