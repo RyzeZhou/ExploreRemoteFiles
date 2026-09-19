@@ -10,6 +10,7 @@
 #include <time.h>
 #include <shellapi.h>
 #include <uxtheme.h>   // SetWindowTheme：属性页只读值框要关掉视觉样式
+#include <commctrl.h>  // SetWindowSubclass/DefSubclassProc：接管 modeless 属性表的按钮
 #include "FtpMeta.h"
 #include "FtpSites.h"
 #include "VscodeBridge.h"
@@ -3095,6 +3096,47 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
     return FALSE;
 }
 
+// ---- modeless 属性表的按钮必须自己接管 -------------------------------------
+// 属性表的「确定 / 取消 / 关闭」按钮属于属性表 frame，不属于我们提供的页面，
+// 所以页面过程（PermPageProc）根本收不到这些 WM_COMMAND —— 模态属性表由它自己的
+// 内部模态循环收尾，而 PSH_MODELESS 下那个循环并不存在：frame 收下点击后什么都不做，
+// 窗口就一直留在屏幕上。2026-09-19 Win11 实测症状：三个按钮全部无反应，只能关掉
+// Explorer 主窗口，属性页才跟着消失。
+// 处理：子类化 sheet frame —— 先交给 frame 自己处理（「确定」必须由它把 PSN_APPLY
+// 通知发给页面，chmod 才会写回），再显式 DestroyWindow。
+static const UINT_PTR kSheetSubclassId = 1;
+
+static LRESULT CALLBACK ErfSheetFrameSubclassProc(HWND hWnd, UINT uMsg, WPARAM wp, LPARAM lp,
+                                                  UINT_PTR /*uIdSubclass*/, DWORD_PTR /*dwRefData*/)
+{
+    switch (uMsg)
+    {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL || LOWORD(wp) == IDCLOSE)
+        {
+            LRESULT r = DefSubclassProc(hWnd, uMsg, wp, lp);   // frame 先发 PSN_APPLY（点确定时）
+            ProbeLog(L"[DIAG] sheet frame button cmd=%u -> close modeless sheet hwnd=%p",
+                     (unsigned)LOWORD(wp), (void*)hWnd);
+            if (IsWindow(hWnd)) DestroyWindow(hWnd);
+            return r;
+        }
+        break;
+    case WM_CLOSE:
+        ProbeLog(L"[DIAG] sheet frame WM_CLOSE -> close modeless sheet hwnd=%p", (void*)hWnd);
+        DestroyWindow(hWnd);
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_CLOSE)   // 右上角 X / Alt+F4
+        {
+            ProbeLog(L"[DIAG] sheet frame SC_CLOSE -> close modeless sheet hwnd=%p", (void*)hWnd);
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        break;
+    }
+    return DefSubclassProc(hWnd, uMsg, wp, lp);
+}
+
 // 右键菜单/背景菜单的“属性”过去创建 IDD_PERMBOX：它是灰底、无标签的
 // 自定义对话框；早期更以 Explorer HWND 调 DialogBoxParamW，因而会锁住
 // 同一宿主的其他窗口。这里改为与 Explorer 原生属性一致的 PropertySheet：
@@ -3141,6 +3183,9 @@ static void ShowRemotePropertiesSheetModeless(PCWSTR site, PCWSTR folder, PCWSTR
     HWND sheet = (HWND)PropertySheetW(&psh);
     if (sheet && sheet != (HWND)-1)
     {
+        // 挂上按钮处理：PSH_MODELESS 的属性表不会自己因确定/取消而关闭（见上面的说明）。
+        if (!SetWindowSubclass(sheet, ErfSheetFrameSubclassProc, kSheetSubclassId, 0))
+            ProbeLog(L"[DIAG] sheet frame subclass failed err=%lu（按钮可能仍无法关闭属性页）", GetLastError());
         ShowWindow(sheet, SW_SHOWNORMAL);
         SetForegroundWindow(sheet);
         if (!haveMeta) MetaWarmStart(pm);

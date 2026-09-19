@@ -56,3 +56,62 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\src-setup\inno-test.ps1
 
 它现在会断言 DelegateExecute CLSID、其 `InprocServer32` 和 `erf:` 命令注册；本机因缺少 C++ 工具链
 未执行这项实机验证。
+
+---
+
+## 追加问题：modeless 属性表的「确定 / 取消 / 关闭」全部失效（2026-09-19）
+
+现场：`7bcac55` 之后外观已经对了 —— 白底、带「文件属性」标签、不再禁用其他 Explorer 窗口；
+但**三个按钮点了都没有反应**，属性页关不掉，只能关掉 Explorer 主窗口，属性页才随之消失。
+
+根因是 `PSH_MODELESS` 的固有行为，与 Win10 / Win11 无关：
+
+1. 属性表的按钮属于属性表 **frame**，不属于我们提供的页面，所以页面过程 `PermPageProc`
+   收不到这些 `WM_COMMAND`；
+2. 模态属性表由它自己的内部模态循环处理按钮并结束窗口，而 `PSH_MODELESS` 下**那个循环不存在**，
+   frame 收下点击后不销毁窗口；
+3. 于是属性表窗口一直留着；它又是 Explorer 的 owned window（`psh.hwndParent = NULL` 时系统取
+   活动窗口作 owner），所以关掉 Explorer 时它才跟着消失 —— 与实测观察完全一致。
+
+修复：子类化 sheet frame（`SetWindowSubclass` + `DefSubclassProc`）接管按钮 ——
+
+- `WM_COMMAND` 且 `IDOK / IDCANCEL / IDCLOSE`：**先** `DefSubclassProc` 让 frame 自己处理
+  （「确定」必须由 frame 把 `PSN_APPLY` 通知发给页面，`chmod` 才会写回），**再** `DestroyWindow`；
+- `WM_CLOSE`、`WM_SYSCOMMAND(SC_CLOSE)`：直接 `DestroyWindow`（右上角 X 与 Alt+F4）；
+- 即使系统在某条路径上也自己销毁了窗口，`IsWindow` 检查让这次销毁成为幂等操作。
+
+### 诊断日志（`remotefs-debug.log`）
+
+- `[DIAG] sheet frame button cmd=<id> -> close modeless sheet hwnd=...`
+- `[DIAG] sheet frame WM_CLOSE -> close modeless sheet hwnd=...`
+- `[DIAG] sheet frame SC_CLOSE -> close modeless sheet hwnd=...`
+- `[DIAG] sheet frame subclass failed err=...`（挂子类失败时留证据）
+
+点按钮后若**没有**出现第一行，说明命令根本没到 frame，那是另一层问题（消息泵 / 窗口层级），
+需要新的取证 —— 这条日志本身就是分界线。
+
+### 本轮未做（留给后续）
+
+- 属性页「确定」路径里的同步 `RunCli(chmod)` 仍跑在 Explorer 的 UI 线程上，远程慢时会卡住属性页；
+  递归改权限已交常驻服务，非递归这一支也可以照此办理。
+- `RemoteFsShell` 目录属性仍有 `DialogBoxParamW(IDD_PERMBOX)` 的模态路径（较低优先级）。
+
+### 回归步骤
+
+编译必须在有 VS Desktop C++ workload 的机器上（Win10 虚拟机），产物再装到 Win11：
+
+```powershell
+Set-Location D:	ools\explore-remote-files
+git log -1 --oneline
+powershell -NoProfile -ExecutionPolicy Bypass -File .\src-cpp\ExplorerDataProviderFtp\compile.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scriptsuild-release.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\src-setupuild-inno.ps1
+Get-Item .\dist\Erf-0.1-Alpha-Setup.exe
+```
+
+把 `dist\Erf-0.1-Alpha-Setup.exe` 复制到 Win11 安装，然后重启 Explorer（或注销再登录）。
+
+1. 右键远程文件 → 属性：窗口应为白底带「文件属性」标签；点「取消」应立即关闭；
+   点「确定」应先写回 `chmod` 再关闭；点右上角 X 也应关闭。
+2. 三个动作都应在 `remotefs-debug.log` 里留下对应的 `sheet frame ...` 日志。
+3. 属性页打开期间，其他 Explorer 窗口应始终可点击（不回归到「其他窗口变暗」）。
