@@ -46,6 +46,7 @@
 #define NsFolderClsid  "{{C816CE0E-728C-4FC9-98E5-D0B35B384597}"
 #define CtxClsid       "{{CB8F539D-3B97-4473-9E07-C8248C53248E}"
 #define PropsClsid     "{{5DD84779-FEF1-46A3-8FCF-9F1A9603BB8F}"
+#define ErfProtocolClsid "{{A970407D-FE36-4C49-A433-61E605D9DDEA}"
 
 #ifndef PayloadDir
   #define PayloadDir "..\dist\ExplorerRemoteFs-win-x64"
@@ -162,6 +163,14 @@ Root: HKCU; Subkey: "Software\Classes\CLSID\{#PropsClsid}"; ValueType: string; V
 Root: HKCU; Subkey: "Software\Classes\CLSID\{#PropsClsid}\InprocServer32"; ValueType: string; ValueName: ""; \
     ValueData: "{app}\ExplorerDataProviderFtp.dll"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\CLSID\{#PropsClsid}\InprocServer32"; ValueType: string; ValueName: "ThreadingModel"; \
+    ValueData: "Apartment"; Flags: uninsdeletevalue
+
+; ── erf: DelegateExecute：在发起地址栏请求的当前标签页内导航 ───────────────
+Root: HKCU; Subkey: "Software\Classes\CLSID\{#ErfProtocolClsid}"; ValueType: string; ValueName: ""; \
+    ValueData: "ERF protocol current-tab navigation"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\CLSID\{#ErfProtocolClsid}\InprocServer32"; ValueType: string; ValueName: ""; \
+    ValueData: "{app}\ExplorerDataProviderFtp.dll"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\CLSID\{#ErfProtocolClsid}\InprocServer32"; ValueType: string; ValueName: "ThreadingModel"; \
     ValueData: "Apartment"; Flags: uninsdeletevalue
 
 ; ── 挂到我们自己的两个 ProgID 上（目录用 CoreType，文件用 FileType）────────
@@ -452,6 +461,10 @@ begin
   RegWriteStringValue(HKCU, 'Software\Classes\erf', '', 'URL: Explorer Remote Files');
   RegWriteStringValue(HKCU, 'Software\Classes\erf', 'URL Protocol', '');
   RegWriteStringValue(HKCU, 'Software\Classes\erf', 'ERF.HandlerOwner', 'ExplorerRemoteFs');
+  { DelegateExecute is in-process in Explorer and receives the originating tab site. }
+  RegWriteStringValue(HKCU, 'Software\Classes\erf\shell\open\command', 'DelegateExecute',
+                      '{A970407D-FE36-4C49-A433-61E605D9DDEA}');
+  { Keep the command as the non-Explorer fallback used when no Shell site exists. }
   RegWriteStringValue(HKCU, 'Software\Classes\erf\shell\open\command', '',
                       '"' + ExpandConstant('{app}\client\RemoteFsClient.exe') + '" --open-erf "%1"');
 end;

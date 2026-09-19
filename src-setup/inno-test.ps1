@@ -93,6 +93,7 @@ function NamespaceVisible([string]$clsid) {
 $folder = '{C816CE0E-728C-4FC9-98E5-D0B35B384597}'
 $ctx = '{CB8F539D-3B97-4473-9E07-C8248C53248E}'
 $props = '{5DD84779-FEF1-46A3-8FCF-9F1A9603BB8F}'
+$erfDelegate = '{A970407D-FE36-4C49-A433-61E605D9DDEA}'
 $arp = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ExplorerRemoteFs_is1'
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runOnce = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
@@ -153,7 +154,7 @@ Check 'Run entry (startup task)' ((RegValue $run 'ExplorerRemoteFs') -like "*Rem
 Check 'resident client started' ($null -ne (Get-Process -Name RemoteFsClient -ErrorAction SilentlyContinue)) 'RemoteFsClient.exe'
 Check 'no desktop shortcut without the task' ($null -eq (DesktopShortcut)) 'only created when the task is checked'
 
-foreach ($c in @($folder, $ctx, $props)) {
+foreach ($c in @($folder, $ctx, $props, $erfDelegate)) {
     $v = RegDefault "$hk\CLSID\$c\InprocServer32"
     Check ("InprocServer32 " + $c.Substring(0, 9)) ($v -like "$TestDir*") $v
 }
@@ -175,6 +176,7 @@ Check 'ctx handler registered (file)' ($null -ne (RegDefault "$hk\RemoteFsFileTy
 Check 'file open verb' ((RegDefault "$hk\RemoteFsFileType\shell\open\command") -like "*ExplorerRemoteFs.Cli.exe*open*") (RegDefault "$hk\RemoteFsFileType\shell\open\command")
 Check 'erf:// owner marker' ((RegValue "$hk\erf" 'ERF.HandlerOwner') -eq 'ExplorerRemoteFs') (RegValue "$hk\erf" 'ERF.HandlerOwner')
 Check 'erf:// handler command' ((RegDefault "$hk\erf\shell\open\command") -like "*--open-erf*") (RegDefault "$hk\erf\shell\open\command")
+Check 'erf:// DelegateExecute current-tab handler' ((RegValue "$hk\erf\shell\open\command" 'DelegateExecute') -eq $erfDelegate) (RegValue "$hk\erf\shell\open\command" 'DelegateExecute')
 Check 'Winlogon AutoRestartShell not written' ($null -eq (RegValue $winlogon 'AutoRestartShell')) (RegValue $winlogon 'AutoRestartShell')
 # shell 真的认这个条目吗（会实例化我们的 in-proc 扩展）
 Check 'shell sees the namespace entry' (NamespaceVisible $folder) 'enumerated Desktop namespace via Shell.Application'
@@ -267,7 +269,7 @@ if ($oldFiles.Count -gt 0) {
 Check 'ARP removed' ($null -eq (RegValue $arp 'DisplayName')) 'ARP'
 Check 'Run entry removed' ($null -eq (RegValue $run 'ExplorerRemoteFs')) 'Run'
 Check 'CliPath removed' ($null -eq (RegValue 'HKCU:\Software\ExplorerRemoteFs' 'CliPath')) 'CliPath'
-foreach ($c in @($folder, $ctx, $props)) {
+foreach ($c in @($folder, $ctx, $props, $erfDelegate)) {
     Check ("CLSID removed " + $c.Substring(0, 9)) ($null -eq (RegDefault "$hk\CLSID\$c\InprocServer32")) $c
 }
 Check 'erf:// removed (owner was ours)' ($null -eq (RegDefault "$hk\erf\shell\open\command")) 'erf'

@@ -1002,6 +1002,38 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
     return FALSE;
 }
 
+// 打开属性页必须一直留在 Explorer UI 线程的非阻塞路径上：只读取本地缓存，
+// 冷缓存由后台线程补齐。尤其不能把 Explorer HWND 传给 DialogBoxParamW 或
+// CreateDialogParamW —— 前者会显式禁用 owner，后者会把页面作为 Explorer 的
+// owned popup；Win11 的标签式 Explorer 会把这种激活/禁用链扩散到同一宿主的
+// 其他窗口。这里刻意创建无 owner 的顶层 modeless 页面。
+static void ShowRemotePropertiesModeless(PCWSTR site, PCWSTR folder, PCWSTR name,
+                                         PCWSTR fullPath, BOOL canSetOwner)
+{
+    if (!site || !site[0] || !folder || !name || !name[0] || !fullPath || !fullPath[0]) return;
+
+    PROPMETA *pm=(PROPMETA*)CoTaskMemAlloc(sizeof(*pm));
+    if(!pm) return;
+    ZeroMemory(pm,sizeof(*pm));
+    pm->refs = 1;
+    pm->modeless = TRUE;
+    pm->canSetOwner = canSetOwner;
+    StringCchCopy(pm->site, ARRAYSIZE(pm->site), site);
+    StringCchCopy(pm->folder, ARRAYSIZE(pm->folder), folder);
+    StringCchCopy(pm->name, ARRAYSIZE(pm->name), name);
+    StringCchCopy(pm->path, ARRAYSIZE(pm->path), fullPath);
+
+    BOOL haveMeta = ReadRemoteMetaCached(site, folder, name, &pm->meta);
+    ProbeLog(L"[PROBE] properties modeless cache=%d owner=NULL site='%s' folder='%s' name='%s' path='%s'",
+             (int)haveMeta, site, folder, name, fullPath);
+    HWND dlg=CreateDialogParamW(g_hInst, MAKEINTRESOURCEW(IDD_PERMBOX), NULL, PermDlgProc, (LPARAM)pm);
+    if(dlg){
+        ShowWindow(dlg,SW_SHOWNORMAL); SetForegroundWindow(dlg);
+        if(!haveMeta) MetaWarmStart(pm);      // 冷缓存：后台取，回来 PostMessage 刷新
+    }
+    else PropMetaRelease(pm);
+}
+
 // Background-menu helpers. The folder PIDL represents the current directory,
 // so its metadata is found by listing the parent directory and selecting its leaf.
 static void ShowCurrentFolderProperties(HWND hwnd, PCWSTR site, PCWSTR folder)
@@ -1017,29 +1049,8 @@ static void ShowCurrentFolderProperties(HWND hwnd, PCWSTR site, PCWSTR folder)
     if (slash == full) StringCchCopy(parent, ARRAYSIZE(parent), L"/");
     else { *slash = L'\0'; StringCchCopy(parent, ARRAYSIZE(parent), full); }
 
-    PROPMETA *pm=(PROPMETA*)CoTaskMemAlloc(sizeof(*pm));
-    if(!pm) return;
-    ZeroMemory(pm,sizeof(*pm));
-    pm->refs = 1;
-    StringCchCopy(pm->site, ARRAYSIZE(pm->site), site);
-    StringCchCopy(pm->path, ARRAYSIZE(pm->path), folder);
-    StringCchCopy(pm->folder, ARRAYSIZE(pm->folder), parent);
-    StringCchCopy(pm->name, ARRAYSIZE(pm->name), name);
-    pm->canSetOwner = SiteCanSetOwner(site);
-    pm->modeless = TRUE;
-    // 这个对话框同样是从 Explorer 的 UI 线程打开的：**绝不能**在这里同步等远程
-    // （老代码用 ReadRemoteMeta，冷缓存最坏要等管道 + 网络好几秒，整个 shell
-    //  一起失去响应 —— Win11 上表现为"其他资源管理器窗口全被锁住"）。
-    // 改成一贯的做法：先读本地缓存把窗口开出来，后台线程取回真实值再刷新。
-    BOOL haveMeta = ReadRemoteMetaCached(site, parent, name, &pm->meta);
-    ProbeLog(L"[PROBE] ShowCurrentFolderProperties cache=%d site='%s' parent='%s' name='%s'",
-             (int)haveMeta, site, parent, name);
-    HWND dlg=CreateDialogParamW(g_hInst, MAKEINTRESOURCEW(IDD_PERMBOX), hwnd, PermDlgProc, (LPARAM)pm);
-    if(dlg){
-        ShowWindow(dlg,SW_SHOWNORMAL); SetForegroundWindow(dlg);
-        if(!haveMeta) MetaWarmStart(pm);      // 冷缓存：后台取，回来 PostMessage 刷新
-    }
-    else PropMetaRelease(pm);
+    (void)hwnd;  // 不可作为 owner：Win11 会把 owned-popup 链关联到 Explorer。
+    ShowRemotePropertiesModeless(site, parent, name, folder, SiteCanSetOwner(site));
 }
 
 static void PopulateSiteInfo(HWND hDlg, PCWSTR site)
@@ -2907,12 +2918,13 @@ public:
         break;
     }
     case MENU_PROPERTIES:{
-        PROPMETA pm={}; StringCchCopy(pm.site,ARRAYSIZE(pm.site),sel.site);
-        pm.canSetOwner = SiteCanSetOwner(sel.site);
-        JoinPath(sel.folder,sel.names[0],pm.path,ARRAYSIZE(pm.path));
-        if(ReadRemoteMeta(sel.site,sel.folder,sel.names[0],&pm.meta))
-            DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_PERMBOX),ci->hwnd,PermDlgProc,(LPARAM)&pm);
-        else MessageBoxW(ci->hwnd,ExplorerText(L"info.metadata_unavailable",L"元数据不可用。",L"Metadata unavailable."),sel.firstIsFolder?ExplorerText(L"property.directory_properties",L"目录属性",L"Directory properties"):ExplorerText(L"property.file_properties",L"文件属性",L"File properties"),MB_OK|MB_ICONINFORMATION);
+        WCHAR path[600] = {};
+        JoinPath(sel.folder,sel.names[0],path,ARRAYSIZE(path));
+        // 不同步 ReadRemoteMeta，也不用 DialogBoxParamW：两者都会把 Explorer 的
+        // UI 路径拖进网络等待或 owner-modal 禁用状态。modeless 页先展示缓存，
+        // 缓存未命中时由 MetaWarmThread 异步补齐。
+        ShowRemotePropertiesModeless(sel.site, sel.folder, sel.names[0], path,
+                                     SiteCanSetOwner(sel.site));
         break; }
     case MENU_TERMINAL:
     {

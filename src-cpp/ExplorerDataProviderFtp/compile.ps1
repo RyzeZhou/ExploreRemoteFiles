@@ -39,7 +39,7 @@ $env:LIB     = "$($msvc.FullName)\lib\x64;$sdkRoot\Lib\$ver\ucrt\x64;$sdkRoot\Li
 
 Set-Location $PSScriptRoot
 Remove-Item *.obj,*.res,*.exp,*.lib,*.pdb -ErrorAction SilentlyContinue
-$cpps = @('Category.cpp','ContextMenu.cpp','Dll.cpp','ExplorerDataProvider.cpp','FVCommands.cpp','Utils.cpp')
+$cpps = @('Category.cpp','ContextMenu.cpp','Dll.cpp','ErfProtocolCommand.cpp','ExplorerDataProvider.cpp','FVCommands.cpp','Utils.cpp')
 & rc.exe /nologo /dUNICODE /d_UNICODE /fo ExplorerDataProvider.res ExplorerDataProvider.rc
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'ExplorerDataProvider.res'))) {
     throw 'Windows resource compilation failed; see rc.exe diagnostics above.'
