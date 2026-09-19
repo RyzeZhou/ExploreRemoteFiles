@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -150,6 +150,11 @@ public partial class App : System.Windows.Application
         _transfers.JobStarted += OnTransferJobStarted;
         _transfers.AllFinished += OnAllTransfersFinished;
         _transfers.Start();
+
+        // 跨进程探针：盯着 explorer 的窗口什么时候被禁用 / 卡住。
+        // 「属性页锁住其他窗口」在 Win11 复现、Win10 正常，而扩展自己的日志在
+        // UI 线程卡死时可能根本写不出来 —— 这一份从服务进程看，最客观。
+        ShellWindowWatchdog.Start();
         _operationQueue = new RemoteOperationQueueService(Dispatcher);
 
         _manager = new MainWindow { Icon = _status.WindowIcon(48) };

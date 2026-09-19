@@ -79,7 +79,18 @@ public:
     STDMETHODIMP_(ULONG) Release() override
     {
         LONG n = InterlockedDecrement(&_ref);
-        if (n == 0) delete this;
+        if (n == 0)
+        {
+            // 复制被取消：Explorer 读了一部分就放手了（正常读完是 _done = TRUE）。
+            // 只"不再读"是不够的 —— 服务侧会把文件甚至整棵树继续下完，队列里还挂着任务。
+            // 只统计"读过但没读完"，免得把 Stat / 探测用的空流也误判成取消。
+            if (!_done && !_cancelled && _pos > 0 && !_batchId.empty())
+            {
+                std::string reply;
+                FtpBridgeCancel(_batchId.c_str(), reply);
+            }
+            delete this;
+        }
         return n;
     }
 

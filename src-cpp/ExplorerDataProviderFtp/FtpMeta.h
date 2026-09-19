@@ -410,6 +410,27 @@ inline BOOL FtpBridgeFetchStatus(PCWSTR jobId, std::string &line)
     return got;
 }
 
+// 通知常驻服务：这一批（batchId）别再跑了。
+// 为什么需要它：Explorer 的复制对话框被取消时，我们这边只是"不再读流"，
+// 服务侧照样会把文件（甚至整棵目录树）下完 —— 队列里任务还挂着、带宽白占，
+// 用户看到的是"取消了却还在跑"。这条命令让取消**真的生效**。
+inline BOOL FtpBridgeCancel(PCWSTR batchId, std::string &line)
+{
+    line.clear();
+    if (!batchId || !batchId[0]) return FALSE;
+    HANDLE pipe = FtpBridgeOpenPipe();
+    if (pipe == INVALID_HANDLE_VALUE)
+    {
+        ProbeLog(L"[XFER] cancel: bridge unavailable batch='%s'", batchId);
+        return FALSE;
+    }
+    BOOL sent = FtpBridgeWriteLine(pipe, L"CANCEL") && FtpBridgeWriteLine(pipe, batchId);
+    BOOL got = sent && FtpBridgeReadReply(pipe, line, 5000);
+    CloseHandle(pipe);
+    ProbeLog(L"[XFER] cancel batch='%s' got=%d reply='%hs'", batchId, (int)got, line.c_str());
+    return got;
+}
+
 // 发起 + 等待完成。等待期间**不占管道**（每秒一次短查询），所以：
 //   · 浏览请求不会被下载堵住；
 //   · 用户在传输队列里点「取消」→ 服务侧中断下载 → 这里立刻拿到 CANCELLED。

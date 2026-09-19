@@ -236,6 +236,17 @@ public sealed class RemoteBridgeService : IDisposable
             return;
         }
 
+        // CANCEL：让常驻服务**真的停下**同一批（batchId）还在跑的传输。
+        // 触发点有两个：用户在传输队列里点「取消」；以及 Explorer 的复制对话框被取消
+        //（我们的流没读完就被释放了）。只"不再读流"不够 —— 服务侧照样会把整棵树下完。
+        if (string.Equals(operation, "CANCEL", StringComparison.Ordinal))
+        {
+            var cancelBatch = await reader.ReadLineAsync(token);
+            var cancelledCount = _transfers?.CancelBatch(cancelBatch ?? string.Empty) ?? 0;
+            await writer.WriteLineAsync("OK " + cancelledCount);
+            return;
+        }
+
         string? siteName = await reader.ReadLineAsync(token);
         string? path = await reader.ReadLineAsync(token);
         if (!string.Equals(operation, "LIST", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(siteName))
@@ -430,7 +441,7 @@ public sealed class RemoteBridgeService : IDisposable
 
             var fileName = System.IO.Path.GetFileName(localPath);
             task = _transfers?.BeginManagedTask("download", siteName, fileName, remote,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
+                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } }, batchId);
 
             // 只读操作：用**独立** Provider 实例（ProviderFactory.Create），不复用池里那条会话，
             // 也不持有 _providerGate —— 否则一个大文件的下载会把浏览用的 LIST 全堵在门外。
@@ -485,7 +496,7 @@ public sealed class RemoteBridgeService : IDisposable
             var folderName = System.IO.Path.GetFileName(remote.TrimEnd('/'));
             if (string.IsNullOrEmpty(folderName)) folderName = remote;
             task = _transfers?.BeginManagedTask("download", siteName, folderName, remote,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
+                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } }, batchId);
             _transfers?.UpdateManagedTask(task!, 0, 0, Ui.IsEnglish ? "Scanning remote folder" : "正在扫描远程目录");
 
             using var fs = ProviderFactory.Create(connection);

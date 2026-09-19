@@ -1,4 +1,4 @@
-﻿// Context menu for the FTP Microsoft-Core namespace.
+// Context menu for the FTP Microsoft-Core namespace.
 // WinSCP-grade verbs: Open / Edit / Download / Copy-to-clipboard / path-name
 // copies / server-side copy & move / rename / delete / custom commands / properties.
 #include <windows.h>
@@ -17,6 +17,7 @@
 #include "Utils.h"
 #include "resource.h"
 #include "ProbeLog.h"
+#include "PropSheetProbe.h"   // 属性页取证探针（Win11「锁住其他窗口」）
 #include <new>
 
 #define MENU_DELETE 0
@@ -504,7 +505,60 @@ typedef struct {
     PIDLIST_ABSOLUTE notify;
     BOOL canSetOwner;
     BOOL modeless;  // heap-owned only for background-menu windows
+    // ---- 属性页异步元数据（2026-09-19）----
+    // 冷缓存时 AddPages 只拿到空元数据（绝不能同步等远程），页面先用空值开出来，
+    // 后台线程取回真实值后再 PostMessage 刷新。这样"打开属性页"永远是毫秒级，
+    // 但用户最终看到的仍然是准确信息。
+    WCHAR folder[600];
+    WCHAR name[MAX_PATH];
+    HWND  dlg;                 // 页面窗口，WM_INITDIALOG 时填
+    volatile LONG metaReady;   // 后台线程已把元数据写回（1 = 可刷新）
+    volatile LONG refs;        // 页面 + 后台线程共同持有，归零才 free
 } PROPMETA;
+
+// 页面与后台线程共享 PROPMETA 的所有权：谁最后放手谁释放。
+// （后台取元数据的线程可能比属性页活得久 —— 用户点开就关，直接 CoTaskMemFree 会野指针。）
+static void PropMetaAddRef(PROPMETA *pm)
+{
+    if (pm) InterlockedIncrement(&pm->refs);
+}
+static void PropMetaRelease(PROPMETA *pm)
+{
+    if (!pm) return;
+    if (InterlockedDecrement(&pm->refs) != 0) return;
+    if (pm->notify) CoTaskMemFree(pm->notify);
+    CoTaskMemFree(pm);
+}
+
+// 属性页冷缓存 → 后台把真实元数据取回来（这一步允许阻塞：不在 UI 线程上）。
+#define WM_APP_ERF_META_READY (WM_APP + 0x51)
+struct MetaWarmCtx { PROPMETA *pm; };
+static DWORD WINAPI MetaWarmThread(LPVOID p)
+{
+    MetaWarmCtx *c = (MetaWarmCtx *)p;
+    PROPMETA *pm = c->pm;
+    std::vector<FTPENTRY> entries;
+    // 允许阻塞：这是后台线程。FtpListCachedAll 走管道 LIST（短请求），
+    // 就算远程慢也只拖这个线程，不拖 Explorer 的 UI 线程。
+    BOOL ok = FtpListCachedAll(pm->site, pm->folder, entries);
+    ProbeLog(L"[PROBE] meta warm done site='%s' folder='%s' name='%s' ok=%d n=%u",
+             pm->site, pm->folder, pm->name, (int)ok, (unsigned)entries.size());
+    InterlockedExchange(&pm->metaReady, 1);
+    if (pm->dlg && IsWindow(pm->dlg))
+        PostMessageW(pm->dlg, WM_APP_ERF_META_READY, 0, 0);
+    delete c;
+    PropMetaRelease(pm);
+    return 0;
+}
+static void MetaWarmStart(PROPMETA *pm)
+{
+    MetaWarmCtx *c = new (std::nothrow) MetaWarmCtx{ pm };
+    if (!c) return;
+    PropMetaAddRef(pm);
+    HANDLE h = CreateThread(NULL, 0, MetaWarmThread, c, 0, NULL);
+    if (h) CloseHandle(h);
+    else { delete c; PropMetaRelease(pm); }
+}
 
 // FTP/FTPS have no standard owner/group mutation. SFTP can issue SETSTAT;
 // whether the server ACL grants it is still confirmed when the user applies it.
@@ -849,27 +903,58 @@ static void LocalizeSiteDialog(HWND hDlg)
     SetDlgItemTextW(hDlg, IDC_SITE_START_PATH_LABEL, ExplorerText(L"property.start_path", L"起始路径：", L"Start path:"));
     SetDlgItemTextW(hDlg, IDCANCEL, ExplorerText(L"button.close", L"关闭", L"Close"));
 }
+// 字段填充：WM_INITDIALOG 与"后台元数据回来了"两条路径共用同一段，
+// 免得日子久了两边慢慢长歪。
+static void PermFillMeta(HWND hDlg, const PROPMETA *pm)
+{
+    const REMOTEMETA *m = &pm->meta;
+    SetWindowTextW(hDlg, PropertyDialogTitle(m));
+    SetDlgItemTextW(hDlg,3001,m->name); SetDlgItemTextW(hDlg,3002,m->type);
+    SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
+    PermInitOwnerGroup(hDlg,m);
+    PermSetOwnerChangeVisible(hDlg, pm->canSetOwner);
+    PermSetChecks(hDlg,m->bits);
+    PermSyncChecksToOctal(hDlg);
+    EnableWindow(GetDlgItem(hDlg,3023), m->fIsFolder ? TRUE : FALSE);
+}
+
+// 后台元数据回来了（WM_APP_ERF_META_READY）：把真实值填进已经开着的对话框。
+// 只在"当初确实是冷缓存"（meta.name 为空）时覆盖 —— 用户已经在改权限时
+// 不要把界面推回去。
+static void PermApplyAsyncMeta(HWND hDlg)
+{
+    PROPMETA *pm=(PROPMETA*)GetWindowLongPtrW(hDlg,DWLP_USER);
+    if(!pm) return;
+    if(!InterlockedCompareExchange(&pm->metaReady,0,0)) return;
+    if(pm->meta.name[0]) return;                     // 当初就命中缓存，无需刷新
+    REMOTEMETA fresh = {};
+    if(!ReadRemoteMetaCached(pm->site, pm->folder, pm->name, &fresh)) return;
+    pm->meta = fresh;
+    PermFillMeta(hDlg, pm);
+    ProbeLog(L"[PROBE] prop dialog refreshed from async meta name='%s' mode='%s'", fresh.name, fresh.mode);
+}
+
 static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
 {
     switch(msg){
     case WM_INITDIALOG:{
+        prop_probe::ProbeScope _probe(L"PermDlg WM_INITDIALOG", 50);
         PROPMETA *pm=(PROPMETA*)lp; if(!pm)return TRUE;
         SetWindowLongPtrW(hDlg,DWLP_USER,(LONG_PTR)pm);
-        SetWindowTextW(hDlg, PropertyDialogTitle(&pm->meta));
+        pm->dlg = hDlg;                              // 后台元数据回来时 PostMessage 到这里
+        prop_probe::DumpChain(hDlg, L"PermDlg init");
+        prop_probe::Start(hDlg);
         LocalizePermissionDialog(hDlg);
         PermHideApplyButton(hDlg);
-        REMOTEMETA *m=&pm->meta;
-        SetDlgItemTextW(hDlg,3001,m->name); SetDlgItemTextW(hDlg,3002,m->type);
-        SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
-        PermInitOwnerGroup(hDlg,m);
-        PermSetOwnerChangeVisible(hDlg, pm->canSetOwner);
         PermMakeValueFieldsFlat(hDlg);
         if (pm->canSetOwner) PermAttachInputTooltip(hDlg);
         PermClearValueSelection(hDlg);
-        PermSetChecks(hDlg,m->bits);
-        PermSyncChecksToOctal(hDlg);
-        EnableWindow(GetDlgItem(hDlg,3023), m->fIsFolder ? TRUE : FALSE);
+        PermFillMeta(hDlg, pm);
+        PermApplyAsyncMeta(hDlg);                    // 冷缓存时后台已经先回来了
         return TRUE;}
+    case WM_APP_ERF_META_READY:
+        PermApplyAsyncMeta(hDlg);
+        return TRUE;
     case WM_COMMAND:
         if(HIWORD(wp)==BN_CLICKED && LOWORD(wp)>=3011 && LOWORD(wp)<=3019){ PermSyncChecksToOctal(hDlg); return TRUE; }
         if(HIWORD(wp)==EN_CHANGE && LOWORD(wp)==3022){ PermSyncOctalToChecks(hDlg); return TRUE; }
@@ -908,8 +993,9 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
         break;
     }
     case WM_NCDESTROY:{
+        prop_probe::Stop();
         PROPMETA *pm=(PROPMETA*)GetWindowLongPtrW(hDlg,DWLP_USER);
-        if(pm && pm->modeless){ if(pm->notify) CoTaskMemFree(pm->notify); CoTaskMemFree(pm); }
+        if(pm && pm->modeless) PropMetaRelease(pm);
         SetWindowLongPtrW(hDlg,DWLP_USER,0);
         break;}
     }
@@ -934,16 +1020,26 @@ static void ShowCurrentFolderProperties(HWND hwnd, PCWSTR site, PCWSTR folder)
     PROPMETA *pm=(PROPMETA*)CoTaskMemAlloc(sizeof(*pm));
     if(!pm) return;
     ZeroMemory(pm,sizeof(*pm));
+    pm->refs = 1;
     StringCchCopy(pm->site, ARRAYSIZE(pm->site), site);
     StringCchCopy(pm->path, ARRAYSIZE(pm->path), folder);
+    StringCchCopy(pm->folder, ARRAYSIZE(pm->folder), parent);
+    StringCchCopy(pm->name, ARRAYSIZE(pm->name), name);
     pm->canSetOwner = SiteCanSetOwner(site);
     pm->modeless = TRUE;
-    if (!ReadRemoteMeta(site, parent, name, &pm->meta)){
-        CoTaskMemFree(pm);
-        MessageBoxW(hwnd, ExplorerText(L"info.directory_metadata_unavailable", L"无法获取当前目录的元数据。", L"Unable to retrieve current directory metadata."), ExplorerText(L"property.directory_properties", L"目录属性", L"Directory properties"), MB_OK | MB_ICONINFORMATION); return; }
+    // 这个对话框同样是从 Explorer 的 UI 线程打开的：**绝不能**在这里同步等远程
+    // （老代码用 ReadRemoteMeta，冷缓存最坏要等管道 + 网络好几秒，整个 shell
+    //  一起失去响应 —— Win11 上表现为"其他资源管理器窗口全被锁住"）。
+    // 改成一贯的做法：先读本地缓存把窗口开出来，后台线程取回真实值再刷新。
+    BOOL haveMeta = ReadRemoteMetaCached(site, parent, name, &pm->meta);
+    ProbeLog(L"[PROBE] ShowCurrentFolderProperties cache=%d site='%s' parent='%s' name='%s'",
+             (int)haveMeta, site, parent, name);
     HWND dlg=CreateDialogParamW(g_hInst, MAKEINTRESOURCEW(IDD_PERMBOX), hwnd, PermDlgProc, (LPARAM)pm);
-    if(dlg){ ShowWindow(dlg,SW_SHOWNORMAL); SetForegroundWindow(dlg); }
-    else CoTaskMemFree(pm);
+    if(dlg){
+        ShowWindow(dlg,SW_SHOWNORMAL); SetForegroundWindow(dlg);
+        if(!haveMeta) MetaWarmStart(pm);      // 冷缓存：后台取，回来 PostMessage 刷新
+    }
+    else PropMetaRelease(pm);
 }
 
 static void PopulateSiteInfo(HWND hDlg, PCWSTR site)
@@ -2889,6 +2985,9 @@ static INT_PTR CALLBACK SitePageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_INITDIALOG:
     {
+        prop_probe::ProbeScope _probe(L"SitePage WM_INITDIALOG", 50);
+        prop_probe::DumpChain(hDlg, L"SitePage init");
+        prop_probe::Start(hDlg);
         PROPMETA *pm = (PROPMETA*)((LPPROPSHEETPAGE)lp)->lParam;
         if (!pm) return FALSE;
         SetWindowLongPtrW(hDlg, DWLP_USER, (LONG_PTR)pm);
@@ -2913,18 +3012,23 @@ static INT_PTR CALLBACK SitePageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
 }
 static UINT CALLBACK PermPageCallback(HWND /* hwnd */, UINT uMsg, LPPROPSHEETPAGE ppsp)
 {
+    if (uMsg == PSPCB_CREATE)
+    {
+        // 属性表**即将**创建页面。此刻还没 hDlg，只能记一笔时间线；
+        // 窗口链 dump 放在 WM_INITDIALOG（那时宿主结构已经成型）。
+        ProbeLog(L"[PROBE] PSPCB_CREATE (tid=%lu)", GetCurrentThreadId());
+    }
     if (uMsg == PSPCB_RELEASE)
     {
+        prop_probe::Stop();   // 属性页关掉了，采样线程收工
+        ProbeLog(L"[PROBE] PSPCB_RELEASE (tid=%lu)", GetCurrentThreadId());
+
         // 提示气泡是我们自己创建的顶层窗口，页面释放时必须销毁 ——
         // 以前从不销毁：每打开一次属性页就漏一个 TOOLTIPS_CLASS 窗口。
         if (g_permTip) { DestroyWindow(g_permTip); g_permTip = NULL; }
 
-        PROPMETA *pm = (PROPMETA*)ppsp->lParam;
-        if (pm)
-        {
-            if (pm->notify) CoTaskMemFree(pm->notify);
-            CoTaskMemFree(pm);
-        }
+        // 页面放手：后台取元数据的线程可能还持有它（refs），谁最后放手谁释放。
+        PropMetaRelease((PROPMETA*)ppsp->lParam);
     }
     return 1;
 }
@@ -2935,25 +3039,28 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_INITDIALOG:
     {
+        prop_probe::ProbeScope _probe(L"PermPage WM_INITDIALOG", 50);
         ProbeLog(L"[DIAG] PermPage WM_INITDIALOG created");
+        // Win11 取证：页面 → 根的完整窗口链（谁 disabled、owner 是谁、宿主长什么样）
+        // + 起采样线程盯着"其他窗口什么时候被禁用/卡住"。
+        prop_probe::DumpChain(hDlg, L"PermPage init");
+        prop_probe::Start(hDlg);
         PROPMETA *pm = (PROPMETA*)((LPPROPSHEETPAGE)lp)->lParam;
         if (!pm) return FALSE;
         SetWindowLongPtrW(hDlg, DWLP_USER, (LONG_PTR)pm);
+        pm->dlg = hDlg;                 // 后台元数据回来时 PostMessage 到这里
         LocalizePermissionDialog(hDlg);
         PermHideApplyButton(hDlg);
-        REMOTEMETA *m = &pm->meta;
-        SetDlgItemTextW(hDlg,3001,m->name); SetDlgItemTextW(hDlg,3002,m->type);
-        SetDlgItemTextW(hDlg,3003,m->mode); SetDlgItemTextW(hDlg,3006,m->size); SetDlgItemTextW(hDlg,3007,m->mtime);
-        PermInitOwnerGroup(hDlg,m);
-        PermSetOwnerChangeVisible(hDlg, pm->canSetOwner);
         PermMakeValueFieldsFlat(hDlg);
         if (pm->canSetOwner) PermAttachInputTooltip(hDlg);
         PermClearValueSelection(hDlg);
-        PermSetChecks(hDlg,m->bits);
-        PermSyncChecksToOctal(hDlg);
-        EnableWindow(GetDlgItem(hDlg,3023), m->fIsFolder ? TRUE : FALSE);
+        PermFillMeta(hDlg, pm);
+        PermApplyAsyncMeta(hDlg);       // 冷缓存时后台可能已经先回来了
         return TRUE;
     }
+    case WM_APP_ERF_META_READY:
+        PermApplyAsyncMeta(hDlg);
+        return TRUE;
     case WM_COMMAND:
         if(HIWORD(wp)==BN_CLICKED && LOWORD(wp)>=3011 && LOWORD(wp)<=3019){ PermSyncChecksToOctal(hDlg); return TRUE; }
         if(HIWORD(wp)==EN_CHANGE && LOWORD(wp)==3022){ PermSyncOctalToChecks(hDlg); return TRUE; }
@@ -3031,7 +3138,11 @@ public:
     // IShellPropSheetExt
     HRESULT AddPages(LPFNADDPROPSHEETPAGE pfnAddPage, LPARAM lParam)
     {
-        ProbeLog(L"[DIAG] PropSheet AddPages called, data=%p pfnAddPage=%p", (void*)data, (void*)pfnAddPage);
+        // AddPages 跑在 Explorer 的 UI 线程上：这里的每一毫秒都是整个 shell 的停顿。
+        // ProbeScope 超过 100ms 就留证据（Win11「其他窗口一起变暗」的直接原因）。
+        prop_probe::ProbeScope _probe(L"AddPages total", 100);
+        ProbeLog(L"[DIAG] PropSheet AddPages called, data=%p pfnAddPage=%p tid=%lu",
+                 (void*)data, (void*)pfnAddPage, GetCurrentThreadId());
         if (!pfnAddPage || !data) return S_OK;   // no selection -> nothing to add
         SELDATA sel;
         if (!CollectSelection(data, &sel)) return S_OK;
@@ -3041,19 +3152,23 @@ public:
         PROPMETA *pm = (PROPMETA*)CoTaskMemAlloc(sizeof(PROPMETA));
         if (!pm) return E_OUTOFMEMORY;
         ZeroMemory(pm, sizeof(*pm));
+        pm->refs = 1;                    // AddPages 持有第一份引用
         StringCchCopy(pm->site, ARRAYSIZE(pm->site), sel.site);
+        StringCchCopy(pm->folder, ARRAYSIZE(pm->folder), sel.folder);
+        StringCchCopy(pm->name, ARRAYSIZE(pm->name), sel.names[0]);
         pm->canSetOwner = SiteCanSetOwner(sel.site);
         JoinPath(sel.folder, sel.names[0], pm->path, ARRAYSIZE(pm->path));
         pm->notify = sel.notify ? ILCloneFull(sel.notify) : NULL;
         if (sel.notify) CoTaskMemFree(sel.notify);
         // 属性页在 Explorer 的 UI 线程上：这里**绝不能**同步等远程。只读缓存；
-        // 未命中就后台预热，页面用空值先开出来（比让整个 shell 卡几秒好得多）。
+        // 未命中就后台取（MetaWarm），页面用空值先开出来，取回来再刷新。
         BOOL haveMeta = ReadRemoteMetaCached(sel.site, sel.folder, sel.names[0], &pm->meta);
         const FTPSITE *siteItem = haveMeta ? NULL : FtpSiteFind(sel.names[0]);
-        if (!haveMeta && sel.folder[0])
+        if (!haveMeta && sel.folder[0] && sel.site[0])
         {
-            // 远程目录里的项但缓存未命中（冷目录）：预热 + 用空元数据开权限页。
-            FtpPrefetchQuiet(sel.site, sel.folder, NULL);
+            // 远程目录里的项但缓存未命中（冷目录）：后台线程去取真实元数据，
+            // 页面先用空值开出来（毫秒级），取回来再 PostMessage 刷新。
+            MetaWarmStart(pm);
             ProbeLog(L"[DIAG] PropSheet: meta cache miss, opening with empty values site='%s' path='%s' name='%s'",
                      sel.site, sel.folder, sel.names[0]);
         }
@@ -3064,7 +3179,7 @@ public:
             const FTPSITE *s = siteItem;
             if (!s)
             {
-                CoTaskMemFree(pm);
+                PropMetaRelease(pm);
                 return S_OK;
             }
             StringCchCopy(pm->site, ARRAYSIZE(pm->site), sel.names[0]);
@@ -3080,8 +3195,7 @@ public:
             HPROPSHEETPAGE hPage = CreatePropertySheetPage(&psp);
             if (!hPage)
             {
-                if (pm->notify) CoTaskMemFree(pm->notify);
-                CoTaskMemFree(pm);
+                PropMetaRelease(pm);
                 return S_OK;
             }
             if (!pfnAddPage(hPage, lParam))
@@ -3103,8 +3217,7 @@ public:
         ProbeLog(L"[DIAG] PropSheet CreatePropertySheetPage hPage=%p lastErr=%u", (void*)hPage, GetLastError());
         if (!hPage)
         {
-            if (pm->notify) CoTaskMemFree(pm->notify);
-            CoTaskMemFree(pm);
+            PropMetaRelease(pm);
             return S_OK;
         }
         BOOL added = pfnAddPage(hPage, lParam);     // pass Explorer's lParam back verbatim

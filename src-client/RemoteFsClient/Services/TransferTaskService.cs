@@ -19,6 +19,9 @@ public sealed class TransferTask : INotifyPropertyChanged
     public string Name { get; init; } = "";
     public string LocalPath { get; init; } = "";
     public string RemotePath { get; init; } = "";
+    /// <summary>同一次用户操作（一次复制 / 一个文件夹）的批次号：
+    /// 取消时按批次一起停 —— 复制引擎取消的语义就是"这次复制不做了"。</summary>
+    public string BatchId { get; init; } = "";
     /// <summary>CLI process performing the transfer (0 when unknown). Cancel kills it.</summary>
     public int Pid { get; init; }
 
@@ -325,15 +328,35 @@ public sealed class TransferTaskService
         MaybeEndBatch();
     }
 
+    /// <summary>按批次取消：一次复制（或一个文件夹）在队列里就是一组。
+    /// Explorer 的复制对话框被取消、或用户在队列里点了取消，都会走到这里 ——
+    /// 光"不再读流"是不够的，服务侧会把剩下的文件继续下完。</summary>
+    public int CancelBatch(string batchId)
+    {
+        if (string.IsNullOrWhiteSpace(batchId)) return 0;
+        if (!_dispatcher.CheckAccess()) return _dispatcher.Invoke(() => CancelBatch(batchId));
+        int cancelled = 0;
+        foreach (var task in Tasks.ToArray())
+        {
+            if (task.IsFinished) continue;
+            if (!string.Equals(task.BatchId, batchId, StringComparison.Ordinal)) continue;
+            Cancel(task);
+            cancelled++;
+        }
+        Log($"CANCEL batch='{batchId}' cancelled={cancelled}");
+        return cancelled;
+    }
+
     /// <summary>
     /// Registers an operation executed by the resident service itself (rather
     /// than by a short-lived CLI process).  The returned task is immediately
     /// visible in the same queue used by upload/download jobs.
     /// </summary>
-    public TransferTask BeginManagedTask(string direction, string server, string name, string remotePath, Action cancel)
+    public TransferTask BeginManagedTask(string direction, string server, string name, string remotePath,
+                                         Action cancel, string batchId = "")
     {
         if (!_dispatcher.CheckAccess())
-            return _dispatcher.Invoke(() => BeginManagedTask(direction, server, name, remotePath, cancel));
+            return _dispatcher.Invoke(() => BeginManagedTask(direction, server, name, remotePath, cancel, batchId));
 
         _batchTimer?.Stop();
         if (!_batchActive)
@@ -345,7 +368,7 @@ public sealed class TransferTaskService
         var task = new TransferTask
         {
             Id = Guid.NewGuid().ToString("N"), Direction = direction, Server = server,
-            Name = name, RemotePath = remotePath,
+            Name = name, RemotePath = remotePath, BatchId = batchId,
         };
         _managedCancels[task.Id] = cancel;
         Tasks.Insert(0, task);
