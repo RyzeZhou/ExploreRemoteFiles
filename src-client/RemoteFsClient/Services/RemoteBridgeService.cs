@@ -20,16 +20,19 @@ public sealed class RemoteBridgeService : IDisposable
     private readonly SemaphoreSlim _providerGate = new(1, 1);
     private readonly object _listingCacheGate = new();
     private readonly Dictionary<string, ListingCacheEntry> _listingCache = new(StringComparer.Ordinal);
+    private readonly TransferTaskService? _transfers;   // 传输队列（上传/下载），与操作队列分开
     private Task? _listener;
     private static readonly TimeSpan CompletedListingCacheLifetime = TimeSpan.FromSeconds(3);
 
     public RemoteBridgeService(Func<ErfNavigationRequest, Task>? navigationHandler = null,
                                RemoteOperationQueueService? operationQueue = null,
-                               RemoteStatusService? status = null)
+                               RemoteStatusService? status = null,
+                               TransferTaskService? transfers = null)
     {
         _navigationHandler = navigationHandler;
         _operationQueue = operationQueue;
         _status = status;
+        _transfers = transfers;
     }
 
     public void Start() => _listener ??= Task.WhenAll(
@@ -183,9 +186,10 @@ public sealed class RemoteBridgeService : IDisposable
                 await writer.WriteLineAsync("FAIL: invalid fetch request");
                 return;
             }
-            var fetchResult = await FetchAsync(fetchSite, fetchRemote, fetchLocal, fetchBatch ?? string.Empty);
-            _status?.ReportSite(fetchSite, fetchResult.StartsWith("OK", StringComparison.Ordinal));
-            await writer.WriteLineAsync(fetchResult);
+            // 立即返回 jobId，下载在后台跑：绝不能让一个请求占着管道实例等到文件下完
+            // （管道只有几个实例，占住就等于把 LIST 也堵死 —— 那正是"复制时更卡"的原因）。
+            var fetchJob = StartFetchJob(fetchSite, fetchRemote, fetchLocal, fetchBatch ?? string.Empty, isDir: false);
+            await writer.WriteLineAsync("STARTED " + fetchJob.Id);
             return;
         }
 
@@ -205,9 +209,30 @@ public sealed class RemoteBridgeService : IDisposable
                 await writer.WriteLineAsync("FAIL: invalid fetchdir request");
                 return;
             }
-            var dirResult = await FetchDirAsync(dirSite, dirRemote, dirLocalRoot, dirBatch ?? string.Empty);
-            _status?.ReportSite(dirSite, dirResult.StartsWith("OK", StringComparison.Ordinal));
-            await writer.WriteLineAsync(dirResult);
+            var dirJob = StartFetchJob(dirSite, dirRemote, dirLocalRoot, dirBatch ?? string.Empty, isDir: true);
+            await writer.WriteLineAsync("STARTED " + dirJob.Id);
+            return;
+        }
+
+        // FETCHSTATUS：查询一个后台下载任务。短请求，秒回 —— 扩展侧靠它区分
+        // "还在下" / "下完了" / "失败了" / "被用户取消了"。
+        if (string.Equals(operation, "FETCHSTATUS", StringComparison.Ordinal))
+        {
+            var jobId = await reader.ReadLineAsync(token);
+            if (jobId is not null && _fetchJobs.TryGetValue(jobId, out var job))
+            {
+                switch (job.State)
+                {
+                    case "done": await writer.WriteLineAsync("DONE"); break;
+                    case "cancelled": await writer.WriteLineAsync("CANCELLED"); break;
+                    case "failed": await writer.WriteLineAsync("FAILED " + job.Message); break;
+                    default: await writer.WriteLineAsync($"RUNNING {job.Done} {job.Total}"); break;
+                }
+            }
+            else
+            {
+                await writer.WriteLineAsync("UNKNOWN");
+            }
             return;
         }
 
@@ -327,6 +352,54 @@ public sealed class RemoteBridgeService : IDisposable
         }
     }
 
+    /// <summary>一个后台下载任务（单文件或整棵目录树）。
+    /// 存在的理由：桥接请求必须**立刻**返回，不能占着管道实例等下载完。</summary>
+    private sealed class FetchJob
+    {
+        public string Id = "";
+        public string Site = "", Remote = "", Local = "", BatchId = "";
+        public long Done, Total;
+        public volatile string State = "running";   // running | done | failed | cancelled
+        public string Message = "";
+        public readonly CancellationTokenSource Cts = new();
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, FetchJob> _fetchJobs = new();
+
+    /// <summary>登记一个后台下载并立即返回（调用方把 job.Id 回给扩展）。</summary>
+    private FetchJob StartFetchJob(string site, string remote, string local, string batchId, bool isDir)
+    {
+        var job = new FetchJob
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Site = site, Remote = remote, Local = local, BatchId = batchId,
+        };
+        _fetchJobs[job.Id] = job;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var result = isDir
+                    ? await FetchDirAsync(job)
+                    : await FetchAsync(job);
+                if (result.StartsWith("OK", StringComparison.Ordinal)) job.State = "done";
+                else if (result.Contains("cancelled", StringComparison.OrdinalIgnoreCase)) job.State = "cancelled";
+                else { job.State = "failed"; job.Message = result; }
+            }
+            catch (Exception ex)
+            {
+                job.State = "failed";
+                job.Message = SanitizeBridgeError(ex.Message);
+            }
+            finally
+            {
+                // 任务留在字典里一会儿，让扩展来得及查到最终状态；之后由下次清理回收。
+                _ = Task.Delay(TimeSpan.FromMinutes(5)).ContinueWith(t => _fetchJobs.TryRemove(job.Id, out var _));
+            }
+        });
+        return job;
+    }
+
     /// <summary>诊断日志（%TEMP%/rfs-tasks.log，与 TransferTaskService / SshConfigReader 同一份）。</summary>
     private static void Log(string message)
     {
@@ -338,15 +411,16 @@ public sealed class RemoteBridgeService : IDisposable
         catch { }
     }
 
-    /// <summary>下载一个远程文件到本地路径：与删除同构 —— 跑在常驻服务的 Provider 上、
-    /// 进传输队列（带进度与「取消」），完成后把 OK / FAIL 回给 Explorer。
+    /// <summary>下载一个远程文件到本地路径。
     ///
-    /// 取消语义（用户实测过的坑）：用户在队列里点「取消」时回 <c>FAIL: cancelled</c>，
-    /// 扩展侧据此**不再重试** —— 否则复制引擎的重试会让同一个文件过一会儿又自己下起来。</summary>
-    private async Task<string> FetchAsync(string siteName, string remotePath, string localPath, string batchId)
+    /// 归属：**传输队列**（上传/下载属于传输；删除/改权限/改所有者才属于操作队列）。
+    /// `BeginManagedTask` 正是为"不由 CLI 进程执行的传输"准备的：它的取消回调直接接
+    /// 我们的 CancellationToken，所以取消能真正中断一个正在下载的大文件。</summary>
+    private async Task<string> FetchAsync(FetchJob job)
     {
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
-        OperationHandle? progress = null;
+        var siteName = job.Site; var remotePath = job.Remote; var localPath = job.Local; var batchId = job.BatchId;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, job.Cts.Token);
+        TransferTask? task = null;
         try
         {
             var connection = FindConnection(siteName);
@@ -354,53 +428,53 @@ public sealed class RemoteBridgeService : IDisposable
             if (string.IsNullOrWhiteSpace(localPath))
                 return "FAIL: missing local path";
 
-            progress = _operationQueue?.Begin(siteName, remote,
-                RemoteOperationQueueWindow.OperationKind.Download,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } },
-                batchId);
-            progress?.Update(0, 0, Ui.IsEnglish ? "Waiting for remote connection" : "等待远程连接");
-
-            // 只读操作：用**独立** Provider 实例（ProviderFactory.Create），既不复用池里那条会话，
-            // 也不持有 _providerGate —— 否则一个几十 GB 的下载会把浏览用的 LIST 全堵在门外，
-            // 用户看到的就是"复制时 Explorer 卡住"。下载结束立刻释放这条连接。
-            using var fs = ProviderFactory.Create(connection);
             var fileName = System.IO.Path.GetFileName(localPath);
+            task = _transfers?.BeginManagedTask("download", siteName, fileName, remote,
+                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
+
+            // 只读操作：用**独立** Provider 实例（ProviderFactory.Create），不复用池里那条会话，
+            // 也不持有 _providerGate —— 否则一个大文件的下载会把浏览用的 LIST 全堵在门外。
+            using var fs = ProviderFactory.Create(connection);
             await Task.Run(() =>
             {
                 fs.EnsureConnected();
-                fs.Download(remote, localPath, (done, total) => progress?.Update(done, total, fileName), false);
+                fs.Download(remote, localPath,
+                    (done, total) =>
+                    {
+                        job.Done = done; job.Total = total;
+                        if (task is not null) _transfers?.UpdateManagedTask(task, done, total, fileName);
+                    },
+                    false, cancellation.Token);
             }, cancellation.Token);
 
-            progress?.Complete(true, false, null);
+            if (task is not null) _transfers?.CompleteManagedTask(task, true, null);
             Log($"fetch ok site='{siteName}' remote='{remote}' -> '{localPath}' batch='{batchId}'");
             return "OK";
         }
-        // 只有**我们自己的** token 被取消才算用户取消：SSH.NET 在超时/断连时
-        // 也会抛 OperationCanceledException，那属于可重试的失败，不能回成 cancelled
-        //（扩展侧对 cancelled 的语义是永久放弃、不再重试）。
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
-            progress?.Complete(false, true, null);
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, null, cancelled: true);
             Log($"fetch cancelled site='{siteName}' remote='{remotePath}' batch='{batchId}'");
             return "FAIL: cancelled";
         }
         catch (Exception ex)
         {
-            progress?.Complete(false, false, ex.Message);
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, ex.Message);
+            Log($"fetch failed site='{siteName}' remote='{remotePath}': {ex.Message}");
             return $"FAIL: {SanitizeBridgeError(ex.Message)}";
         }
     }
 
     /// <summary>递归下载一个远程目录到本地根：**一个文件夹 = 一个队列任务**（用户要求），
-    /// 同时拖多个文件夹时每个文件夹各自一组（扩展为每个顶层文件夹生成一个 batchId）。
+    /// 同时拖多个文件夹时每个文件夹各自一组。
     ///
-    /// 先扫一遍树拿到文件总数，再逐个下载 —— 与 DELETE 的做法一致（"先列出目录树获得
-    /// 项目总数，再执行"）。只读操作，用独立 Provider 实例且不持有 _providerGate，
-    /// 所以下载期间浏览不受影响。</summary>
-    private async Task<string> FetchDirAsync(string siteName, string remoteDir, string localRoot, string batchId)
+    /// 与 FetchAsync 一样进**传输队列**；先扫一遍树拿到文件总数，再逐个下载，
+    /// 进度聚合到同一个任务上（与 DELETE 的"先列树再执行"同一套路）。</summary>
+    private async Task<string> FetchDirAsync(FetchJob job)
     {
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
-        OperationHandle? progress = null;
+        var siteName = job.Site; var remoteDir = job.Remote; var localRoot = job.Local; var batchId = job.BatchId;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, job.Cts.Token);
+        TransferTask? task = null;
         try
         {
             var connection = FindConnection(siteName);
@@ -408,11 +482,11 @@ public sealed class RemoteBridgeService : IDisposable
             if (string.IsNullOrWhiteSpace(localRoot))
                 return "FAIL: missing local root";
 
-            progress = _operationQueue?.Begin(siteName, remote,
-                RemoteOperationQueueWindow.OperationKind.Download,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } },
-                batchId);
-            progress?.Update(0, 0, Ui.IsEnglish ? "Scanning remote folder" : "正在扫描远程目录");
+            var folderName = System.IO.Path.GetFileName(remote.TrimEnd('/'));
+            if (string.IsNullOrEmpty(folderName)) folderName = remote;
+            task = _transfers?.BeginManagedTask("download", siteName, folderName, remote,
+                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
+            _transfers?.UpdateManagedTask(task!, 0, 0, Ui.IsEnglish ? "Scanning remote folder" : "正在扫描远程目录");
 
             using var fs = ProviderFactory.Create(connection);
             int downloaded = 0, failed = 0;
@@ -425,8 +499,10 @@ public sealed class RemoteBridgeService : IDisposable
                 CollectRemoteFiles(fs, remote, localRoot, files, cancellation.Token);
 
                 int total = files.Count;
-                progress?.Update(0, total,
-                    Ui.IsEnglish ? $"0 / {total} files" : $"0 / {total} 个文件");
+                job.Done = 0; job.Total = total;
+                if (task is not null)
+                    _transfers?.UpdateManagedTask(task, 0, total,
+                        Ui.IsEnglish ? $"0 / {total} files" : $"0 / {total} 个文件");
 
                 foreach (var file in files)
                 {
@@ -435,37 +511,38 @@ public sealed class RemoteBridgeService : IDisposable
                     {
                         var dir = System.IO.Path.GetDirectoryName(file.Local);
                         if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir);
-                        fs.Download(file.Remote, file.Local, null, false);
+                        fs.Download(file.Remote, file.Local, null, false, cancellation.Token);
                         downloaded++;
                     }
+                    catch (OperationCanceledException) { throw; }
                     catch (Exception ex)
                     {
-                        // 单个文件失败不该把整棵树判死：记下来，最后一起报（与 DELETE 的
-                        // "失败明细"一致），用户至少拿到了能拿到的那些。
+                        // 单个文件失败不判死整棵树：记下来最后一起报，用户至少拿到能拿到的。
                         failed++;
                         Log($"fetchdir: '{file.Remote}' failed: {ex.Message}");
                     }
-                    progress?.Update(downloaded + failed, total,
-                        Ui.IsEnglish ? $"{downloaded} / {total} files" : $"{downloaded} / {total} 个文件");
+                    job.Done = downloaded + failed;
+                    if (task is not null)
+                        _transfers?.UpdateManagedTask(task, downloaded + failed, total,
+                            Ui.IsEnglish ? $"{downloaded} / {total} files" : $"{downloaded} / {total} 个文件");
                 }
             }, cancellation.Token);
 
-            progress?.Complete(failed == 0, false, failed == 0 ? null : $"{failed} file(s) failed");
+            if (task is not null)
+                _transfers?.CompleteManagedTask(task, failed == 0, failed == 0 ? null : $"{failed} file(s) failed");
             Log($"fetchdir done site='{siteName}' remote='{remote}' -> '{localRoot}' files={downloaded} failed={failed} batch='{batchId}'");
             return failed == 0 ? "OK" : $"FAIL: {failed} file(s) failed";
         }
-        // 只有**我们自己的** token 被取消才算用户取消：SSH.NET 在超时/断连时
-        // 也会抛 OperationCanceledException，那属于可重试的失败，不能回成 cancelled
-        //（扩展侧对 cancelled 的语义是永久放弃、不再重试）。
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
-            progress?.Complete(false, true, null);
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, null, cancelled: true);
             Log($"fetchdir cancelled site='{siteName}' remote='{remoteDir}' batch='{batchId}'");
             return "FAIL: cancelled";
         }
         catch (Exception ex)
         {
-            progress?.Complete(false, false, ex.Message);
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, ex.Message);
+            Log($"fetchdir failed site='{siteName}' remote='{remoteDir}': {ex.Message}");
             return $"FAIL: {SanitizeBridgeError(ex.Message)}";
         }
     }

@@ -1,4 +1,4 @@
-namespace ExplorerRemoteFs.Providers;
+﻿namespace ExplorerRemoteFs.Providers;
 
 /// <summary>
 /// 递归权限修改的结果。<b>Failed &gt; 0 即"部分完成"，调用方不得报成功</b>
@@ -34,8 +34,10 @@ public interface IRemoteFileSystem : IDisposable
     /// <summary>创建一个零字节文件；目标已存在时必须失败，不得覆盖。</summary>
     void CreateEmptyFile(string path);
 
-    /// <summary>下载远程文件到本地路径。progress(已传字节, 总字节) 可选；resume 时从断点续传。</summary>
-    void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false);
+    /// <summary>下载远程文件到本地路径。progress(已传字节, 总字节) 可选；resume 时从断点续传。
+    /// token 取消时实现必须**尽快中断**下载并删掉半截文件（服务侧的传输队列靠它取消）。</summary>
+    void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false,
+                  CancellationToken token = default);
 
     /// <summary>上传本地文件到远程路径。progress(已传字节, 总字节) 可选；resume 时从断点续传。</summary>
     void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false);

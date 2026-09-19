@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // Shared PIDL-external FTP metadata cache for the Microsoft-core namespace.
 // Keyed by directory path; short TTL; cleared after successful mutations.
 // Explorer process performs no network I/O (spawns the CLI bridge), but we
@@ -325,121 +325,140 @@ inline BOOL FtpBridgeDelete(PCWSTR site, PCWSTR path, BOOL recursive, std::strin
     return ok;
 }
 
-// 下载文件：走常驻服务（与 DELETE / CHMOD 同一条路）。
-//
-// 这里曾经是 `CreateProcess(cli get …)` + `WaitForSingleObject(INFINITE)`，三个问题：
-//   1) Shell DLL 自己启动 CLI —— 违反架构约束（docs/ERF_RESIDENT_SERVICE_ARCHITECTURE.md：
-//      Explorer NSE 只做 Shell/PIDL/视图/列/属性/菜单/本地元数据；会话、凭据、Provider 连接、
-//      缓存、传输队列都归常驻服务）；
-//   2) 每个文件一个 CLI 进程 = 每文件一次冷启动 + 一次全新的 SFTP 登录，
-//      "一次复制 10 个文件"就是 10 个进程、10 次握手、10 条互不相干的队列任务；
-//   3) 同步等到整份文件下完，复制期间 Explorer 一直卡着。
-// 现在只发一个 FETCH，服务复用已有 Provider 会话、把下载放进传输队列（有进度、可取消），
-// 我们只等最终 OK/FAIL —— 与 IFileOperation 的删除完全同形。
-//
-// batchId：同一次用户复制操作的所有文件共用一个，队列窗口据此把它们折叠成一组
-//（用户要求：一次复制 = 一个任务，任务内每个文件可展开查看）。
-inline BOOL FtpBridgeFetch(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &response)
+// ── 桥接管道的小工具（发起/查询共用）──────────────────────────────────────
+inline HANDLE FtpBridgeOpenPipe()
 {
-    response.clear();
     const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
-    HANDLE pipe = INVALID_HANDLE_VALUE;
-    DWORD lastError = ERROR_SUCCESS;
     for (int attempt = 0; attempt < 3; ++attempt)
     {
-        pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (pipe != INVALID_HANDLE_VALUE) break;
-        lastError = GetLastError();
-        if (lastError != ERROR_PIPE_BUSY || !WaitNamedPipeW(pipeName, 5000)) break;
+        HANDLE pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, NULL);
+        if (pipe != INVALID_HANDLE_VALUE) return pipe;
+        if (GetLastError() != ERROR_PIPE_BUSY || !WaitNamedPipeW(pipeName, 5000)) break;
     }
+    return INVALID_HANDLE_VALUE;
+}
+
+inline BOOL FtpBridgeReadReply(HANDLE pipe, std::string &line, ULONGLONG timeoutMs)
+{
+    line.clear();
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    while (GetTickCount64() < deadline)
+    {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) return FALSE;   // 服务关了连接
+        if (avail > 0)
+        {
+            char buf[512]; DWORD got = 0;
+            if (!ReadFile(pipe, buf, sizeof(buf), &got, NULL) || got == 0) return FALSE;
+            line.append(buf, got);
+            if (line.find('\n') != std::string::npos) return TRUE;
+        }
+        else
+        {
+            Sleep(20);
+        }
+    }
+    return FALSE;
+}
+
+// 发起一个后台下载：发请求 → 收 "STARTED <jobId>" → **立即返回**。
+//
+// 为什么不能像以前那样"发完就等回执直到文件下完"：命名管道的实例只有几个，
+// 一个请求占着它几分钟，就等于把 LIST 一起堵死 —— 实测日志里已经出现过
+// `[BRIDGE] unavailable site='WSL-SFTP' path='/home/zhou/AI_work' err=231 elapsed=5000`
+//（err=231 就是 ERROR_PIPE_BUSY），用户那边看到的就是"复制时更卡了"。
+inline BOOL FtpBridgeFetchStart(PCWSTR op, PCWSTR site, PCWSTR remote, PCWSTR local,
+                                PCWSTR batchId, std::string &jobId)
+{
+    jobId.clear();
+    HANDLE pipe = FtpBridgeOpenPipe();
     if (pipe == INVALID_HANDLE_VALUE)
     {
-        ProbeLog(L"[XFER] resident fetch bridge unavailable site='%s' remote='%s' err=%lu",
-                 site ? site : L"", remote ? remote : L"", lastError);
+        ProbeLog(L"[XFER] fetch bridge unavailable op='%s' site='%s' err=%lu", op, site ? site : L"", GetLastError());
         return FALSE;
     }
 
-    BOOL sent = FtpBridgeWriteLine(pipe, L"FETCH") &&
+    BOOL sent = FtpBridgeWriteLine(pipe, op) &&
                 FtpBridgeWriteLine(pipe, site ? site : L"") &&
                 FtpBridgeWriteLine(pipe, remote ? remote : L"") &&
                 FtpBridgeWriteLine(pipe, local ? local : L"") &&
                 FtpBridgeWriteLine(pipe, (batchId && batchId[0]) ? batchId : L"-");
-    // 大文件要给够时间；取消由服务侧的队列负责（用户点「取消」→ 服务中断下载 → 回 FAIL: cancelled）
-    const ULONGLONG deadline = GetTickCount64() + 30ull * 60ull * 1000ull;
-    if (sent)
-    {
-        while (GetTickCount64() < deadline)
-        {
-            DWORD avail = 0;
-            if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) break;
-            if (avail > 0)
-            {
-                char buf[1024]; DWORD got = 0;
-                if (!ReadFile(pipe, buf, sizeof(buf), &got, NULL) || got == 0) break;
-                response.append(buf, got);
-                if (response.find('\n') != std::string::npos) break;
-            }
-            else Sleep(25);
-        }
-    }
+    std::string line;
+    BOOL got = sent && FtpBridgeReadReply(pipe, line, 15000);
     CloseHandle(pipe);
-    BOOL ok = sent && response.rfind("OK", 0) == 0;
-    ProbeLog(L"[XFER] resident fetch site='%s' remote='%s' batch='%s' sent=%d ok=%d reply='%hs'",
-             site ? site : L"", remote ? remote : L"", batchId ? batchId : L"-", sent, ok, response.c_str());
-    return ok;
+
+    if (!got || line.rfind("STARTED ", 0) != 0)
+    {
+        ProbeLog(L"[XFER] fetch start FAILED op='%s' reply='%hs'", op, line.c_str());
+        return FALSE;
+    }
+    jobId = line.substr(8);
+    while (!jobId.empty() && (jobId.back() == '\r' || jobId.back() == '\n')) jobId.pop_back();
+    return !jobId.empty();
 }
 
-// 递归下载一个远程目录：同样走常驻服务（**一个文件夹 = 一个队列任务**，用户要求）。
-// 与 FtpBridgeFetch 同形，只是把"一个文件"换成"一棵树"：服务侧先扫一遍树拿到文件总数，
-// 再逐个下载，并把进度聚合到同一个队列条目上。
-inline BOOL FtpBridgeFetchDir(PCWSTR site, PCWSTR remoteDir, PCWSTR localRoot, PCWSTR batchId, std::string &response)
+// 查询后台下载状态：RUNNING <done> <total> / DONE / FAILED <msg> / CANCELLED / UNKNOWN
+inline BOOL FtpBridgeFetchStatus(PCWSTR jobId, std::string &line)
+{
+    line.clear();
+    HANDLE pipe = FtpBridgeOpenPipe();
+    if (pipe == INVALID_HANDLE_VALUE) return FALSE;
+    BOOL sent = FtpBridgeWriteLine(pipe, L"FETCHSTATUS") && FtpBridgeWriteLine(pipe, jobId);
+    BOOL got = sent && FtpBridgeReadReply(pipe, line, 15000);
+    CloseHandle(pipe);
+    return got;
+}
+
+// 发起 + 等待完成。等待期间**不占管道**（每秒一次短查询），所以：
+//   · 浏览请求不会被下载堵住；
+//   · 用户在传输队列里点「取消」→ 服务侧中断下载 → 这里立刻拿到 CANCELLED。
+inline BOOL FtpBridgeFetchWait(PCWSTR op, PCWSTR site, PCWSTR remote, PCWSTR local,
+                               PCWSTR batchId, std::string &response)
 {
     response.clear();
-    const WCHAR pipeName[] = L"\\\\.\\pipe\\ExplorerRemoteFs.Bridge.v1";
-    HANDLE pipe = INVALID_HANDLE_VALUE;
-    DWORD lastError = ERROR_SUCCESS;
-    for (int attempt = 0; attempt < 3; ++attempt)
+    std::string jobId;
+    if (!FtpBridgeFetchStart(op, site, remote, local, batchId, jobId))
     {
-        pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (pipe != INVALID_HANDLE_VALUE) break;
-        lastError = GetLastError();
-        if (lastError != ERROR_PIPE_BUSY || !WaitNamedPipeW(pipeName, 5000)) break;
-    }
-    if (pipe == INVALID_HANDLE_VALUE)
-    {
-        ProbeLog(L"[XFER] resident fetchdir bridge unavailable site='%s' dir='%s' err=%lu",
-                 site ? site : L"", remoteDir ? remoteDir : L"", lastError);
+        response = "FAIL: cannot start fetch";
         return FALSE;
     }
 
-    BOOL sent = FtpBridgeWriteLine(pipe, L"FETCHDIR") &&
-                FtpBridgeWriteLine(pipe, site ? site : L"") &&
-                FtpBridgeWriteLine(pipe, remoteDir ? remoteDir : L"/") &&
-                FtpBridgeWriteLine(pipe, localRoot ? localRoot : L"") &&
-                FtpBridgeWriteLine(pipe, (batchId && batchId[0]) ? batchId : L"-");
-    // 整棵树可能很大：给足 2 小时；取消由服务侧的队列负责。
-    const ULONGLONG deadline = GetTickCount64() + 120ull * 60ull * 1000ull;
-    if (sent)
+    const ULONGLONG started = GetTickCount64();
+    const ULONGLONG deadline = started + 120ull * 60ull * 1000ull;
+    int tick = 0;
+    for (;;)
     {
-        while (GetTickCount64() < deadline)
+        Sleep(200);
+        if (GetTickCount64() > deadline) { response = "FAIL: timeout"; return FALSE; }
+        if (++tick % 5) continue;                       // 约每秒查一次
+
+        std::wstring wideJob(jobId.begin(), jobId.end());
+        std::string st;
+        if (!FtpBridgeFetchStatus(wideJob.c_str(), st)) continue;   // 查询失败：下次再试
+        if (st.rfind("DONE", 0) == 0)
         {
-            DWORD avail = 0;
-            if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) break;
-            if (avail > 0)
-            {
-                char buf[1024]; DWORD got = 0;
-                if (!ReadFile(pipe, buf, sizeof(buf), &got, NULL) || got == 0) break;
-                response.append(buf, got);
-                if (response.find('\n') != std::string::npos) break;
-            }
-            else Sleep(25);
+            response = "OK";
+            ProbeLog(L"[XFER] fetch done op='%s' remote='%s' job=%hs elapsed=%llu",
+                     op, remote ? remote : L"", jobId.c_str(), GetTickCount64() - started);
+            return TRUE;
         }
+        if (st.rfind("CANCELLED", 0) == 0) { response = "FAIL: cancelled"; return FALSE; }
+        if (st.rfind("FAILED", 0) == 0) { response = st; return FALSE; }
+        if (st.rfind("UNKNOWN", 0) == 0) { response = "FAIL: job lost"; return FALSE; }
     }
-    CloseHandle(pipe);
-    BOOL ok = sent && response.rfind("OK", 0) == 0;
-    ProbeLog(L"[XFER] resident fetchdir site='%s' dir='%s' batch='%s' sent=%d ok=%d reply='%hs'",
-             site ? site : L"", remoteDir ? remoteDir : L"", batchId ? batchId : L"-", sent, ok, response.c_str());
-    return ok;
+}
+
+// 下载一个文件（单文件路径）。语义同以前：TRUE=已下载到本地。
+inline BOOL FtpBridgeFetch(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &response)
+{
+    return FtpBridgeFetchWait(L"FETCH", site, remote, local, batchId, response);
+}
+
+// 递归下载一个目录树（一个文件夹 = 一个传输任务）。
+inline BOOL FtpBridgeFetchDir(PCWSTR site, PCWSTR remoteDir, PCWSTR localRoot, PCWSTR batchId, std::string &response)
+{
+    return FtpBridgeFetchWait(L"FETCHDIR", site, remoteDir, localRoot, batchId, response);
 }
 
 // 递归修改权限：走常驻服务（与 DELETE 同一条路）。

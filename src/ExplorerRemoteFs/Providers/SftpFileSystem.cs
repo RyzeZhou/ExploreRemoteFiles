@@ -1,4 +1,4 @@
-using ExplorerRemoteFs.Config;
+﻿using ExplorerRemoteFs.Config;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
@@ -213,14 +213,33 @@ public sealed class SftpFileSystem : IRemoteFileSystem
     // NOTE: SSH.NET has no resume API; SFTP resume would need OpenWrite + Seek
     // against the remote offset (TODO). The flag is accepted for interface
     // compatibility and currently ignored, so SFTP restarts the transfer.
-    public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false)
+    public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false,
+                         CancellationToken token = default)
     {
         EnsureConnected();
         if (_client is null) return;
         long total = 0;
         try { total = _client.GetAttributes(remotePath).Size; } catch { }
-        using var fs = File.Create(localPath);
-        _client.DownloadFile(remotePath, fs, downloaded => progress?.Invoke((long)downloaded, total));
+        using (var fs = File.Create(localPath))
+        {
+            try
+            {
+                // 取消检查放在进度回调里：SSH.NET 在下载循环中调用它，抛异常即中断下载。
+                // 没有它的话，服务侧 cancellation.Cancel() 对一个正在下的大文件完全无效
+                //（用户实测："取消都无法取消"）。
+                _client.DownloadFile(remotePath, fs, downloaded =>
+                {
+                    token.ThrowIfCancellationRequested();
+                    progress?.Invoke((long)downloaded, total);
+                });
+            }
+            catch
+            {
+                // 中断/失败：删掉半截文件，别让它被当成"下载完成"
+                try { fs.Dispose(); File.Delete(localPath); } catch { }
+                throw;
+            }
+        }
         progress?.Invoke(new FileInfo(localPath).Length, new FileInfo(localPath).Length);
         Utils.ShellLog.Write($"SFTP get: {remotePath} -> {localPath}");
     }

@@ -157,7 +157,7 @@ public partial class App : System.Windows.Application
         _manager.Closing += OnManagerClosing;
         MainWindow = _manager;
         CreateTrayIcon();
-        _bridge = new RemoteBridgeService(QueueErfNavigationAsync, _operationQueue, _status);
+        _bridge = new RemoteBridgeService(QueueErfNavigationAsync, _operationQueue, _status, _transfers);
         _bridge.Start();
         ListenForShowRequests();
         if (pendingErfNavigation is not null)

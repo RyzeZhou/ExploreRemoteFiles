@@ -1,4 +1,4 @@
-using ExplorerRemoteFs.Config;
+﻿using ExplorerRemoteFs.Config;
 using FluentFTP;
 
 namespace ExplorerRemoteFs.Providers;
@@ -171,25 +171,41 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         }
     }
 
-    public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false)
+    public void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false,
+                         CancellationToken token = default)
     {
         EnsureConnected();
         if (_client is null) return;
-        Action<FtpProgress>? fp = null;
-        if (progress is not null)
-            fp = p =>
-            {
-                // FluentFTP exposes no TotalBytes; derive it from the percentage.
-                long total = p.Progress > 0 ? (long)(p.TransferredBytes / (p.Progress / 100.0)) : 0;
-                progress(p.TransferredBytes, total);
-            };
+        // 取消检查放在进度回调里（FluentFTP 在下载循环中调用它）：抛异常即中断下载，
+        // 否则服务侧的取消对一个正在下的大文件完全无效。
+        Action<FtpProgress>? fp = p =>
+        {
+            token.ThrowIfCancellationRequested();
+            if (progress is null) return;
+            // FluentFTP exposes no TotalBytes; derive it from the percentage.
+            long total = p.Progress > 0 ? (long)(p.TransferredBytes / (p.Progress / 100.0)) : 0;
+            progress(p.TransferredBytes, total);
+        };
         // Resume uses the FTP REST command (FluentFTP handles it): the server
         // continues from the existing local file's size. Only requested when we
         // know a previous attempt of this transfer was interrupted.
         var mode = resume ? FtpLocalExists.Resume : FtpLocalExists.Overwrite;
-        var result = _client.DownloadFile(localPath, remotePath, mode, FtpVerify.None, fp);
+        FtpStatus result;
+        try
+        {
+            result = _client.DownloadFile(localPath, remotePath, mode, FtpVerify.None, fp);
+        }
+        catch
+        {
+            // 中断/失败：删掉半截文件，别让它被当成"下载完成"
+            try { File.Delete(localPath); } catch { }
+            throw;
+        }
         if (result == FtpStatus.Failed)
+        {
+            try { File.Delete(localPath); } catch { }
             throw new InvalidOperationException($"FTP download failed: {remotePath}");
+        }
         progress?.Invoke(new FileInfo(localPath).Length, new FileInfo(localPath).Length);
         Utils.ShellLog.Write($"FTP get: {remotePath} -> {localPath}");
     }
