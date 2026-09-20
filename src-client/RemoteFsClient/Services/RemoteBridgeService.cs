@@ -623,6 +623,11 @@ public sealed class RemoteBridgeService : IDisposable
             if (string.IsNullOrWhiteSpace(localRoot)) return new(FetchJobState.Failed, "missing local root");
             var folderName = System.IO.Path.GetFileName(remote.TrimEnd('/'));
             if (string.IsNullOrEmpty(folderName)) folderName = remote;
+            // 本地树**必须带顶层文件夹名**：Shell 扩展的 descriptor relPath 是
+            // "small-5\\f-7723.txt"，LocalPath(rel) = <localRoot>\<rel>。旧实现
+            // （CLI getr）也是这么落盘的（CmdGetR 里有明确注释）；搬到服务后一度丢掉
+            // 这一层，导致 GetData(FILECONTENTS) 永远找不到文件（"fetch wait failed"）。
+            var downloadRoot = System.IO.Path.Combine(localRoot, folderName);
             task = _transfers?.BeginManagedTask("download", siteName, folderName, remote,
                 () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }), batchId);
             _transfers?.UpdateManagedTask(task!, 0, 0, Ui.IsEnglish ? "Scanning remote folder" : "正在扫描远程目录");
@@ -633,7 +638,7 @@ public sealed class RemoteBridgeService : IDisposable
                 fs.EnsureConnected();
                 cancellation.Token.ThrowIfCancellationRequested();
                 var files = new List<(string Remote, string Local)>();
-                CollectRemoteFiles(fs, remote, localRoot, files, cancellation.Token);
+                CollectRemoteFiles(fs, remote, downloadRoot, files, cancellation.Token);
                 int total = files.Count;
                 job.Done = 0; job.Total = total;
                 if (task is not null) _transfers?.UpdateManagedTask(task, 0, total,

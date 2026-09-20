@@ -766,7 +766,7 @@ public:
 
         std::vector<FTPENTRY> kids;
         BOOL have = cacheOnly ? FtpCachePeekAll(dir.site.c_str(), full.c_str(), kids)
-                              : FtpListCachedAll(dir.site.c_str(), full.c_str(), kids);
+                              : FtpListCachedAll(dir.site.c_str(), full.c_str(), kids, /*waitForWarm=*/true);
         if (!have)
         {
             cold = TRUE;

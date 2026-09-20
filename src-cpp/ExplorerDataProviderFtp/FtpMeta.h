@@ -747,7 +747,7 @@ inline void FtpCacheClear()
 // into an empty cache and can show an empty listing; prefetching guarantees the
 // re-enumeration hits a ready cache and always shows the new state.
 // Runs entirely off the caller's thread (cache clear + network fetch + notify).
-inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out);   // fwd (defined below)
+inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out, bool waitForWarm = false);   // fwd (defined below)
 struct FtpRefreshCtx
 {
     WCHAR site[64];
@@ -1022,6 +1022,16 @@ inline BOOL FtpPrefetchBegin(PCWSTR key)
     v.push_back(key);
     ReleaseSRWLockExclusive(&FtpPrefetchLock());
     return TRUE;
+}
+// 只读查询：某个键的预取/预热是否正在跑。
+inline BOOL FtpPrefetchInFlightHas(PCWSTR key)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&FtpPrefetchLock());
+    std::vector<std::wstring> &v = FtpPrefetchInFlight();
+    found = (std::find(v.begin(), v.end(), std::wstring(key)) != v.end());
+    ReleaseSRWLockShared(&FtpPrefetchLock());
+    return found;
 }
 inline void FtpPrefetchEnd(PCWSTR key)
 {
@@ -1360,7 +1370,7 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
 
 // Returns the complete cached listing. On a miss, populate the cache once via
 // FtpListCached, which now parses the full CLI output before copying a slice.
-inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out)
+inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out, bool waitForWarm)
 {
     out.clear();
     PCWSTR key = (path && path[0]) ? path : L"/";
@@ -1383,6 +1393,44 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     {
         FtpCachePromote(site, key, out);
         return TRUE;
+    }
+
+    // 同一个目录的**后台预热**（tree|site|dir）正在跑时，先等它把内存缓存填好，
+    // 而不是再发一次同步网络 LIST。实测同一次数据对象展开里"预热 + 同步 LIST"
+    // 会各拉一遍（扁平 4469 项目录：预热 ~0.5 s，同步 LIST 占住 UI 线程 2.6 s）。
+    // waitForWarm 只由数据对象展开路径传入 —— 预热线程自身调用时必须为 false，
+    // 否则会等自己（那个键就是它持有的）。
+    if (waitForWarm)
+    {
+        WCHAR warmKey[760] = {};
+        StringCchPrintf(warmKey, ARRAYSIZE(warmKey), L"tree|%s|%s", site, key);
+        if (FtpPrefetchInFlightHas(warmKey))
+        {
+            const ULONGLONG deadline = GetTickCount64() + 5000;
+            while (GetTickCount64() < deadline)
+            {
+                Sleep(50);
+                ULONGLONG t = GetTickCount64();
+                BOOL hit = FALSE;
+                AcquireSRWLockShared(&FtpCacheLock());
+                for (auto const &entry : FtpCacheEntries())
+                {
+                    if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(t, entry.tick, FTP_CACHE_TTL_MS))
+                    {
+                        out = entry.items;
+                        hit = TRUE;
+                        break;
+                    }
+                }
+                ReleaseSRWLockShared(&FtpCacheLock());
+                if (hit)
+                {
+                    ProbeLog(L"[CACHE] expand waited for warm site='%s' path='%s' n=%u", site, key, (UINT)out.size());
+                    return TRUE;
+                }
+            }
+            ProbeLog(L"[CACHE] expand warm wait timed out site='%s' path='%s' -> sync LIST", site, key);
+        }
     }
 
     FTPENTRY first = {};
