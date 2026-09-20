@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Threading;
 using WinForms = System.Windows.Forms;
 using Drawing = System.Drawing;
@@ -452,6 +453,43 @@ public partial class App : System.Windows.Application
         return GetForegroundWindow();
     }
 
+    /// <summary>
+    /// 用 UIA SelectionPattern 判定 Win11 Explorer 窗口的**活动标签**名称。
+    /// 实测（25H2 26200）：XAML TabView 的选中 TabItem 名称与 ShellWindows 条目的
+    /// LocationName 一一对应；这是外部进程判定"活动标签"唯一可靠的公开机制
+    /// （IsWindowVisible 与地址栏文本均不可用，见 KNOWN_ISSUES_2026-09-19）。
+    /// 全程只读，失败返回 null（调用方回退到旧打分逻辑）。
+    /// </summary>
+    private static string? TryGetActiveTabName(IntPtr windowRoot)
+    {
+        if (windowRoot == IntPtr.Zero) return null;
+        try
+        {
+            var rootElement = AutomationElement.FromHandle(windowRoot);
+            if (rootElement is null) return null;
+            var tabViewCondition = new PropertyCondition(
+                AutomationElement.ClassNameProperty, "Microsoft.UI.Xaml.Controls.TabView");
+            var tabViews = rootElement.FindAll(TreeScope.Descendants, tabViewCondition);
+            if (tabViews is null || tabViews.Count == 0) return null;
+            foreach (AutomationElement tabView in tabViews)
+            {
+                if (!tabView.TryGetCurrentPattern(SelectionPattern.Pattern, out var patternObject))
+                    continue;
+                var selectionPattern = (SelectionPattern)patternObject;
+                var selected = selectionPattern.Current.GetSelection();
+                if (selected is null || selected.Length == 0) continue;
+                var name = selected[0].Current.Name;
+                ErfLog($"UIA active-tab name='{name}'");
+                return string.IsNullOrWhiteSpace(name) ? null : name;
+            }
+        }
+        catch (Exception ex)
+        {
+            ErfLog($"UIA active-tab probe failed; {ex.Message}");
+        }
+        return null;
+    }
+
     private static bool TryNavigateForegroundExplorer(string parsingName, IntPtr sourceWindow)
     {
         // 标签页定位（2026-09-18 修"在 A 标签页输入路径却在固定的 B 标签页打开"）：
@@ -472,6 +510,13 @@ public partial class App : System.Windows.Application
         }
 
         ErfLog($"in-place navigation anchor=0x{anchor.ToInt64():X}; anchorRoot=0x{anchorRoot.ToInt64():X}; currentRoot=0x{currentRoot.ToInt64():X}");
+
+        // 活动标签判定：协议被激活时前台窗口就是用户正输入的 Explorer 窗口
+        // （RemoteFsClient 启动不抢前台），所以锚点窗口/当前前台窗口即是探测目标。
+        // 用 UIA SelectionPattern 拿"当前活动标签"名称，名字与 ShellWindows 的
+        // LocationName 一一对应 → 最高分档。旧打分作为 UIA 不可用时的兜底。
+        var probeRoot = anchorRoot != IntPtr.Zero ? anchorRoot : currentRoot;
+        var activeTabName = TryGetActiveTabName(probeRoot);
 
         object? shellWindows = null;
         object? bestBrowser = null;
@@ -518,13 +563,32 @@ public partial class App : System.Windows.Application
                         null)));
                     var tabRoot = GetAncestor(tabHandle, GaRoot);
 
+                    string? locationName = null;
+                    try
+                    {
+                        locationName = Convert.ToString(browserObject.GetType().InvokeMember(
+                            "LocationName",
+                            System.Reflection.BindingFlags.GetProperty,
+                            null,
+                            browserObject,
+                            null));
+                    }
+                    catch
+                    {
+                        // ShellWindows 条目可能瞬时失效，LocationName 拿不到时
+                        // 只用句柄打分（保持与旧实现一致）。
+                    }
+
                     var score = 0;
-                    if (anchor != IntPtr.Zero && tabHandle == anchor) score = 4;
+                    if (!string.IsNullOrEmpty(activeTabName) && locationName == activeTabName &&
+                        tabRoot == probeRoot)
+                        score = 5;   // UIA 确认的活动标签（最高优先）
+                    else if (anchor != IntPtr.Zero && tabHandle == anchor) score = 4;
                     else if (anchor != IntPtr.Zero && (IsChild(tabHandle, anchor) || IsChild(anchor, tabHandle))) score = 3;
                     else if (anchorRoot != IntPtr.Zero && tabRoot == anchorRoot) score = 2;
                     else if (currentRoot != IntPtr.Zero && tabRoot == currentRoot) score = 1;
 
-                    ErfLog($"ShellWindows[{index}] tab=0x{tabHandle.ToInt64():X} root=0x{tabRoot.ToInt64():X}; score={score}");
+                    ErfLog($"ShellWindows[{index}] tab=0x{tabHandle.ToInt64():X} root=0x{tabRoot.ToInt64():X}; name='{locationName}'; score={score}");
                     if (score == 0) continue;
 
                     if (score > bestScore)

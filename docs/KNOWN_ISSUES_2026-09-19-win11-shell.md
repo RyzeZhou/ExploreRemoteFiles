@@ -1053,3 +1053,55 @@ HKCU\Software\ExplorerRemoteFs\DownloadDir   (REG_SZ)
 | 目录已改变 -> [1] 在新目录重新下载 | C 里出现新下载的文件，**B 保持原样**（没搬） |
 | 已下载过 -> [0] 重新下载 -> 命名冲突 -> [1] 保留两者 | 生成 `test (2).txt`，原 `test.txt` 未动 |
 | 命名冲突 -> [2] 取消 | `open-ticket result: FAIL: 用户取消`，目标目录未变 |
+
+
+---
+
+## Win11 活动标签判定新突破：UIA SelectionPattern（2026-09-20 夜，Win11 侧接管后实测）
+
+> 状态：客户端 `App.xaml.cs` 已加 UIA 活动标签判定（`score=5` 最高档）；待 Win10 VM 编译 + 本机安装回归。
+
+### 三个新实测（推翻/修正旧结论）
+
+1. **ShellWindows 每个条目的 `HWND` 全部是顶层 `CabinetWClass` 句柄**
+   （实测窗口 `0x19060C` 4 个标签、`0xA0CA4` 6 个标签，每条目 `HWND` 相同）。
+   → `App.xaml.cs` 注释"ShellWindows 每项 HWND 是标签页级"的假设**不成立**，
+   这就是"固定跳第一个标签"的直接机制：分数并列 4 时 `>` 永远选中枚举序最小的那条。
+
+2. **`CaptureTabAnchor()` 里 `GetGuiThreadInfo(0)` 的 `0` = 当前线程（RemoteFsClient 自己）**，
+   注释误写为"前台线程"。锚点必然拿不到 Explorer 的焦点子窗口 → 退化为 `GetForegroundWindow()`（顶层）
+   → 所有同窗口标签 `tabRoot == anchorRoot` 并列 2/4 分 → 固定第一个。
+
+3. **UIA `SelectionPattern` 能唯一判定活动标签**（这是外部进程判活动标签**唯一可靠**的公开机制）：
+   - 实录：`0x19060C` 选中 TabItem 名 "程序列表" ↔ ShellWindows `[7] LocationName='程序列表'` ✅；
+     `0xA0CA4` 选中 "WinSCP" ↔ `[10]` ✅。单次 UIA 查询约 205ms。
+   - 旧结论只排除了 `IsWindowVisible`（KB 检索结论）与地址栏文本（Value/TextPattern 空、
+     TextBox 全窗口一份），**从没试过 SelectionPattern** —— 今天补上了这一格。
+
+### 修复（客户端 `src-client/RemoteFsClient/App.xaml.cs`）
+
+- 新增 `TryGetActiveTabName(IntPtr windowRoot)`：
+  `AutomationElement.FromHandle` → 找 `ClassName=="Microsoft.UI.Xaml.Controls.TabView"` →
+  `SelectionPattern.GetSelection()[0].Name`。只读；任何失败返回 null（兜底旧逻辑）。
+- `TryNavigateForegroundExplorer` 打分新增最高档：
+  `activeTabName != null && LocationName == activeTabName && tabRoot == probeRoot` → **score=5**；
+  原 4/3/2/1 档原样保留为 UIA 不可用时的兜底。
+- 每行枚举日志补 `name='{LocationName}'`，便于核对匹配。
+- 不依赖注册表/安装结构；`erf:` 协议、版本分流、CLSID 全部未动 —— 与 Win10 侧交接的"我的区域"
+  （`App.xaml.cs` 的 `--open-erf` 链路）一致。
+
+### 待回归（需要 Win10 VM 编译 + 本机实测）
+
+1. 编译：`dotnet publish src-client/RemoteFsClient`（或随 Win10 侧 build-release 全量编译）。
+2. 安装后用**操作同一套**：同一 Explorer 窗口开 ≥2 个标签，切到**非第一个**标签，地址栏输
+   `erf:site:/path` → 预期**只在该标签直达**；`%TEMP%emotefs-erf.log` 应见
+   `UIA active-tab name='...'` 与对应条目的 `score=5`。
+3. 回归普通路径（地址栏 `易远传/WSL/R`、`::{CLSID}\WSL/R`）：应不受影响（根本不进协议通道）。
+
+### 相关结论（命令层）
+
+- **没有命令能"定位/指定标签页"**：Win11 的标签是 XAML `TabView` 的 UI 状态，命令行无对应开关。
+- **所有 `explorer.exe` 形态实测都开新窗口**（纯路径、`/n`、`/e`、命名空间 CLSID 全为独立 HWND），
+  不存在"用命令在现有窗口开新标签"。
+- "保存工作区 = 一组路径恢复成一个窗口多标签"：公开 API 层做不了（无按清单开多标签的接口；
+  多标签只能 UI 手势 Ctrl+T 创建，或 UIA 自动化逐标签导航 —— 属另一功能，未实现）。
