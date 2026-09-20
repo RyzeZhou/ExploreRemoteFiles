@@ -120,7 +120,7 @@ public:
             // copy engine. _pos == 0 and _done == TRUE therefore do NOT mean the
             // download completed. A released stream after FETCH began is Explorer's
             // cancellation signal and must stop the resident service job.
-            if (_fetchStarted && !_downloadReady && !_cancelled && !_cancelRequested && !_batchId.empty())
+            if (_fetchStarted && !_jobDone && !_cancelled && !_cancelRequested && !_batchId.empty())
             {
                 _cancelRequested = TRUE;
                 ProbeLog(L"[DL] cancel requested by stream release batch='%s' remote='%s' pos=%llu",
@@ -151,6 +151,32 @@ public:
                      _site.c_str(), _remote.c_str(), _local.c_str());
             return STG_E_READFAULT;
         }
+
+        // 边下边读：等到"这次要读的那一段"已经落盘（或任务终态）。
+        const ULONGLONG tWait = GetTickCount64();
+        for (;;)
+        {
+            if (_pos < OnDiskSize()) break;
+            if (PollJobTerminal())
+            {
+                if (_pos < OnDiskSize()) break;
+                if (_cancelled)
+                {
+                    ProbeLog(L"[DL] Read cancelled mid-stream site='%s' remote='%s' pos=%llu",
+                             _site.c_str(), _remote.c_str(), (unsigned long long)_pos);
+                    return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+                }
+                if (_jobFailed && _pos == 0) return STG_E_READFAULT;
+                break;   // 正常结束 → 下面 ReadFile 返回 EOF
+            }
+            Sleep(50);
+        }
+
+        ULONGLONG avail = OnDiskSize();
+        if (_pos >= avail) { if (pcbRead) *pcbRead = 0; return S_FALSE; }   // EOF
+        ULONGLONG canRead = avail - _pos;
+        if ((ULONGLONG)cb > canRead) cb = (ULONG)canRead;
+
         DWORD got = 0;
         if (!ReadFile(_h, pv, cb, &got, NULL))
         {
@@ -158,11 +184,14 @@ public:
                      (unsigned long)cb, (unsigned long)GetLastError(), _local.c_str());
             return STG_E_READFAULT;
         }
-        if (!_loggedFirstRead)
+        ULONGLONG waited = GetTickCount64() - tWait;
+        ++_readCount;
+        if (!_loggedFirstRead || waited >= 500 || _readCount <= 5)
         {
             _loggedFirstRead = TRUE;
-            ProbeLog(L"[DL] first Read ok cb=%lu got=%lu size=%llu local='%s'",
-                     (unsigned long)cb, (unsigned long)got, (unsigned long long)_size, _local.c_str());
+            ProbeLog(L"[DL] Read tid=%lu n=%d cb=%lu got=%lu pos=%llu onDisk=%llu waitedMs=%llu local='%s'",
+                     GetCurrentThreadId(), _readCount, (unsigned long)cb, (unsigned long)got,
+                     (unsigned long long)_pos, (unsigned long long)avail, waited, _local.c_str());
         }
         if (pcbRead) *pcbRead = got;
         _pos += got;
@@ -253,54 +282,70 @@ private:
                  (unsigned long long)freeBytes.QuadPart, (int)hasFreeBytes, _local.c_str(), _batchId.c_str());
         const ULONGLONG tEnsure = GetTickCount64();
 
-        BOOL fetched = FALSE;
-        for (int attempt = 0; attempt < 2 && !fetched; ++attempt)
+        // 边下边读：只**发起** FETCH（不等它下完），等本地文件开始有数据就返回；
+        // 之后 Read() 再按需等待更多字节。这样第一次 Read 不再被"整个文件下完"卡住
+        // —— 之前实测 6 GB 文件在调用线程上干等 10.5 s，就是这里。
+        if (!FtpBridgeFetchStart(L"FETCH", _site.c_str(), _remote.c_str(), _local.c_str(), _batchId.c_str(), _jobId))
         {
-            if (attempt)
-            {
-                ProbeLog(L"[DL] retrying download (attempt %d) remote='%s'", attempt + 1, _remote.c_str());
-                Sleep(300);
-            }
-            std::string reply;
-            FtpBridgeFetchState state = RfsFetchToFile(_site.c_str(), _remote.c_str(), _local.c_str(), _batchId.c_str(), reply);
-            fetched = (state == FtpBridgeFetchState::Done);
-            if (state == FtpBridgeFetchState::Cancelled)
-            {
-                _cancelled = TRUE;
-                ProbeLog(L"[DL] cancelled terminal; not retrying batch='%s' remote='%s'", _batchId.c_str(), _remote.c_str());
-                break;
-            }
-        }
-        if (!fetched)
-        {
-            ProbeLog(L"[DL] Ensure FAILED: download failed site='%s' remote='%s' local='%s' exists=%d cancelled=%d",
-                     _site.c_str(), _remote.c_str(), _local.c_str(),
-                     (int)PathFileExistsW(_local.c_str()), (int)_cancelled);
-            DeleteFileW(_local.c_str());       // existing policy: no partial data-object cache
+            ProbeLog(L"[DL] Ensure FAILED: cannot start fetch site='%s' remote='%s' batch='%s'",
+                     _site.c_str(), _remote.c_str(), _batchId.c_str());
+            DeleteFileW(_local.c_str());
             _local.clear();
-            if (!_cancelled) _done = FALSE;    // ordinary failure may still be retried
+            _done = FALSE;
             return FALSE;
         }
-        _h = CreateFileW(_local.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        _jobDone = FALSE;
+        _jobFailed = FALSE;
+        ProbeLog(L"[DL] ensure started job=%hs remote='%s' batch='%s'", _jobId.c_str(), _remote.c_str(), _batchId.c_str());
+
+        const ULONGLONG deadline = tEnsure + 120000;   // 最多等 2 分钟开始出数据
+        for (;;)
+        {
+            WIN32_FILE_ATTRIBUTE_DATA fa = {};
+            if (GetFileAttributesExW(_local.c_str(), GetFileExInfoStandard, &fa)) break;
+            if (PollJobTerminal()) break;
+            if (GetTickCount64() > deadline) break;
+            Sleep(50);
+        }
+        _h = CreateFileW(_local.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
         if (_h == INVALID_HANDLE_VALUE)
         {
-            ProbeLog(L"[DL] Ensure FAILED: cannot open local '%s' err=%lu",
-                     _local.c_str(), (unsigned long)GetLastError());
+            ProbeLog(L"[DL] Ensure FAILED: cannot open local '%s' err=%lu cancelled=%d failed=%d",
+                     _local.c_str(), (unsigned long)GetLastError(), (int)_cancelled, (int)_jobFailed);
             DeleteFileW(_local.c_str());
             _local.clear();
+            if (!_cancelled) _done = FALSE;    // 普通失败可重试；取消是终态
             return FALSE;
         }
-        {
-            LARGE_INTEGER li = {};
-            GetFileSizeEx(_h, &li);
-            ProbeLog(L"[DL] Ensure ok local='%s' size_on_disk=%lld expected=%llu",
-                     _local.c_str(), (long long)li.QuadPart, (unsigned long long)_size);
-        }
         _downloadReady = TRUE;
-        ProbeLog(L"[DL] Ensure done tid=%lu elapsedMs=%llu local='%s' batch='%s'",
-                 GetCurrentThreadId(), GetTickCount64() - tEnsure, _local.c_str(), _batchId.c_str());
+        ProbeLog(L"[DL] ensure opened tid=%lu elapsedMs=%llu local='%s' size_on_disk=%llu expected=%llu",
+                 GetCurrentThreadId(), GetTickCount64() - tEnsure, _local.c_str(),
+                 (unsigned long long)OnDiskSize(), (unsigned long long)_size);
         return TRUE;
+    }
+
+    // 本地临时文件当前已落盘多少字节（边下边长）
+    ULONGLONG OnDiskSize()
+    {
+        if (_h == INVALID_HANDLE_VALUE) return 0;
+        LARGE_INTEGER li = {};
+        if (!GetFileSizeEx(_h, &li)) return 0;
+        return (ULONGLONG)li.QuadPart;
+    }
+
+    // 查询服务端任务是否已终态。返回 TRUE = 已终态（_jobDone 置位；失败/取消另标记）。
+    BOOL PollJobTerminal()
+    {
+        if (_jobId.empty() || _jobDone) return TRUE;
+        std::wstring w(_jobId.begin(), _jobId.end());
+        std::string st;
+        if (!FtpBridgeFetchStatus(w.c_str(), st)) return FALSE;   // 短查询失败：当作还在跑
+        if (st.rfind("DONE", 0) == 0) { _jobDone = TRUE; return TRUE; }
+        if (st.rfind("CANCELLED", 0) == 0) { _jobDone = TRUE; _cancelled = TRUE; return TRUE; }
+        if (st.rfind("FAILED", 0) == 0) { _jobDone = TRUE; _jobFailed = TRUE; return TRUE; }
+        if (st.rfind("UNKNOWN", 0) == 0) { _jobDone = TRUE; _jobFailed = TRUE; return TRUE; }
+        return FALSE;
     }
 
     LONG _ref;
@@ -314,6 +359,11 @@ private:
     BOOL _cancelled;            // explicit CANCELLED terminal state from FETCHSTATUS
     BOOL _cancelRequested;      // stream-release cancellation was sent to the service
     BOOL _loggedFirstRead = FALSE;
+    // 边下边读（2026-09-20）：FETCH 只发起、不等完成；Read 按需等字节。
+    std::string _jobId;
+    BOOL _jobDone = FALSE;
+    BOOL _jobFailed = FALSE;
+    int _readCount = 0;
 };
 
 // ---------------------------------------------------------------------------

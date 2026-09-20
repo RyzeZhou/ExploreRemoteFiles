@@ -16,14 +16,6 @@
 #include "ProbeLog.h"
 
 // ---------------------------------------------------------------------------
-// 复制/粘贴走哪条路（2026-09-20）：
-//   0（默认）= **不**提供 CFSTR_FILEDESCRIPTORW / CFSTR_FILECONTENTS，让 Explorer 的复制
-//              引擎改走 ITransferSource（Shell 工作线程 + 它自己的进度窗口），与删除同路，
-//              不再占用发起窗口的 UI 线程。
-//   1 = 旧行为（剪贴板虚拟文件格式）。可随时回退，无需重装。
-// 读 HKCU\Software\ExplorerRemoteFs\UseVirtualFileFormats（DWORD，缺省=0）。
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // Shell 资源协议实验档位（2026-09-20）：HKCU\Software\ExplorerRemoteFs\ShellResourceMode
 // IShellItemResources 是**未公开协议**（SDK 无文档/样例）。Shell 的复制引擎经
 // ITransferSource::OpenItem 拿到资源对象后，可能：只要元数据、或者要枚举资源、
@@ -53,10 +45,20 @@ inline DWORD ErfShellResourceMode()
     return s_value;
 }
 
+// ---------------------------------------------------------------------------
+// 复制/粘贴的数据通路：
+//   1（默认）= 提供 CFSTR_FILEDESCRIPTORW / CFSTR_FILECONTENTS。**实测结论（2026-09-20）**：
+//              Explorer 复制虚拟文件夹时只能走这条通路 —— ITransferSource 在 Win11 上
+//              只被用于删除/移动/元数据；复制引擎拿到 IShellItemResources 后就收工，
+//              从不要 IStream（四种资源档位都试过）。关掉 FD 的结果就是"只有占位、没有数据"。
+//              原来的"占 UI 线程"问题改由 CRemoteStream **边下边读**解决。
+//   0 = 不提供虚拟文件格式（实验档，仅供对照）。
+// 读 HKCU\Software\ExplorerRemoteFs\UseVirtualFileFormats（DWORD，缺省=1）。
+// ---------------------------------------------------------------------------
 inline BOOL ErfUseVirtualFileFormats()
 {
     static volatile LONG s_loaded = 0;
-    static BOOL s_value = FALSE;   // 默认走 B
+    static BOOL s_value = TRUE;   // 默认走 FD/FILECONTENTS（唯一能真正拿到数据的通路）
     if (InterlockedCompareExchange(&s_loaded, 1, 0) == 0)
     {
         HKEY k = NULL;
