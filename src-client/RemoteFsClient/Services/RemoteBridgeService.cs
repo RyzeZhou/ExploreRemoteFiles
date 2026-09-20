@@ -593,8 +593,11 @@ public sealed class RemoteBridgeService : IDisposable
             var connection = FindConnection(siteName);
             var remote = NormalizeRemotePath(remotePath);
             var fileName = System.IO.Path.GetFileName(remote);
+            // 复制对话框驱动的直传流：**不允许暂停**（暂停会让 Shell 的复制停滞、Explorer
+            // 显示忙碌光标），只能等待或取消 —— 见 TransferTask.CanPause。
             task = _transfers?.BeginManagedTask("download", siteName, fileName, remote,
-                () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }), batchId);
+                () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }),
+                batchId, canPause: false);
             using var fs = ProviderFactory.Create(connection);
             await Task.Run(() =>
             {
@@ -604,11 +607,7 @@ public sealed class RemoteBridgeService : IDisposable
                 fs.DownloadToStream(remote, output, (done, total) =>
                 {
                     job.Done = done; job.Total = total;
-                    if (task is not null)
-                    {
-                        _transfers?.WaitWhilePaused(task, cancellation.Token);
-                        _transfers?.UpdateManagedTask(task, done, total, fileName);
-                    }
+                    if (task is not null) _transfers?.UpdateManagedTask(task, done, total, fileName);
                 }, cancellation.Token);
             }, cancellation.Token);
             Volatile.Write(ref job.State, (int)FetchJobState.Done);

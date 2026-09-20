@@ -109,7 +109,7 @@
                                         <GridViewColumn.CellTemplate>
                                             <DataTemplate>
                                                 <StackPanel Orientation="Horizontal">
-                                                    <Button Content="{Binding PauseLabel}" Click="OnPauseTask" Tag="{Binding}" Padding="8,1" Margin="0,0,4,0" MinWidth="52"/>
+                                                    <Button Content="{Binding PauseLabel}" Click="OnPauseTask" Tag="{Binding}" IsEnabled="{Binding CanPause}" Padding="8,1" Margin="0,0,4,0" MinWidth="52"/>
                                                     <Button Content="{Binding CancelLabel}" Click="OnCancelTask" Tag="{Binding}" Padding="8,1"/>
                                                 </StackPanel>
                                             </DataTemplate>

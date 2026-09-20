@@ -1533,18 +1533,59 @@ static void OpenRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, BOOL 
     // The blocking GET runs on a worker thread (2026-09-20); Explorer returns at once.
     StartDownloadJob(site, full, local, edit ? 2 : 1);
 }
+// ── 默认下载目录（"即点即下"，不再弹保存对话框）──────────────────────────────
+// 读 HKCU\Software\ExplorerRemoteFs\DownloadDir（REG_SZ）；缺省 = %USERPROFILE%\Downloads。
+static BOOL DefaultDownloadDir(PWSTR out, UINT cch)
+{
+    out[0] = 0;
+    HKEY k = NULL;
+    if (ERROR_SUCCESS == RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", 0, KEY_READ, &k))
+    {
+        DWORD type = 0, cb = cch * sizeof(WCHAR);
+        LONG r = RegQueryValueExW(k, L"DownloadDir", NULL, &type, (LPBYTE)out, &cb);
+        RegCloseKey(k);
+        if (r != ERROR_SUCCESS || type != REG_SZ) out[0] = 0;
+    }
+    if (!out[0])
+    {
+        WCHAR profile[MAX_PATH] = {};
+        if (!SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, profile)) return FALSE;
+        StringCchPrintfW(out, cch, L"%s\\Downloads", profile);
+    }
+    size_t n = wcslen(out);
+    if (n && (out[n - 1] == L'\\' || out[n - 1] == L'/')) out[n - 1] = 0;
+    CreateDirectoryW(out, NULL);
+    return out[0] != 0;
+}
+
+// 目标目录里若已有同名文件，自动加 " (2)"、" (3)" … —— "即点即下"不能悄悄覆盖用户已有文件。
+static void UniqueLocalPath(PCWSTR dir, PCWSTR name, PWSTR out, UINT cch)
+{
+    StringCchPrintfW(out, cch, L"%s\\%s", dir, name);
+    if (!PathFileExistsW(out)) return;
+    PCWSTR dot = PathFindExtensionW(name);
+    std::wstring stem(name, (dot && *dot) ? (size_t)(dot - name) : wcslen(name));
+    std::wstring ext = (dot && *dot) ? dot : L"";
+    for (int i = 2; i < 1000; ++i)
+    {
+        StringCchPrintfW(out, cch, L"%s\\%s (%d)%s", dir, stem.c_str(), i, ext.c_str());
+        if (!PathFileExistsW(out)) return;
+    }
+}
+
 static void DownloadFiles(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count)
 {
-    WCHAR dir[MAX_PATH];
-    if(!TempDir(L"Download",site,dir,ARRAYSIZE(dir))) return;
-    // Save dialog for single file (must stay on the UI thread)
-    if(count==1){
-        WCHAR local[MAX_PATH]; StringCchPrintf(local,ARRAYSIZE(local),L"%s%s",dir,names[0]);
-        WCHAR filter[64] = {}; StringCchPrintf(filter, ARRAYSIZE(filter), L"%s%c*.*%c", ExplorerText(L"filter.all_files", L"所有文件", L"All files"), 0, 0);
-        OPENFILENAMEW ofn={sizeof(ofn)}; ofn.hwndOwner=hwnd; ofn.lpstrFilter=filter;
-        ofn.lpstrFile=local; ofn.nMaxFile=ARRAYSIZE(local); ofn.Flags=OFN_OVERWRITEPROMPT; ofn.lpstrTitle=ExplorerText(L"dialog.download_to",L"下载到",L"Download to");
-        if(!GetSaveFileNameW(&ofn)) return;
-        WCHAR full[700]; JoinPath(folder,names[0],full,ARRAYSIZE(full));
+    (void)hwnd;   // 即点即下：不再弹保存对话框，直接下到默认下载目录
+    WCHAR dir[MAX_PATH] = {};
+    if (!DefaultDownloadDir(dir, ARRAYSIZE(dir)))
+    {
+        if (!TempDir(L"Download", site, dir, ARRAYSIZE(dir))) return;
+    }
+    if (count == 1)
+    {
+        WCHAR local[MAX_PATH] = {}; UniqueLocalPath(dir, names[0], local, ARRAYSIZE(local));
+        WCHAR full[700]; JoinPath(folder, names[0], full, ARRAYSIZE(full));
+        ProbeLog(L"[DL] menu download '%s' -> '%s'", full, local);
         StartDownloadJob(site, full, local, 0);
         return;
     }
@@ -1554,7 +1595,7 @@ static void DownloadFiles(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, 
     b->site = site ? site : L""; b->dir = dir;
     for(int i=0;i<count;i++){
         WCHAR full[700]; JoinPath(folder,names[i],full,ARRAYSIZE(full));
-        WCHAR local[MAX_PATH]; StringCchPrintf(local,ARRAYSIZE(local),L"%s%s",dir,names[i]);
+        WCHAR local[MAX_PATH] = {}; UniqueLocalPath(dir, names[i], local, ARRAYSIZE(local));
         b->files.emplace_back(full, local);
     }
     DllAddRef();   // 2026-09-20: pin the module until the batch download returns

@@ -167,16 +167,30 @@ public:
         if (want > 0 && !ReadFile(_pipe, pv, want, &got, NULL)) got = 0;
         if (got == 0)
         {
-            // 管道关闭：正常 EOF，或服务侧失败/取消 —— 用 FETCHSTATUS 判定。
-            PollJobTerminal();
+            // 管道关闭。**必须确认是"任务成功"才算 EOF** —— 否则失败/取消/服务消失
+            // 会被当成正常结束，Explorer 会把截断的文件报成"复制成功"。
+            if (_size > 0 && _pos >= _size)
+            {
+                ProbeLog(L"[DL] stream Read EOF(pos=size) remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
+                if (pcbRead) *pcbRead = 0;
+                return S_FALSE;
+            }
+            for (int i = 0; i < 10 && !_jobDone && !_cancelled; ++i)
+            {
+                PollJobTerminal();
+                if (_jobDone || _cancelled) break;
+                Sleep(50);
+            }
             if (_cancelled)
             {
                 ProbeLog(L"[DL] stream Read cancelled remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
                 return HRESULT_FROM_WIN32(ERROR_CANCELLED);
             }
-            if (_jobFailed)
+            if (_jobFailed || !_jobDone)
             {
-                ProbeLog(L"[DL] stream Read FAILED remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
+                ProbeLog(L"[DL] stream Read FAILED(truncated) remote='%s' pos=%llu size=%llu failed=%d done=%d",
+                         _remote.c_str(), (unsigned long long)_pos, (unsigned long long)_size,
+                         (int)_jobFailed, (int)_jobDone);
                 return STG_E_READFAULT;
             }
             ProbeLog(L"[DL] stream Read EOF remote='%s' pos=%llu size=%llu", _remote.c_str(),

@@ -22,6 +22,10 @@ public sealed class TransferTask : INotifyPropertyChanged
     /// <summary>同一次用户操作（一次复制 / 一个文件夹）的批次号：
     /// 取消时按批次一起停 —— 复制引擎取消的语义就是"这次复制不做了"。</summary>
     public string BatchId { get; init; } = "";
+    /// <summary>这个任务能不能"暂停"。由复制对话框驱动的直传流（FETCHSTREAM）**不能**：
+    /// 暂停会让 Shell 的复制停滞（Explorer 会显示忙碌光标），只能等待或取消。
+    /// 我们自己的传输路径（菜单下载 / 复制到… / 上传）可以真暂停。</summary>
+    public bool CanPause { get; init; } = true;
     /// <summary>CLI process performing the transfer (0 when unknown). Cancel kills it.</summary>
     public int Pid { get; init; }
 
@@ -334,9 +338,12 @@ public sealed class TransferTaskService
     /// <summary>Pause/resume by flipping the job's named gate; the CLI blocks in
     /// its progress callback while the gate is reset, so the transfer thread
     /// stops reading/writing without tearing the connection down.</summary>
+    /// <summary>"暂停"只对**我们自己的**传输路径生效（菜单下载 / 复制到… / 上传）：
+    /// 那条链路的消费者是我们自己的工作线程，真暂停不会让 Explorer 出现忙碌光标。
+    /// 复制对话框驱动的直传流（`CanPause=false`）在 UI 上按钮就是禁用的，这里再兜一道。</summary>
     public void TogglePause(TransferTask task)
     {
-        if (task is null || task.IsFinished) return;
+        if (task is null || task.IsFinished || !task.CanPause) return;
         // Service-managed transfer: the gate lives in this process.
         if (_managedGates.TryGetValue(task.Id, out var managedGate))
         {
@@ -359,23 +366,20 @@ public sealed class TransferTaskService
         }
     }
 
-    /// <summary>"暂停" = **限速**（不是完全停）。
-    ///
-    /// 为什么不做真暂停：暂停时字节停流，Explorer 的复制引擎会认为"源停滞"，于是给窗口设
-    /// 忙碌光标（用户实测"暂停时光标频繁转圈"），`IStream::Read` 也会一直阻塞。改成
-    /// "每块之间停一小段"后：字节继续慢慢流动 → 复制不算停滞 → 没有忙碌光标、窗口不卡；
-    /// 恢复（gate.Set）立即回到全速，取消（token）立即返回。
-    /// 有效速率 ≈ 块大小 / PauseThrottle（SFTP 约 80 KB/块 → 约 270 KB/s）。</summary>
-    private static readonly TimeSpan PauseThrottle = TimeSpan.FromMilliseconds(300);
-
-    /// <summary>暂停闸门：暂停时**限速**放行（见上），绝不抛出。
-    /// 由下载进度回调调用，运行在传输线程上（SFTP 下载循环 / FTP 传输线程）。</summary>
+    /// <summary>真暂停：阻塞传输线程直到恢复（或取消）。**只由我们自己的传输路径调用**
+    /// （菜单下载 / 复制到… / 上传）—— 消费者是我们的工作线程，不会让 Explorer 出现忙碌光标。
+    /// 复制对话框驱动的直传流不走这里（它的暂停按钮被禁用）。
+    /// 非抛出：取消/对象已释放都直接返回。</summary>
     public void WaitWhilePaused(TransferTask? task, CancellationToken token)
     {
         if (task is null) return;
         if (!_managedGates.TryGetValue(task.Id, out var gate)) return;
-        if (gate.IsSet || token.IsCancellationRequested) return;
-        try { gate.Wait(PauseThrottle); } catch (ObjectDisposedException) { }
+        while (!gate.IsSet)
+        {
+            if (token.IsCancellationRequested) return;
+            try { if (gate.Wait(100)) return; }
+            catch (ObjectDisposedException) { return; }
+        }
     }
 
     /// <summary>Cancel = terminate the CLI process performing the transfer, or
@@ -426,10 +430,10 @@ public sealed class TransferTaskService
     /// visible in the same queue used by upload/download jobs.
     /// </summary>
     public TransferTask BeginManagedTask(string direction, string server, string name, string remotePath,
-                                         Action cancel, string batchId = "")
+                                         Action cancel, string batchId = "", bool canPause = true)
     {
         if (!_dispatcher.CheckAccess())
-            return _dispatcher.Invoke(() => BeginManagedTask(direction, server, name, remotePath, cancel, batchId));
+            return _dispatcher.Invoke(() => BeginManagedTask(direction, server, name, remotePath, cancel, batchId, canPause));
 
         _batchTimer?.Stop();
         if (!_batchActive)
@@ -441,7 +445,7 @@ public sealed class TransferTaskService
         var task = new TransferTask
         {
             Id = Guid.NewGuid().ToString("N"), Direction = direction, Server = server,
-            Name = name, RemotePath = remotePath, BatchId = batchId,
+            Name = name, RemotePath = remotePath, BatchId = batchId, CanPause = canPause,
         };
         _managedCancels[task.Id] = cancel;
         _managedGates[task.Id] = new ManualResetEventSlim(true);   // signaled = running
