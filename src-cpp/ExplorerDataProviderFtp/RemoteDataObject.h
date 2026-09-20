@@ -115,8 +115,7 @@ public:
     {
         LONG n = InterlockedDecrement(&_ref);
         if (n == 0)
-        {
-            // CFSTR_FILECONTENTS is prefetched before the first byte reaches the
+        {            // CFSTR_FILECONTENTS is prefetched before the first byte reaches the
             // copy engine. _pos == 0 and _done == TRUE therefore do NOT mean the
             // download completed. A released stream after FETCH began is Explorer's
             // cancellation signal and must stop the resident service job.
@@ -136,11 +135,20 @@ public:
             }
             delete this;
         }
+        else if (_fetchStarted && !_jobDone)
+        {
+            // Shell 在下载完成前丢掉了这个流（用户取消/放弃）：唤醒可能正阻塞在
+            // Read 等待循环里的那一次调用，让它立刻以 ERROR_CANCELLED 返回。
+            ProbeLog(L"[DL] stream released mid-stream; wake blocked Read remote='%s' pos=%llu",
+                     _remote.c_str(), (unsigned long long)_pos);
+            InterlockedExchange(&_released, 1);
+        }
         return n;
     }
 
     STDMETHODIMP Read(void *pv, ULONG cb, ULONG *pcbRead) override
     {
+        RefGuard guard(this);   // 抽消息期间 Shell 可能释放本流
         if (pcbRead) *pcbRead = 0;
         if (!pv) return STG_E_INVALIDPOINTER;
         if (!Ensure())
@@ -161,6 +169,11 @@ public:
         for (;;)
         {
             if (_pos < OnDiskSize()) break;
+            if (ReleasedByShell())
+            {
+                ProbeLog(L"[DL] Read aborted: stream released remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
+                return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+            }
             if (PollJobTerminal())
             {
                 if (_pos < OnDiskSize()) break;
@@ -173,7 +186,8 @@ public:
                 if (_jobFailed && _pos == 0) return STG_E_READFAULT;
                 break;   // 正常结束 → 下面 ReadFile 返回 EOF
             }
-            Sleep(50);
+            PumpMessages();   // 让复制对话框保持响应（否则暂停时表现为"无响应"）
+            Sleep(20);
         }
 
         ULONGLONG avail = OnDiskSize();
@@ -205,6 +219,7 @@ public:
 
     STDMETHODIMP Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *newPos) override
     {
+        RefGuard guard(this);
         if (!Ensure()) return _cancelled ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : STG_E_READFAULT;
         LARGE_INTEGER zero = {};
         if (!SetFilePointerEx(_h, move, &zero, origin)) return STG_E_INVALIDFUNCTION;
@@ -309,7 +324,17 @@ private:
             if (GetFileAttributesExW(_local.c_str(), GetFileExInfoStandard, &fa)) break;
             if (PollJobTerminal()) break;
             if (GetTickCount64() > deadline) break;
-            Sleep(50);
+            if (ReleasedByShell()) break;
+            PumpMessages();
+            Sleep(20);
+        }
+        if (ReleasedByShell())
+        {
+            _cancelled = TRUE;
+            ProbeLog(L"[DL] ensure aborted: stream released remote='%s'", _remote.c_str());
+            DeleteFileW(_local.c_str());
+            _local.clear();
+            return FALSE;
         }
         // 打开本地临时文件：允许共享读/写/删（写方可能还在写、失败时会被删）。
         // 若写方以独占方式打开（例如 FTP 后端），会持续 ERROR_SHARING_VIOLATION(32)：
@@ -340,7 +365,16 @@ private:
                 return FALSE;
             }
             PollJobTerminal();   // 顺便刷新终态（失败/取消时 Read 据此收尾）
-            Sleep(50);
+            if (ReleasedByShell())
+            {
+                _cancelled = TRUE;
+                ProbeLog(L"[DL] ensure aborted (sharing wait): stream released '%s'", _local.c_str());
+                DeleteFileW(_local.c_str());
+                _local.clear();
+                return FALSE;
+            }
+            PumpMessages();
+            Sleep(20);
         }
         _downloadReady = TRUE;
         ProbeLog(L"[DL] ensure opened tid=%lu elapsedMs=%llu local='%s' size_on_disk=%llu expected=%llu",
@@ -388,6 +422,29 @@ private:
     BOOL _jobDone = FALSE;
     BOOL _jobFailed = FALSE;
     int _readCount = 0;
+    volatile LONG _released = 0;   // Shell 在下载完成前释放了本流（取消/放弃）
+
+    // 等待期间抽消息：Explorer 的复制对话框与源窗口用的是**同一个线程消息队列**，
+    // 不抽它，对话框就显示"无响应"—— 用户看到的就是"暂停后窗口卡住"。
+    static void PumpMessages()
+    {
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    BOOL ReleasedByShell() { return InterlockedCompareExchange(&_released, 0, 0) != 0; }
+
+    // Read/Seek 期间给自己加一份引用：抽消息时 Shell 可能释放本流（用户取消），
+    // 没有这份自保就是 use-after-free。
+    struct RefGuard
+    {
+        CRemoteStream *s;
+        explicit RefGuard(CRemoteStream *p) : s(p) { s->AddRef(); }
+        ~RefGuard() { s->Release(); }
+    };
 };
 
 // ---------------------------------------------------------------------------
