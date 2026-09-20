@@ -30,7 +30,7 @@ git push origin v0.0.9-pre-alpha
 > **进度（2026-09-15）：代码与实测已完成**——两个 Provider 的叶子分支已修（含"目录自身失败也要
 > 继续下探"），接口返回 `ChmodRecursiveResult{Dirs, Files, Failures}`，CLI 以退出码 3 报 `PARTIAL`。
 > 实测 `chmodr /chmodtest 750` → `dirs=2 files=3 failed=0`，改后**文件与目录**均为 `-rwxr-x---`/`drwxr-x---`。
-> **唯一未完成项：把它接进 A2 的队列窗口。**
+> **当时的唯一未完成项：把它接进 A2 的队列窗口。**（下面有 09-20 的进度块：已完成）
 >
 > **进度（2026-09-20）：已接进队列，A1 完成。** 递归改权限走常驻服务
 > （`FtpMeta.h:715`「递归修改权限：走常驻服务」），与删除共用队列窗口，失败明细汇总；
@@ -59,7 +59,7 @@ git push origin v0.0.9-pre-alpha
 > 否则 DataTemplate 绑定根本没附加）见
 > [TERMINAL_AND_OPERATIONS_2026-09-16.md](TERMINAL_AND_OPERATIONS_2026-09-16.md) §11。
 >
-> **仍未做**（下表里属于"与传输队列统一"的部分）：上传/下载纳入同一窗口、
+> **当时仍未做**（下表里属于"与传输队列统一"的部分）：上传/下载纳入同一窗口、
 > 进度改为**字节 + 条目数双维度**、把 `TransferTaskService` 按队列语义收敛。
 >
 > **进度（2026-09-20）：主体已完成，A2 达成。**
