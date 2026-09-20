@@ -250,14 +250,16 @@ public sealed class SftpFileSystem : IRemoteFileSystem
     }
 
     public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false,
-                       CancellationToken token = default)
+                       CancellationToken token = default, Action? waitWhilePaused = null)
     {
         token.ThrowIfCancellationRequested();
         EnsureConnected();
         if (_client is null) return;
         long total = 0;
         try { total = new FileInfo(localPath).Length; } catch { }
-        using var fs = File.OpenRead(localPath);
+        // 暂停/取消都放在**输入流**上：上传循环在自己的线程上 await input.ReadAsync(...)，
+        // 在那里阻塞只会暂停这次上传；放到进度回调里会卡死会话消息线程（见 PausableReadStream）。
+        using Stream fs = new PausableReadStream(File.OpenRead(localPath), waitWhilePaused);
         // 与 Download 同理：同步 UploadFile 把回调丢到线程池执行、写死 CancellationToken.None，
         // 回调里抛异常会终止宿主进程。改走带 token 的异步重载；进度回调经 SafeProgress 永不抛出。
         IProgress<UploadFileProgressReport>? reporter = progress is null

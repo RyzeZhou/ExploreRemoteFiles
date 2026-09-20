@@ -578,10 +578,11 @@ public sealed class RemoteBridgeService : IDisposable
                 fs.Upload(localPath, remote, (done, total) =>
                 {
                     job.Done = done; job.Total = total;
-                    // 注意：SSH.NET 的上传进度回调跑在**会话的消息线程**上，在这里阻塞会把整条
-                    // 连接卡住（与下载的传输线程不同）。所以上传只支持取消、不做暂停闸门阻塞。
                     if (task is not null) _transfers?.UpdateManagedTask(task, done, total, fileName);
-                }, false, cancellation.Token);
+                }, false, cancellation.Token,
+                // 暂停闸门：SFTP 把它挂在**输入流**上（上传线程），不会卡住会话消息线程；
+                // FTP 在传输线程的进度回调里调用。取消仍走 token。
+                waitWhilePaused: task is null ? null : () => _transfers?.WaitWhilePaused(task, cancellation.Token));
             }, cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
             if (task is not null) _transfers?.CompleteManagedTask(task, true, null);

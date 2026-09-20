@@ -40,9 +40,12 @@ public interface IRemoteFileSystem : IDisposable
                   CancellationToken token = default);
 
     /// <summary>上传本地文件到远程路径。progress(已传字节, 总字节) 可选；resume 时从断点续传。
-    /// token 取消时实现必须**尽快中断**上传（服务侧的传输队列靠它取消）。</summary>
+    /// token 取消时实现必须**尽快中断**上传（服务侧的传输队列靠它取消）。
+    /// waitWhilePaused：每次从本地流读一块之前调用一次，用于**安全地暂停上传** ——
+    /// 实现必须保证它跑在传输线程上（SFTP 用 PausableReadStream 包输入流、FTP 用进度回调），
+    /// 绝不能放在会话消息线程上阻塞（那会卡死整条连接）。</summary>
     void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false,
-                CancellationToken token = default);
+                CancellationToken token = default, Action? waitWhilePaused = null);
 
     /// <summary>修改远程权限（chmod；mode 为 8 进制数字，如 640）。</summary>
     void SetPermissions(string path, int mode);

@@ -214,9 +214,10 @@ private:
         DeleteFileW(_local.c_str());
         ULARGE_INTEGER freeBytes = {};
         BOOL hasFreeBytes = GetDiskFreeSpaceExW(dir, &freeBytes, NULL, NULL);
-        ProbeLog(L"[DL] Ensure start site='%s' remote='%s' size=%llu free=%llu has_free=%d -> '%s' batch='%s'",
-                 _site.c_str(), _remote.c_str(), (unsigned long long)_size,
+        ProbeLog(L"[DL] Ensure start tid=%lu site='%s' remote='%s' size=%llu free=%llu has_free=%d -> '%s' batch='%s'",
+                 GetCurrentThreadId(), _site.c_str(), _remote.c_str(), (unsigned long long)_size,
                  (unsigned long long)freeBytes.QuadPart, (int)hasFreeBytes, _local.c_str(), _batchId.c_str());
+        const ULONGLONG tEnsure = GetTickCount64();
 
         BOOL fetched = FALSE;
         for (int attempt = 0; attempt < 2 && !fetched; ++attempt)
@@ -263,6 +264,8 @@ private:
                      _local.c_str(), (long long)li.QuadPart, (unsigned long long)_size);
         }
         _downloadReady = TRUE;
+        ProbeLog(L"[DL] Ensure done tid=%lu elapsedMs=%llu local='%s' batch='%s'",
+                 GetCurrentThreadId(), GetTickCount64() - tEnsure, _local.c_str(), _batchId.c_str());
         return TRUE;
     }
 
@@ -389,10 +392,17 @@ public:
     BOOL WaitForFile(const std::wstring &rel)
     {
         std::wstring p = LocalPath(rel);
+        const ULONGLONG t0 = GetTickCount64();
         for (;;)
         {
             if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                ULONGLONG dt = GetTickCount64() - t0;
+                if (dt >= 500)   // 谁在等、等了多久：确认不是 UI 线程在等
+                    ProbeLog(L"[DATAOBJ] WaitForFile slow tid=%lu elapsedMs=%llu '%s'",
+                             GetCurrentThreadId(), dt, rel.c_str());
                 return TRUE;
+            }
             if (_finished)
             {
                 for (int i = 0; i < 5; i++)
@@ -876,7 +886,7 @@ public:
                 medium->tymed = TYMED_ISTREAM;
                 medium->pstm = stream;
                 medium->pUnkForRelease = NULL;
-                ProbeLog(L"[DATAOBJ] GetData contents idx=%d '%s' (from folder fetch)", (int)fmt->lindex, it.name.c_str());
+                ProbeLog(L"[DATAOBJ] GetData contents idx=%d '%s' tid=%lu (from folder fetch)", (int)fmt->lindex, it.name.c_str(), GetCurrentThreadId());
                 return S_OK;
             }
 
@@ -890,7 +900,7 @@ public:
             medium->tymed = TYMED_ISTREAM;
             medium->pstm = stream;
             medium->pUnkForRelease = NULL;
-            ProbeLog(L"[DATAOBJ] GetData contents idx=%d '%s'", (int)fmt->lindex, it.name.c_str());
+            ProbeLog(L"[DATAOBJ] GetData contents idx=%d '%s' tid=%lu", (int)fmt->lindex, it.name.c_str(), GetCurrentThreadId());
             return S_OK;
         }
 
