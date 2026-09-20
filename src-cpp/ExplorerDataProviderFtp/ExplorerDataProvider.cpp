@@ -1423,8 +1423,21 @@ public:
         // （用户看到的"0x80004002 不支持的接口"）。
         if (IsEqualIID(riid, ERF_IID_IShellItemResources))
         {
+            DWORD mode = ErfShellResourceMode();
+            if (mode == 2)
+            {
+                ProbeLog(L"[XFER] OpenItem(resources) mode=2 -> S_FALSE (表示没有资源)");
+                return S_FALSE;   // *ppv 已是 NULL
+            }
+            if (mode == 3)
+            {
+                ProbeLog(L"[XFER] OpenItem(resources) mode=3 -> E_NOTIMPL");
+                return E_NOTIMPL;
+            }
+            const GUID &resGuid = (mode == 1) ? GUID_NULL : ERF_GUID_DataResource;
+            ProbeLog(L"[XFER] OpenItem(resources) mode=%u guidType=%08X", (unsigned)mode, resGuid.Data1);
             CRemoteItemResources *res = new (std::nothrow) CRemoteItemResources(
-                m_site, full.c_str(), name, size, isFolder, mtime, m_batchId);
+                m_site, full.c_str(), name, size, isFolder, mtime, m_batchId, resGuid);
             if (!res) return E_OUTOFMEMORY;
             hr = res->QueryInterface(riid, ppv);
             res->Release();

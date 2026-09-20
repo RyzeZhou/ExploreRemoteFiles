@@ -23,6 +23,36 @@
 //   1 = 旧行为（剪贴板虚拟文件格式）。可随时回退，无需重装。
 // 读 HKCU\Software\ExplorerRemoteFs\UseVirtualFileFormats（DWORD，缺省=0）。
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Shell 资源协议实验档位（2026-09-20）：HKCU\Software\ExplorerRemoteFs\ShellResourceMode
+// IShellItemResources 是**未公开协议**（SDK 无文档/样例）。Shell 的复制引擎经
+// ITransferSource::OpenItem 拿到资源对象后，可能：只要元数据、或者要枚举资源、
+// 或者干脆不要资源而直接要 IStream。不同版本/不同来源行为不同，所以做成档位：
+//   0（默认）= 返回资源对象，EnumResources 枚举 1 个"数据资源"（自定义 GUID）
+//   1        = 同上，但资源 GUID 用 GUID_NULL（"默认数据流"的常见约定）
+//   2        = OpenItem(IShellItemResources) 直接返回 S_FALSE + NULL（表示没有资源）
+//   3        = OpenItem(IShellItemResources) 直接返回 E_NOTIMPL
+// 改完重启 explorer 生效，不需要重装。
+// ---------------------------------------------------------------------------
+inline DWORD ErfShellResourceMode()
+{
+    static volatile LONG s_loaded = 0;
+    static DWORD s_value = 0;
+    if (InterlockedCompareExchange(&s_loaded, 1, 0) == 0)
+    {
+        HKEY k = NULL;
+        if (ERROR_SUCCESS == RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", 0, KEY_READ, &k))
+        {
+            DWORD v = 0, cb = sizeof(v), type = 0;
+            if (ERROR_SUCCESS == RegQueryValueExW(k, L"ShellResourceMode", NULL, &type, (LPBYTE)&v, &cb) &&
+                type == REG_DWORD)
+                s_value = v;
+            RegCloseKey(k);
+        }
+    }
+    return s_value;
+}
+
 inline BOOL ErfUseVirtualFileFormats()
 {
     static volatile LONG s_loaded = 0;

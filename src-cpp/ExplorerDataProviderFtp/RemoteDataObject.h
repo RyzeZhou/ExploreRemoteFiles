@@ -404,10 +404,10 @@ class CRemoteItemResources : public IShellItemResources
 {
 public:
     CRemoteItemResources(PCWSTR site, PCWSTR remote, PCWSTR name, ULONGLONG size,
-                         BOOL isFolder, DWORD mtimeUnix, PCWSTR batchId)
+                         BOOL isFolder, DWORD mtimeUnix, PCWSTR batchId, const GUID &resourceGuid)
         : _ref(1), _site(site ? site : L""), _remote(remote ? remote : L""),
           _name(name ? name : L""), _size(size), _isFolder(isFolder),
-          _mtimeUnix(mtimeUnix), _batchId(batchId ? batchId : L"")
+          _mtimeUnix(mtimeUnix), _batchId(batchId ? batchId : L""), _resourceGuid(resourceGuid)
     {
         DllAddRef();
     }
@@ -470,9 +470,10 @@ public:
     }
     STDMETHODIMP EnumResources(IEnumResources **ppenumr) override
     {
-        ProbeLog(L"[XFER] IShellItemResources::EnumResources '%s' -> 1 data resource", _name.c_str());
+        ProbeLog(L"[XFER] IShellItemResources::EnumResources '%s' -> 1 data resource guidType=%08X",
+                 _name.c_str(), _resourceGuid.Data1);
         if (!ppenumr) return E_POINTER;
-        *ppenumr = new (std::nothrow) CShellItemResourceEnum(ERF_GUID_DataResource, _name.c_str());
+        *ppenumr = new (std::nothrow) CShellItemResourceEnum(_resourceGuid, _name.c_str());
         return *ppenumr ? S_OK : E_OUTOFMEMORY;
     }
     STDMETHODIMP SupportsResource(const SHELL_ITEM_RESOURCE *pcsir) override
@@ -514,6 +515,7 @@ private:
     ULONGLONG _size;
     BOOL _isFolder;
     DWORD _mtimeUnix;
+    GUID _resourceGuid;
 };
 
 // ---------------------------------------------------------------------------
