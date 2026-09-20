@@ -54,6 +54,10 @@ static const GUID ERF_IID_IDataObjectAsyncCapability =
 static const GUID ERF_IID_IShellItemResources =
 { 0xff5693be, 0x2ce0, 0x4d48, { 0xb5, 0xc5, 0x40, 0x81, 0x7d, 0x1a, 0xcd, 0xb9 } };
 
+// IEnumResources {2dd81fe3-a83c-4da9-a330-47249d345ba1}
+static const GUID ERF_IID_IEnumResources =
+{ 0x2dd81fe3, 0xa83c, 0x4da9, { 0xa3, 0x30, 0x47, 0x24, 0x9d, 0x34, 0x5b, 0xa1 } };
+
 // Local path of the transfer CLI (per-user install location).
 inline std::wstring RfsCliPath()
 {
@@ -322,6 +326,54 @@ private:
 // 这里给出的都是我们已知的元数据（缓存里的 size/mtime + 名字），资源方面只支持
 // 默认资源 —— 也就是文件内容流本身（OpenResource(IID_IStream)）。
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// IEnumResources：我们没有"额外资源"（默认资源就是文件内容流本身），所以给一个
+// **空的**枚举器。返回 E_NOTIMPL 会让复制引擎直接以 0x80004001 中止。
+// ---------------------------------------------------------------------------
+class CEmptyEnumResources : public IEnumResources
+{
+public:
+    CEmptyEnumResources() : _ref(1) { DllAddRef(); }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, ERF_IID_IEnumResources))
+        {
+            *ppv = static_cast<IEnumResources *>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&_ref); }
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        LONG n = InterlockedDecrement(&_ref);
+        if (n == 0) delete this;
+        return n;
+    }
+
+    STDMETHODIMP Next(ULONG, SHELL_ITEM_RESOURCE *, ULONG *pceltFetched) override
+    {
+        if (pceltFetched) *pceltFetched = 0;
+        return S_FALSE;   // 没有更多资源
+    }
+    STDMETHODIMP Skip(ULONG) override { return S_FALSE; }
+    STDMETHODIMP Reset() override { return S_OK; }
+    STDMETHODIMP Clone(IEnumResources **ppenumr) override
+    {
+        if (!ppenumr) return E_POINTER;
+        *ppenumr = new (std::nothrow) CEmptyEnumResources();
+        return *ppenumr ? S_OK : E_OUTOFMEMORY;
+    }
+
+private:
+    ~CEmptyEnumResources() { DllRelease(); }
+    LONG _ref;
+};
+
 class CRemoteItemResources : public IShellItemResources
 {
 public:
@@ -356,12 +408,16 @@ public:
 
     STDMETHODIMP GetAttributes(DWORD *pdwAttributes) override
     {
+        ProbeLog(L"[XFER] IShellItemResources::GetAttributes tid=%lu '%s' folder=%d",
+                 GetCurrentThreadId(), _name.c_str(), (int)_isFolder);
         if (!pdwAttributes) return E_POINTER;
         *pdwAttributes = _isFolder ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
         return S_OK;
     }
     STDMETHODIMP GetSize(ULONGLONG *pullSize) override
     {
+        ProbeLog(L"[XFER] IShellItemResources::GetSize tid=%lu '%s' size=%llu",
+                 GetCurrentThreadId(), _name.c_str(), _size);
         if (!pullSize) return E_POINTER;
         *pullSize = _size;
         return S_OK;
@@ -375,20 +431,32 @@ public:
         if (pftAccess)   { pftAccess->dwLowDateTime = li.LowPart;   pftAccess->dwHighDateTime = li.HighPart; }
         return S_OK;
     }
-    STDMETHODIMP SetTimes(const FILETIME *, const FILETIME *, const FILETIME *) override { return E_NOTIMPL; }
+    STDMETHODIMP SetTimes(const FILETIME *, const FILETIME *, const FILETIME *) override
+    {
+        ProbeLog(L"[XFER] IShellItemResources::SetTimes (no-op) '%s'", _name.c_str());
+        return S_OK;   // 源项时间不回写；返回 E_NOTIMPL 会让引擎中止
+    }
     STDMETHODIMP GetResourceDescription(const SHELL_ITEM_RESOURCE *, LPWSTR *ppszDescription) override
     {
+        ProbeLog(L"[XFER] IShellItemResources::GetResourceDescription '%s'", _name.c_str());
         if (!ppszDescription) return E_POINTER;
         return SHStrDupW(_name.c_str(), ppszDescription);
     }
     STDMETHODIMP EnumResources(IEnumResources **ppenumr) override
     {
-        if (ppenumr) *ppenumr = NULL;
-        return E_NOTIMPL;   // 没有额外资源：默认资源就是文件内容流
+        ProbeLog(L"[XFER] IShellItemResources::EnumResources '%s' -> empty", _name.c_str());
+        if (!ppenumr) return E_POINTER;
+        *ppenumr = new (std::nothrow) CEmptyEnumResources();
+        return *ppenumr ? S_OK : E_OUTOFMEMORY;
     }
-    STDMETHODIMP SupportsResource(const SHELL_ITEM_RESOURCE *) override { return S_FALSE; }
+    STDMETHODIMP SupportsResource(const SHELL_ITEM_RESOURCE *) override
+    {
+        ProbeLog(L"[XFER] IShellItemResources::SupportsResource '%s' -> S_FALSE", _name.c_str());
+        return S_FALSE;
+    }
     STDMETHODIMP OpenResource(const SHELL_ITEM_RESOURCE *, REFIID riid, void **ppv) override
     {
+        ProbeLog(L"[XFER] IShellItemResources::OpenResource '%s' riid=%08X", _name.c_str(), riid.Data1);
         if (!ppv) return E_POINTER;
         *ppv = NULL;
         if (_isFolder) return E_NOINTERFACE;
@@ -399,8 +467,16 @@ public:
         stream->Release();
         return hr;
     }
-    STDMETHODIMP CreateResource(const SHELL_ITEM_RESOURCE *, REFIID, void **) override { return E_NOTIMPL; }
-    STDMETHODIMP MarkForDelete() override { return E_NOTIMPL; }
+    STDMETHODIMP CreateResource(const SHELL_ITEM_RESOURCE *, REFIID riid, void **) override
+    {
+        ProbeLog(L"[XFER] IShellItemResources::CreateResource '%s' riid=%08X -> E_NOTIMPL", _name.c_str(), riid.Data1);
+        return E_NOTIMPL;   // 源端不创建资源（我们只读远程）
+    }
+    STDMETHODIMP MarkForDelete() override
+    {
+        ProbeLog(L"[XFER] IShellItemResources::MarkForDelete (no-op) '%s'", _name.c_str());
+        return S_OK;   // 源端"标记删除"我们不做；返回 E_NOTIMPL 会让引擎中止
+    }
 
 private:
     ~CRemoteItemResources() { DllRelease(); }
