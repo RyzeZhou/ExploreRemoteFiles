@@ -221,7 +221,11 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         if (_client is null) return;
         long total = 0;
         try { total = _client.GetAttributes(remotePath).Size; } catch { }
-        using (var fs = File.Create(localPath))
+        // 本地临时文件必须以**共享读**方式打开：Shell 扩展在下载进行中就要读它
+        // （边下边读）。File.Create 默认 FileShare.None，扩展侧会拿到
+        // ERROR_SHARING_VIOLATION(32)，表现为"磁盘操作失败"。
+        using (var fs = new FileStream(localPath, FileMode.Create, FileAccess.Write,
+                                       FileShare.Read | FileShare.Write | FileShare.Delete))
         {
             try
             {

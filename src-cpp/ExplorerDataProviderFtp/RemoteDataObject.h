@@ -120,7 +120,11 @@ public:
             // copy engine. _pos == 0 and _done == TRUE therefore do NOT mean the
             // download completed. A released stream after FETCH began is Explorer's
             // cancellation signal and must stop the resident service job.
-            if (_fetchStarted && !_jobDone && !_cancelled && !_cancelRequested && !_batchId.empty())
+            // 只有"**一个字节都没交出去**"的流在释放时才算取消信号：否则 Shell 只是
+            // 用完释放（或 sniff 流提前释放），一发 CANCEL 会把**整批**（含正在跑的正主）
+            // 一起取消 —— 实测表现为队列里两条任务、然后"磁盘操作失败"。
+            if (_fetchStarted && !_jobDone && !_cancelled && !_cancelRequested &&
+                !_batchId.empty() && _pos == 0)
             {
                 _cancelRequested = TRUE;
                 ProbeLog(L"[DL] cancel requested by stream release batch='%s' remote='%s' pos=%llu",
@@ -307,16 +311,36 @@ private:
             if (GetTickCount64() > deadline) break;
             Sleep(50);
         }
-        _h = CreateFileW(_local.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-        if (_h == INVALID_HANDLE_VALUE)
+        // 打开本地临时文件：允许共享读/写/删（写方可能还在写、失败时会被删）。
+        // 若写方以独占方式打开（例如 FTP 后端），会持续 ERROR_SHARING_VIOLATION(32)：
+        // 这时**不立刻失败**，等它写完再开 —— 该路退化成"下完再读"，但不会误报磁盘错误。
+        const ULONGLONG openDeadline = GetTickCount64() + 120000;
+        for (;;)
         {
-            ProbeLog(L"[DL] Ensure FAILED: cannot open local '%s' err=%lu cancelled=%d failed=%d",
-                     _local.c_str(), (unsigned long)GetLastError(), (int)_cancelled, (int)_jobFailed);
-            DeleteFileW(_local.c_str());
-            _local.clear();
-            if (!_cancelled) _done = FALSE;    // 普通失败可重试；取消是终态
-            return FALSE;
+            _h = CreateFileW(_local.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+            if (_h != INVALID_HANDLE_VALUE) break;
+            DWORD err = GetLastError();
+            if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION)
+            {
+                ProbeLog(L"[DL] Ensure FAILED: cannot open local '%s' err=%lu cancelled=%d failed=%d",
+                         _local.c_str(), (unsigned long)err, (int)_cancelled, (int)_jobFailed);
+                DeleteFileW(_local.c_str());
+                _local.clear();
+                if (!_cancelled) _done = FALSE;    // 普通失败可重试；取消是终态
+                return FALSE;
+            }
+            if (GetTickCount64() > openDeadline)
+            {
+                ProbeLog(L"[DL] Ensure FAILED: open timed out (sharing) '%s'", _local.c_str());
+                DeleteFileW(_local.c_str());
+                _local.clear();
+                if (!_cancelled) _done = FALSE;
+                return FALSE;
+            }
+            PollJobTerminal();   // 顺便刷新终态（失败/取消时 Read 据此收尾）
+            Sleep(50);
         }
         _downloadReady = TRUE;
         ProbeLog(L"[DL] ensure opened tid=%lu elapsedMs=%llu local='%s' size_on_disk=%llu expected=%llu",
