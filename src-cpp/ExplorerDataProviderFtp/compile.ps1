@@ -45,7 +45,14 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $PSScriptRoo
     throw 'Windows resource compilation failed; see rc.exe diagnostics above.'
 }
 foreach($cpp in $cpps){ cl.exe /nologo /c /EHa /MD /std:c++17 /W3 /utf-8 /D_WINDOWS /D_USRDLL /DUNICODE /D_UNICODE $cpp; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE} }
+# SQLite amalgamation（third_party）：目录缓存 + 票据库的存储层。
+# 按 C 编译（cl 依 .c 扩展名走 C；C++ 专用开关一律不加），/MD 必须与上面一致。
+$sqliteC = 'third_party\sqlite\sqlite3.c'
+cl.exe /nologo /c /MD /O2 /W3 /DSQLITE_THREADSAFE=1 /DSQLITE_OMIT_LOAD_EXTENSION /DSQLITE_OMIT_DEPRECATED `
+        /DSQLITE_DEFAULT_MEMSTATUS=0 /DSQLITE_OMIT_SHARED_CACHE /DSQLITE_DQS=0 /D_CRT_SECURE_NO_WARNINGS $sqliteC
+if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
 $objs=$cpps | ForEach-Object {[IO.Path]::GetFileNameWithoutExtension($_)+'.obj'}
+$objs += 'sqlite3.obj'
 $outDir = Split-Path -Parent $OutputPath
 if ($outDir) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
 $implib = [IO.Path]::ChangeExtension($OutputPath, '.lib')

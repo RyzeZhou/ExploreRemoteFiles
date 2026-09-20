@@ -1015,6 +1015,21 @@ public:
     // indices no longer mean anything).
     BOOL TryExpand(BOOL cacheOnly)
     {
+        if (_isTicket)
+        {
+            // 票据模式：对外只有一个几百字节的 .erfdl 文件，不展开任何远程树。
+            std::vector<Item> items;
+            Item it = {};
+            it.name = _ticketName;
+            it.relPath = _ticketName;
+            it.size = (ULONGLONG)_ticketText.size();
+            it.mtime = (DWORD)time(nullptr);
+            it.isFolder = FALSE;
+            items.push_back(it);
+            _items.swap(items);
+            _expanded = TRUE;
+            return TRUE;
+        }
         std::vector<Item> items;
         std::vector<CFolderFetch *> fetches;
         BOOL cold = FALSE;
@@ -1069,6 +1084,40 @@ public:
         ProbeLog(L"[DATAOBJ] expand done cacheOnly=%d tid=%lu tops=%u dirs=%u coldDirs=%u items=%u elapsedMs=%llu",
                  (int)cacheOnly, GetCurrentThreadId(), (UINT)_tops.size(), dirs, coldDirs,
                  (UINT)_items.size(), GetTickCount64() - t0);
+        return TRUE;
+    }
+
+    // 把已 Add 的选中项转成**一张传输票据**（Ctrl+C 只产出票据，不传载荷）。
+    // 成功返回 TRUE；此后本数据对象只对外暴露一个几百字节的 .erfdl 文件。
+    BOOL ConvertToTicket(PCWSTR site)
+    {
+        if (_tops.empty() || !site || !site[0]) return FALSE;
+        std::vector<FtpTicketItem> items;
+        for (auto const &t : _tops)
+        {
+            FtpTicketItem it;
+            std::wstring full = t.folder;
+            if (!full.empty() && full[full.size() - 1] != L'/') full += L'/';
+            full += t.name;
+            it.remote = full;
+            it.name = t.name;
+            it.size = t.size;
+            it.mtime = t.mtime;
+            it.isFolder = t.isFolder;
+            items.push_back(it);
+        }
+        std::string jobId;
+        if (!FtpBridgeMakeTicket(site, items, jobId)) return FALSE;
+        std::wstring siteW = site;
+        for (auto &c : siteW) if (wcschr(L"\\/:*?\"<>|", c)) c = L'_';
+        std::wstring jobIdW(jobId.begin(), jobId.end());
+        WCHAR nameBuf[320] = {};
+        StringCchPrintfW(nameBuf, ARRAYSIZE(nameBuf), L"ERF_%s_%s.erfdl", siteW.c_str(), jobIdW.c_str());
+        _ticketName = nameBuf;
+        // 票据文本**只有** magic/version/jobId —— 路径只存在服务侧记录里。
+        _ticketText = "{\"magic\":\"ERFDL\",\"version\":1,\"jobId\":\"" + jobId + "\"}";
+        _isTicket = TRUE;
+        ProbeLog(L"[DATAOBJ] ticket '%s' bytes=%u", _ticketName.c_str(), (UINT)_ticketText.size());
         return TRUE;
     }
 
@@ -1215,6 +1264,17 @@ public:
 
         if (fmt->cfFormat == cfContents && fmt->lindex >= 0 && (size_t)fmt->lindex < _items.size())
         {
+            if (_isTicket)
+            {
+                // 票据内容：内存流直接给出几百字节的 JSON —— 不碰网络、瞬时完成。
+                IStream *mem = SHCreateMemStream((const BYTE *)_ticketText.data(), (UINT)_ticketText.size());
+                if (!mem) return E_OUTOFMEMORY;
+                medium->tymed = TYMED_ISTREAM;
+                medium->pstm = mem;
+                medium->pUnkForRelease = NULL;
+                ProbeLog(L"[DATAOBJ] ticket contents served bytes=%u", (UINT)_ticketText.size());
+                return S_OK;
+            }
             const Item &it = _items[(size_t)fmt->lindex];
             if (it.isFolder) return DV_E_LINDEX;
 
@@ -1325,6 +1385,10 @@ private:
     BOOL _probeBorn = FALSE;        // created inside a shell menu/drag probe window
     DWORD _probeTick = 0;           // and when that happened (see BeingProbed)
     BOOL _prewarmStarted = FALSE;   // background subtree warm-up already kicked off
+    // ── 传输票据模式（2026-09-20）：整个数据对象只对外暴露一个 .erfdl ──────────
+    BOOL _isTicket = FALSE;
+    std::wstring _ticketName;
+    std::string _ticketText;
     BOOL _asyncMode = FALSE;        // IDataObjectAsyncCapability: target opted into async
     BOOL _inOperation = FALSE;      // IDataObjectAsyncCapability: between Start/EndOperation
 };

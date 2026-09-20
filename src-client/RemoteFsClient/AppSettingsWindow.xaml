@@ -83,12 +83,18 @@
             <!-- 下载 -->
             <Grid x:Name="SectionDownload" Visibility="Collapsed">
                 <Grid.ColumnDefinitions><ColumnDefinition Width="176"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
                 <TextBlock x:Name="DownloadDirLabel" VerticalAlignment="Center"/>
                 <TextBox x:Name="DownloadDirBox" Grid.Column="1" Margin="0,4,8,0"/>
                 <Button x:Name="BrowseDownloadDirButton" Grid.Column="2" Click="OnBrowseDownloadDir" Padding="12,4" Margin="0,4,0,0"/>
-                <TextBlock x:Name="DownloadHintText" Grid.Row="1" Grid.ColumnSpan="3" TextWrapping="Wrap"
-                           Foreground="#666" Margin="0,16,0,0" VerticalAlignment="Top"/>
+                <CheckBox x:Name="TicketModeCheck" Grid.Row="1" Grid.ColumnSpan="3" Margin="0,18,0,0"/>
+                <TextBlock x:Name="DownloadHintText" Grid.Row="2" Grid.ColumnSpan="3" TextWrapping="Wrap"
+                           Foreground="#666" Margin="0,14,0,0" VerticalAlignment="Top"/>
+                <TextBlock x:Name="TicketModeHint" Grid.Row="3" Grid.ColumnSpan="3" TextWrapping="Wrap"
+                           Foreground="#666" Margin="0,6,0,0" VerticalAlignment="Top"/>
             </Grid>
 
             <!-- 文件关联 -->

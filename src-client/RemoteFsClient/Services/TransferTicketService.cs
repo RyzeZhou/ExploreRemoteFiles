@@ -1,8 +1,8 @@
 using System.IO;
-using System.Text;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Threading;
+using Microsoft.Data.Sqlite;
 
 namespace RemoteFsClient.Services;
 
@@ -32,8 +32,9 @@ public sealed class TicketRecord
 
 /// <summary>
 /// 「传输票据」(.erfdl)：票据本身只有 magic/version/jobId；**要传什么、从哪来、原先下到哪**
-/// 全部只存在这里（%LOCALAPPDATA%\ExplorerRemoteFs\tickets.json）。这样即使票据被拿走，
-/// 也看不出内容；被篡改也无用（jobId 查不到就拒绝）。
+/// 只存在**数据库**里（<c>&lt;MetadataCachePath&gt;\erf-cache.db</c> 的 tickets/ticket_items 两张表，
+/// 与扩展 DLL 的目录缓存共用一个库）。这样即使票据被拿走，也看不出内容；被篡改也无用
+/// （jobId 查不到就拒绝）。
 /// </summary>
 public sealed class TransferTicketService
 {
@@ -42,45 +43,199 @@ public sealed class TransferTicketService
 
     private readonly Dispatcher _dispatcher;
     private readonly RemoteBridgeService _bridge;
+    private readonly string _dbPath;
+    private readonly string _connectionString;
     private readonly object _gate = new();
-    private readonly Dictionary<string, TicketRecord> _records = new(StringComparer.Ordinal);
-    private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
-
-    private static string StorePath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "ExplorerRemoteFs", "tickets.json");
 
     public TransferTicketService(Dispatcher dispatcher, RemoteBridgeService bridge)
     {
         _dispatcher = dispatcher;
         _bridge = bridge;
-        Load();
-    }
-
-    private void Load()
-    {
-        try
+        // 与扩展 DLL 读的是**同一个注册表值**，因此两边用的是同一个库文件。
+        string dir = AppSettings.Load().MetadataCachePath;
+        if (string.IsNullOrWhiteSpace(dir)) dir = AppSettings.DefaultMetadataCachePath;
+        try { Directory.CreateDirectory(dir); } catch { }
+        _dbPath = Path.Combine(dir, "erf-cache.db");
+        _connectionString = new SqliteConnectionStringBuilder
         {
-            if (!File.Exists(StorePath)) return;
-            var list = JsonSerializer.Deserialize<List<TicketRecord>>(File.ReadAllText(StorePath), Json);
-            if (list is null) return;
-            foreach (var r in list) if (!string.IsNullOrEmpty(r.JobId)) _records[r.JobId] = r;
-            Log($"tickets loaded n={_records.Count}");
-        }
-        catch (Exception ex) { Log($"tickets load failed: {ex.Message}"); }
+            DataSource = _dbPath,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+        }.ToString();
+        Init();
     }
 
-    private void Save()
+    private SqliteConnection Open()
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        using var pragma = connection.CreateCommand();
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=4000;";
+        pragma.ExecuteNonQuery();
+        return connection;
+    }
+
+    private void Init()
     {
         try
         {
             lock (_gate)
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(StorePath)!);
-                File.WriteAllText(StorePath, JsonSerializer.Serialize(_records.Values.ToList(), Json));
+                using var connection = Open();
+                using var cmd = connection.CreateCommand();
+                // 与 DLL 侧 kSchema 完全一致（谁先跑谁建表）。
+                cmd.CommandText =
+                    "CREATE TABLE IF NOT EXISTS dir_cache(" +
+                    "  site TEXT NOT NULL, path TEXT NOT NULL, tick INTEGER NOT NULL," +
+                    "  items BLOB NOT NULL, PRIMARY KEY(site, path));" +
+                    "CREATE TABLE IF NOT EXISTS tickets(" +
+                    "  job_id TEXT PRIMARY KEY, created INTEGER NOT NULL, direction TEXT NOT NULL," +
+                    "  last_dest TEXT NOT NULL DEFAULT '', done_files TEXT NOT NULL DEFAULT '');" +
+                    "CREATE TABLE IF NOT EXISTS ticket_items(" +
+                    "  job_id TEXT NOT NULL, idx INTEGER NOT NULL, site TEXT NOT NULL, remote TEXT NOT NULL," +
+                    "  name TEXT NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL," +
+                    "  is_folder INTEGER NOT NULL, PRIMARY KEY(job_id, idx));";
+                cmd.ExecuteNonQuery();
+                using var stats = connection.CreateCommand();
+                stats.CommandText = "SELECT (SELECT COUNT(*) FROM dir_cache), (SELECT COUNT(*) FROM tickets)";
+                using var reader = stats.ExecuteReader();
+                if (reader.Read())
+                    Log($"tickets db ready '{_dbPath}' dir_cache={reader.GetInt64(0)} tickets={reader.GetInt64(1)}");
+            }
+            MigrateLegacyJson();
+        }
+        catch (Exception ex) { Log($"tickets db init failed: {ex.Message}"); }
+    }
+
+    /// <summary>把旧版 tickets.json 一次性搬进数据库（搬完改名，不再看它）。</summary>
+    private void MigrateLegacyJson()
+    {
+        try
+        {
+            string legacy = Path.Combine(Path.GetDirectoryName(_dbPath)!, "tickets.json");
+            if (!File.Exists(legacy)) return;
+            var list = JsonSerializer.Deserialize<List<TicketRecord>>(File.ReadAllText(legacy));
+            int imported = 0;
+            foreach (var rec in list ?? new List<TicketRecord>())
+            {
+                if (string.IsNullOrEmpty(rec.JobId) || rec.Items.Count == 0) continue;
+                if (GetRecord(rec.JobId) is not null) continue;
+                ImportRecord(rec);
+                imported++;
+            }
+            File.Move(legacy, legacy + ".migrated", overwrite: true);
+            Log($"legacy tickets.json imported n={imported}");
+        }
+        catch (Exception ex) { Log($"legacy tickets import failed: {ex.Message}"); }
+    }
+
+    private void ImportRecord(TicketRecord rec)
+    {
+        lock (_gate)
+        {
+            using var connection = Open();
+            using var tx = connection.BeginTransaction();
+            InsertTicketRow(connection, tx, rec);
+            InsertItems(connection, tx, rec);
+            tx.Commit();
+        }
+    }
+
+    private static void InsertTicketRow(SqliteConnection c, SqliteTransaction tx, TicketRecord rec)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "INSERT OR REPLACE INTO tickets(job_id, created, direction, last_dest, done_files) " +
+                          "VALUES($id, $created, $dir, $dest, $done)";
+        cmd.Parameters.AddWithValue("$id", rec.JobId);
+        cmd.Parameters.AddWithValue("$created", rec.CreatedUnix);
+        cmd.Parameters.AddWithValue("$dir", rec.Direction);
+        cmd.Parameters.AddWithValue("$dest", rec.LastDest ?? "");
+        cmd.Parameters.AddWithValue("$done", JsonSerializer.Serialize(rec.DoneFiles ?? new List<string>()));
+        cmd.ExecuteNonQuery();
+    }
+
+    private static void InsertItems(SqliteConnection c, SqliteTransaction tx, TicketRecord rec)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "INSERT OR REPLACE INTO ticket_items(job_id, idx, site, remote, name, size, mtime, is_folder) " +
+                          "VALUES($id, $idx, $site, $remote, $name, $size, $mtime, $folder)";
+        var pId = cmd.Parameters.Add("$id", SqliteType.Text);
+        var pIdx = cmd.Parameters.Add("$idx", SqliteType.Integer);
+        var pSite = cmd.Parameters.Add("$site", SqliteType.Text);
+        var pRemote = cmd.Parameters.Add("$remote", SqliteType.Text);
+        var pName = cmd.Parameters.Add("$name", SqliteType.Text);
+        var pSize = cmd.Parameters.Add("$size", SqliteType.Integer);
+        var pMtime = cmd.Parameters.Add("$mtime", SqliteType.Integer);
+        var pFolder = cmd.Parameters.Add("$folder", SqliteType.Integer);
+        cmd.Prepare();
+        for (int i = 0; i < rec.Items.Count; i++)
+        {
+            var it = rec.Items[i];
+            pId.Value = rec.JobId; pIdx.Value = i;
+            pSite.Value = it.Site ?? ""; pRemote.Value = it.Remote ?? ""; pName.Value = it.Name ?? "";
+            pSize.Value = it.Size; pMtime.Value = it.Mtime; pFolder.Value = it.IsFolder ? 1 : 0;
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    private TicketRecord? GetRecord(string jobId)
+    {
+        try
+        {
+            lock (_gate)
+            {
+                using var connection = Open();
+                var rec = new TicketRecord { JobId = jobId };
+                using (var cmd = connection.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT created, direction, last_dest, done_files FROM tickets WHERE job_id=$id";
+                    cmd.Parameters.AddWithValue("$id", jobId);
+                    using var reader = cmd.ExecuteReader();
+                    if (!reader.Read()) return null;
+                    rec.CreatedUnix = reader.GetInt64(0);
+                    rec.Direction = reader.GetString(1);
+                    rec.LastDest = reader.GetString(2);
+                    try { rec.DoneFiles = JsonSerializer.Deserialize<List<string>>(reader.GetString(3)) ?? new(); }
+                    catch { rec.DoneFiles = new(); }
+                }
+                using (var cmd = connection.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT site, remote, name, size, mtime, is_folder FROM ticket_items " +
+                                      "WHERE job_id=$id ORDER BY idx";
+                    cmd.Parameters.AddWithValue("$id", jobId);
+                    using var reader = cmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        rec.Items.Add(new TicketItem
+                        {
+                            Site = reader.GetString(0), Remote = reader.GetString(1), Name = reader.GetString(2),
+                            Size = reader.GetInt64(3), Mtime = reader.GetInt64(4), IsFolder = reader.GetInt64(5) != 0,
+                        });
+                    }
+                }
+                return rec.Items.Count > 0 ? rec : null;
             }
         }
-        catch (Exception ex) { Log($"tickets save failed: {ex.Message}"); }
+        catch (Exception ex) { Log($"tickets read failed job={jobId}: {ex.Message}"); return null; }
+    }
+
+    private void SaveState(TicketRecord rec)
+    {
+        try
+        {
+            lock (_gate)
+            {
+                using var connection = Open();
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = "UPDATE tickets SET last_dest=$dest, done_files=$done WHERE job_id=$id";
+                cmd.Parameters.AddWithValue("$dest", rec.LastDest ?? "");
+                cmd.Parameters.AddWithValue("$done", JsonSerializer.Serialize(rec.DoneFiles ?? new List<string>()));
+                cmd.Parameters.AddWithValue("$id", rec.JobId);
+                cmd.ExecuteNonQuery();
+            }
+        }
+        catch (Exception ex) { Log($"tickets save failed job={rec.JobId}: {ex.Message}"); }
     }
 
     private static void Log(string message)
@@ -104,8 +259,14 @@ public sealed class TransferTicketService
             Direction = direction,
             Items = items.ToList(),
         };
-        lock (_gate) _records[rec.JobId] = rec;
-        Save();
+        lock (_gate)
+        {
+            using var connection = Open();
+            using var tx = connection.BeginTransaction();
+            InsertTicketRow(connection, tx, rec);
+            InsertItems(connection, tx, rec);
+            tx.Commit();
+        }
         Log($"MKTICKET job={rec.JobId} items={rec.Items.Count} dir={direction} first='{(items.Count > 0 ? items[0].Remote : "")}'");
         return rec.JobId;
     }
@@ -134,8 +295,7 @@ public sealed class TransferTicketService
             string? jobId = ParseJobId(text);
             if (string.IsNullOrEmpty(jobId))
                 return "FAIL: 这不是易远传的传输票据";
-            TicketRecord? rec;
-            lock (_gate) _records.TryGetValue(jobId, out rec);
+            TicketRecord? rec = GetRecord(jobId);
             if (rec is null)
                 return "FAIL: 票据无法识别（可能是别台机器生成的，或本机任务记录已丢失；请重新复制一次）";
 
@@ -163,32 +323,28 @@ public sealed class TransferTicketService
             }
 
             // 冲突检查：同名 / 大小写同名 —— 只有冲突才问用户
-            var plan = new List<(TicketItem item, string target, bool overwrite)>();
+            var plan = new List<(TicketItem item, string target)>();
             foreach (var item in rec.Items)
             {
                 string target = Path.Combine(dest, item.Name);
                 string? existing = FindConflict(dest, item.Name);
-                if (existing is null) { plan.Add((item, target, true)); continue; }
+                if (existing is null) { plan.Add((item, target)); continue; }
                 var c = AskOnUi(
                     $"目标目录已存在同名项：\n{existing}\n\n要覆盖它，还是保留两者（重命名新文件）？",
                     "传输票据：命名冲突", MessageBoxButton.YesNoCancel);
                 if (c == MessageBoxResult.Cancel) return "FAIL: 用户取消";
-                if (c == MessageBoxResult.Yes) plan.Add((item, target, true));
-                else plan.Add((item, UniquePath(dest, item.Name), true));
+                if (c == MessageBoxResult.Yes) plan.Add((item, target));
+                else plan.Add((item, UniquePath(dest, item.Name)));
             }
 
-            string batchId = "ticket-" + rec.JobId.Substring(0, 8);
-            int started = 0;
-            foreach (var (item, target, overwrite) in plan)
-            {
+            string batchId = "ticket-" + rec.JobId.Substring(0, Math.Min(8, rec.JobId.Length));
+            foreach (var (item, target) in plan)
                 _bridge.StartTicketDownload(item.Site, item.Remote, target, item.IsFolder, batchId);
-                started++;
-            }
             rec.LastDest = dest;
             rec.DoneFiles = plan.Select(p => p.target).ToList();
-            Save();
-            Log($"OPEN-TICKET job={rec.JobId} dest='{dest}' items={started} changed={destChanged}");
-            return $"OK 已开始 {started} 项下载到 {dest}";
+            SaveState(rec);
+            Log($"OPEN-TICKET job={rec.JobId} dest='{dest}' items={plan.Count} changed={destChanged}");
+            return $"OK 已开始 {plan.Count} 项下载到 {dest}";
         }
         catch (Exception ex)
         {
@@ -244,9 +400,9 @@ public sealed class TransferTicketService
         {
             try
             {
-                if (!File.Exists(old)) { continue; }
+                if (!File.Exists(old)) continue;
                 string target = Path.Combine(newDest, Path.GetFileName(old));
-                if (File.Exists(target)) { continue; }
+                if (File.Exists(target)) continue;
                 File.Move(old, target);
                 moved.Add(target);
             }

@@ -14,5 +14,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\ExplorerRemoteFs\ExplorerRemoteFs.csproj" />
+    <!-- 目录缓存 + 票据记录共用一个 SQLite 库（<MetadataCachePath>\erf-cache.db）。 -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
   </ItemGroup>
 </Project>

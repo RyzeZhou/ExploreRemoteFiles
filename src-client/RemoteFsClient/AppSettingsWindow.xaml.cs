@@ -24,6 +24,7 @@ public partial class AppSettingsWindow : Window
         FileCachePathBox.Text = Settings.FileCachePath;
         EditorPathBox.Text = Settings.EditorPath;
         DownloadDirBox.Text = Settings.DownloadDir;
+        TicketModeCheck.IsChecked = Settings.UseTransferTicket;
         ExplorerLanguageBox.SelectedValue = Settings.ExplorerLanguage;
         ServiceLanguageBox.SelectedValue = Settings.ServiceLanguage;
         DefaultViewBox.SelectedValue = Settings.DefaultViewMode;
@@ -78,6 +79,12 @@ public partial class AppSettingsWindow : Window
         DownloadHintText.Text = Ui.IsEnglish
             ? "The context-menu 'Download' command saves straight here — no save dialog. If a file with the same name already exists, a \" (2)\" suffix is appended instead of overwriting."
             : "右键「下载」会直接保存到这里，不再弹保存对话框；同名文件自动加 “ (2)”，不会覆盖已有文件。";
+        TicketModeCheck.Content = Ui.IsEnglish
+            ? "Ctrl+C creates a transfer ticket (.erfdl) instead of copying the files"
+            : "Ctrl+C 只产出一张「传输票据」(.erfdl)，不复制文件本体";
+        TicketModeHint.Text = Ui.IsEnglish
+            ? "Remote\u2192local: Ctrl+C in a remote folder puts a small .erfdl file on the clipboard. Paste it anywhere, move it where you want the data to land, then double-click it \u2014 the download starts into the ticket's own folder. The ticket carries only an id; the file list and paths stay in the local database."
+            : "远程\u2192本地：在远程文件夹里 Ctrl+C，剪贴板上是一张小票据。粘贴到任意位置，把它**移到你想让数据落地的地方**，再双击 —— 就会下载到票据所在目录。票据里只有一个编号，文件清单与路径只存在本地数据库。";
 
         AssocHintText.Text = Ui.IsEnglish
             ? ".erfdl files are ERF transfer tickets. Double-clicking one starts the transfer into the folder where the ticket currently is. Re-register the association if it was lost (e.g. after reinstalling Explorer, another tool stole the extension, or you moved the program)."
@@ -193,6 +200,7 @@ public partial class AppSettingsWindow : Window
         Settings.FileCachePath = FileCachePathBox.Text.Trim();
         Settings.EditorPath = EditorPathBox.Text.Trim();
         Settings.DownloadDir = DownloadDirBox.Text.Trim();
+        Settings.UseTransferTicket = TicketModeCheck.IsChecked == true;
         Settings.ExplorerLanguage = (ExplorerLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.ServiceLanguage = (ServiceLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.DefaultViewMode = (DefaultViewBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "details";

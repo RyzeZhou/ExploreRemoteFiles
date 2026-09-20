@@ -16,6 +16,37 @@
 #include "ProbeLog.h"
 
 // ---------------------------------------------------------------------------
+// 「传输票据」(.erfdl) 开关：打开后 Ctrl+C 产出的"虚拟文件"是**票据**（几百字节），
+// 不再是文件载荷。双击票据（由服务解析）才会真正下载到**票据所在目录**。
+// HKCU\Software\ExplorerRemoteFs\UseTransferTicket（DWORD，缺省 0）。
+// ---------------------------------------------------------------------------
+inline BOOL ErfUseTransferTicket()
+{
+    // 每次现读（设置页勾选/取消要立刻生效，不能等重启资源管理器）。
+    DWORD v = 0, cb = sizeof(v), type = 0;
+    HKEY k = NULL;
+    if (ERROR_SUCCESS != RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", 0, KEY_READ, &k)) return FALSE;
+    BOOL on = (ERROR_SUCCESS == RegQueryValueExW(k, L"UseTransferTicket", NULL, &type, (LPBYTE)&v, &cb) &&
+               type == REG_DWORD && v != 0);
+    RegCloseKey(k);
+    return on;
+}
+
+// ── 票据（MKTICKET）桥接 ────────────────────────────────────────────────────
+// 服务登记"这次要传什么"并回 jobId；票据文本（只有 magic/version/jobId）由调用方拼，
+// 服务**不把路径写进票据**（防泄露/防篡改）。
+struct FtpTicketItem
+{
+    std::wstring remote;   // 远程全路径
+    std::wstring name;     // 名字（含扩展名）
+    ULONGLONG size;
+    DWORD mtime;
+    BOOL isFolder;
+};
+
+// （FtpBridgeMakeTicket 实现在下面、依赖管道小工具，见 FtpBridgeFetchDir 之后。）
+
+// ---------------------------------------------------------------------------
 // Shell 资源协议实验档位（2026-09-20）：HKCU\Software\ExplorerRemoteFs\ShellResourceMode
 // IShellItemResources 是**未公开协议**（SDK 无文档/样例）。Shell 的复制引擎经
 // ITransferSource::OpenItem 拿到资源对象后，可能：只要元数据、或者要枚举资源、
@@ -580,6 +611,45 @@ inline FtpBridgeFetchState FtpBridgeFetchDir(PCWSTR site, PCWSTR remoteDir, PCWS
     return FtpBridgeFetchWait(L"FETCHDIR", site, remoteDir, localRoot, batchId, response);
 }
 
+// ── 票据（MKTICKET）────────────────────────────────────────────────────────
+// 服务登记"这次要传什么"并回 jobId；票据文本（只有 magic/version/jobId）由调用方拼，
+// 服务**不把路径写进票据**（防泄露/防篡改）。放在这里是因为依赖上面的管道小工具。
+inline BOOL FtpBridgeMakeTicket(PCWSTR site, const std::vector<FtpTicketItem> &items, std::string &jobId)
+{
+    jobId.clear();
+    if (!site || !site[0] || items.empty()) return FALSE;
+    HANDLE pipe = FtpBridgeOpenPipe();
+    if (pipe == INVALID_HANDLE_VALUE)
+    {
+        ProbeLog(L"[TICKET] bridge unavailable site='%s'", site);
+        return FALSE;
+    }
+    WCHAR count[32] = {};
+    StringCchPrintfW(count, ARRAYSIZE(count), L"%u", (unsigned)items.size());
+    BOOL sent = FtpBridgeWriteLine(pipe, L"MKTICKET") && FtpBridgeWriteLine(pipe, site) && FtpBridgeWriteLine(pipe, count);
+    for (size_t i = 0; sent && i < items.size(); ++i)
+    {
+        WCHAR line[2048] = {};
+        StringCchPrintfW(line, ARRAYSIZE(line), L"%s\t%s\t%llu\t%lu\t%d",
+                         items[i].remote.c_str(), items[i].name.c_str(),
+                         (unsigned long long)items[i].size, (unsigned long)items[i].mtime,
+                         (int)items[i].isFolder);
+        sent = FtpBridgeWriteLine(pipe, line);
+    }
+    std::string reply;
+    BOOL got = sent && FtpBridgeReadReply(pipe, reply, 15000);
+    CloseHandle(pipe);
+    if (!got || reply.rfind("OK ", 0) != 0)
+    {
+        ProbeLog(L"[TICKET] MKTICKET FAILED site='%s' n=%u reply='%hs'", site, (unsigned)items.size(), reply.c_str());
+        return FALSE;
+    }
+    jobId = reply.substr(3);
+    while (!jobId.empty() && (jobId.back() == '\r' || jobId.back() == '\n')) jobId.pop_back();
+    ProbeLog(L"[TICKET] MKTICKET ok site='%s' n=%u job=%hs", site, (unsigned)items.size(), jobId.c_str());
+    return !jobId.empty();
+}
+
 // 直传流：让常驻服务把远程文件**直接**以字节写回同一个管道（DLL 的 IStream 直接读），
 // 不再落本地临时文件 —— 目标文件由 Explorer 直接写，省掉一次完整拷贝与一份磁盘占用。
 // 协议：写 FETCHSTREAM/site/remote/batchId → 回一行 `OK <jobId>`（或 `FAIL: ...`）
@@ -791,50 +861,168 @@ inline BOOL FtpMetadataCacheFile(PCWSTR site, PCWSTR path, PWSTR out, UINT cch)
     WCHAR dir[MAX_PATH] = {}; if (!FtpMetadataCacheDirectory(dir, ARRAYSIZE(dir))) return FALSE;
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\ExplorerRemoteFs-meta-%016llX.bin", dir, FtpMetadataCacheHash(site, path)));
 }
-// maxAgeMs = 0 表示不限年龄；>0 且超龄时返回 FALSE，但**绝不删文件**（见上面
+// ── 目录缓存的存储层：SQLite（2026-09-20 起）──────────────────────────────
+// 以前是"一个目录一个 .bin 文件"，散落一目录；现在统一进
+//   <MetadataCachePath>\erf-cache.db
+// 的 dir_cache 表（主键 site+path）：存取都是索引点查，快、好清理、好统计。
+// 同一张库里还有服务侧写的 tickets / ticket_items（票据记录），一个库两用。
+#include "third_party/sqlite/sqlite3.h"
+
+inline std::string FtpUtf8(PCWSTR w)
+{
+    if (!w) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (n <= 1) return std::string();
+    std::string s((size_t)n - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, NULL, NULL);
+    return s;
+}
+inline SRWLOCK &FtpDbLock() { static SRWLOCK lock = SRWLOCK_INIT; return lock; }
+
+// 懒打开、同进程共享一个连接（SQLITE_OPEN_FULLMUTEX：任意线程调用都安全）。
+// 打开/建表失败只记住失败，绝不让缓存问题拖垮 Shell 调用。
+inline sqlite3 *FtpDb()
+{
+    static sqlite3 *s_db = NULL;
+    static LONG s_state = 0;                 // 0=未尝试 1=可用 -1=失败
+    if (s_state == 1) return s_db;
+    AcquireSRWLockExclusive(&FtpDbLock());
+    if (s_state == 0)
+    {
+        s_state = -1;
+        WCHAR dir[MAX_PATH] = {}, file[MAX_PATH] = {};
+        if (FtpMetadataCacheDirectory(dir, ARRAYSIZE(dir)) &&
+            SUCCEEDED(StringCchPrintfW(file, ARRAYSIZE(file), L"%s\\erf-cache.db", dir)))
+        {
+            std::string path = FtpUtf8(file);
+            sqlite3 *db = NULL;
+            if (path.size() &&
+                sqlite3_open_v2(path.c_str(), &db,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK)
+            {
+                sqlite3_busy_timeout(db, 4000);
+                static const char kSchema[] =
+                    "PRAGMA journal_mode=WAL;"
+                    "PRAGMA synchronous=NORMAL;"
+                    "PRAGMA temp_store=MEMORY;"
+                    "CREATE TABLE IF NOT EXISTS dir_cache("
+                    "  site TEXT NOT NULL, path TEXT NOT NULL, tick INTEGER NOT NULL,"
+                    "  items BLOB NOT NULL, PRIMARY KEY(site, path));"
+                    "CREATE TABLE IF NOT EXISTS tickets("
+                    "  job_id TEXT PRIMARY KEY, created INTEGER NOT NULL, direction TEXT NOT NULL,"
+                    "  last_dest TEXT NOT NULL DEFAULT '', done_files TEXT NOT NULL DEFAULT '');"
+                    "CREATE TABLE IF NOT EXISTS ticket_items("
+                    "  job_id TEXT NOT NULL, idx INTEGER NOT NULL, site TEXT NOT NULL, remote TEXT NOT NULL,"
+                    "  name TEXT NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL,"
+                    "  is_folder INTEGER NOT NULL, PRIMARY KEY(job_id, idx));";
+                char *err = NULL;
+                if (sqlite3_exec(db, kSchema, NULL, NULL, &err) == SQLITE_OK)
+                {
+                    s_db = db; s_state = 1;
+                }
+                else
+                {
+                    ProbeLog(L"[DB] schema failed: %hs", err ? err : "?");
+                    sqlite3_free(err);
+                    sqlite3_close(db);
+                }
+            }
+            else
+            {
+                ProbeLog(L"[DB] open failed: %hs", db ? sqlite3_errmsg(db) : "");
+                if (db) sqlite3_close(db);
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&FtpDbLock());
+    return (s_state == 1) ? s_db : NULL;
+}
+
+// maxAgeMs = 0 表示不限年龄；>0 且超龄时返回 FALSE，但**绝不删行**（见上面
 // FTP_CACHE_TTL_MS 的说明：过期即删会让磁盘层永远追不上内存层）。ageMsOut 回传年龄。
 inline BOOL FtpDiskCacheLoad(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &items,
                              ULONGLONG maxAgeMs = 0, ULONGLONG *ageMsOut = NULL)
 {
     items.clear(); if (ageMsOut) *ageMsOut = 0;
-    WCHAR file[MAX_PATH] = {}; if (!FtpMetadataCacheFile(site, path, file, ARRAYSIZE(file))) return FALSE;
-    WIN32_FILE_ATTRIBUTE_DATA a = {}; if (!GetFileAttributesExW(file, GetFileExInfoStandard, &a)) return FALSE;
-    FILETIME ft = {}; GetSystemTimeAsFileTime(&ft); ULARGE_INTEGER now = {}, written = {}; now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime; written.LowPart = a.ftLastWriteTime.dwLowDateTime; written.HighPart = a.ftLastWriteTime.dwHighDateTime;
-    ULONGLONG ageMs = (now.QuadPart > written.QuadPart) ? ((now.QuadPart - written.QuadPart) / 10000ULL) : 0ULL;
-    if (ageMsOut) *ageMsOut = ageMs;
-    if (maxAgeMs && ageMs > maxAgeMs) return FALSE;
-    HANDLE f = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL); if (f == INVALID_HANDLE_VALUE) return FALSE;
-    FtpDiskCacheHeader head = {}; DWORD got = 0;
-    BOOL ok = ReadFile(f, &head, sizeof(head), &got, NULL) && got == sizeof(head) &&
-              head.magic == 0x45524653 && head.version == 2 && head.count <= 100000 &&
-              0 == StrCmp(head.site, site ? site : L"") &&
-              0 == StrCmp(head.folder, (path && path[0]) ? path : L"/");
-    if (ok && head.count) { items.resize(head.count); DWORD bytes = head.count * (DWORD)sizeof(FTPENTRY); ok = ReadFile(f, items.data(), bytes, &got, NULL) && got == bytes; }
-    CloseHandle(f);
-    if (!ok)
+    sqlite3 *db = FtpDb(); if (!db) return FALSE;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT tick, items FROM dir_cache WHERE site=?1 AND path=?2",
+                           -1, &st, NULL) != SQLITE_OK) return FALSE;
+    std::string sSite = FtpUtf8(site ? site : L"");
+    std::string sPath = FtpUtf8((path && path[0]) ? path : L"/");
+    sqlite3_bind_text(st, 1, sSite.c_str(), (int)sSite.size(), SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, sPath.c_str(), (int)sPath.size(), SQLITE_STATIC);
+    BOOL ok = FALSE, corrupt = FALSE;
+    if (sqlite3_step(st) == SQLITE_ROW)
     {
+        sqlite3_int64 tick = sqlite3_column_int64(st, 0);
+        int bytes = sqlite3_column_bytes(st, 1);
+        const void *blob = sqlite3_column_blob(st, 1);
+        FILETIME ft = {}; GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER now = {}, written = {}; now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime;
+        written.QuadPart = (ULONGLONG)tick;
+        ULONGLONG ageMs = (now.QuadPart > written.QuadPart) ? ((now.QuadPart - written.QuadPart) / 10000ULL) : 0ULL;
+        if (ageMsOut) *ageMsOut = ageMs;
+        if (bytes < 0 || (bytes % (int)sizeof(FTPENTRY)) != 0 ||
+            (bytes / (int)sizeof(FTPENTRY)) > 100000 || (bytes > 0 && !blob))
+        {
+            corrupt = TRUE;             // 坏行：删掉，让下次重新拉
+        }
+        else if (maxAgeMs && ageMs > maxAgeMs)
+        {
+            ok = FALSE;                 // 超龄：**不删**
+        }
+        else
+        {
+            if (bytes > 0)
+            {
+                items.resize((size_t)(bytes / (int)sizeof(FTPENTRY)));
+                memcpy(items.data(), blob, (size_t)bytes);
+            }
+            ok = TRUE;
+        }
+    }
+    sqlite3_finalize(st);
+    if (corrupt)
+    {
+        sqlite3_stmt *del = NULL;
+        if (sqlite3_prepare_v2(db, "DELETE FROM dir_cache WHERE site=?1 AND path=?2", -1, &del, NULL) == SQLITE_OK)
+        {
+            sqlite3_bind_text(del, 1, sSite.c_str(), (int)sSite.size(), SQLITE_STATIC);
+            sqlite3_bind_text(del, 2, sPath.c_str(), (int)sPath.size(), SQLITE_STATIC);
+            sqlite3_step(del);
+        }
+        sqlite3_finalize(del);
         items.clear();
-        // Stale v1 (case-folded era), foreign-identity or truncated file: drop
-        // it so the next load refetches. Store is atomic (temp + move), so a
-        // present-but-unreadable file is never a half-written one.
-        DeleteFileW(file);
     }
     return ok;
 }
 inline void FtpDiskCacheStore(PCWSTR site, PCWSTR path, const FTPENTRY *items, int count)
 {
-    if (count < 0 || count > 100000 || (count && !items)) return; WCHAR file[MAX_PATH] = {}, temp[MAX_PATH] = {}; if (!FtpMetadataCacheFile(site, path, file, ARRAYSIZE(file))) return;
-    if (FAILED(StringCchPrintfW(temp, ARRAYSIZE(temp), L"%s.%lu.%lu.tmp", file, GetCurrentProcessId(), GetCurrentThreadId()))) return;
-    HANDLE f = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL); if (f == INVALID_HANDLE_VALUE) return;
-    FtpDiskCacheHeader head = {}; head.magic = 0x45524653; head.version = 2; head.count = (DWORD)count;
-    StringCchCopy(head.site, ARRAYSIZE(head.site), site ? site : L"");
-    StringCchCopy(head.folder, ARRAYSIZE(head.folder), (path && path[0]) ? path : L"/");
-    DWORD wrote = 0; BOOL ok = WriteFile(f, &head, sizeof(head), &wrote, NULL) && wrote == sizeof(head);
-    if (ok && count) { DWORD bytes = (DWORD)count * (DWORD)sizeof(FTPENTRY); ok = WriteFile(f, items, bytes, &wrote, NULL) && wrote == bytes; }
-    CloseHandle(f); if (ok) MoveFileExW(temp, file, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH); DeleteFileW(temp);
+    if (count < 0 || count > 100000 || (count && !items)) return;
+    sqlite3 *db = FtpDb(); if (!db) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO dir_cache(site, path, tick, items) VALUES(?1, ?2, ?3, ?4) "
+            "ON CONFLICT(site, path) DO UPDATE SET tick=excluded.tick, items=excluded.items",
+            -1, &st, NULL) != SQLITE_OK) return;
+    FILETIME ft = {}; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER now = {}; now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime;
+    std::string sSite = FtpUtf8(site ? site : L"");
+    std::string sPath = FtpUtf8((path && path[0]) ? path : L"/");
+    sqlite3_bind_text(st, 1, sSite.c_str(), (int)sSite.size(), SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, sPath.c_str(), (int)sPath.size(), SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)now.QuadPart);
+    if (count) sqlite3_bind_blob(st, 4, items, count * (int)sizeof(FTPENTRY), SQLITE_STATIC);
+    else sqlite3_bind_zeroblob(st, 4, 0);      // 空目录也是一个有效结果
+    sqlite3_step(st);
+    sqlite3_finalize(st);
 }
 inline void FtpDiskCacheClear()
 {
+    sqlite3 *db = FtpDb();
+    if (db) sqlite3_exec(db, "DELETE FROM dir_cache", NULL, NULL, NULL);
+    // 顺带清掉旧版"一个目录一个 .bin"的遗留文件（一次性迁移）。
     WCHAR dir[MAX_PATH] = {}, pattern[MAX_PATH] = {}; if (!FtpMetadataCacheDirectory(dir, ARRAYSIZE(dir))) return;
     if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\ExplorerRemoteFs-meta-*.bin", dir))) return;
     WIN32_FIND_DATAW data = {}; HANDLE find = FindFirstFileW(pattern, &data); if (find == INVALID_HANDLE_VALUE) return;

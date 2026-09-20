@@ -1775,9 +1775,17 @@ try
                     }
                     obj->Add(m_szSiteName, m_szRemotePath, name, size, mtime, isFolder);
                 }
-                // 趁用户还在想"粘到哪儿"，后台先把选中文件夹的子树列进缓存，
-                // 免得真正粘贴时在 UI 线程上同步拉整棵树（见 CRemoteDataObject::Prewarm）。
-                obj->Prewarm();
+                // 票据模式：Ctrl+C 只产出一张 .erfdl（几百字节），真正下载等双击票据时才开始。
+                if (ErfUseTransferTicket() && obj->ConvertToTicket(m_szSiteName))
+                {
+                    ProbeLog(L"[DATAOBJ] ticket mode: served .erfdl instead of payload");
+                }
+                else
+                {
+                    // 趁用户还在想"粘到哪儿"，后台先把选中文件夹的子树列进缓存，
+                    // 免得真正粘贴时在 UI 线程上同步拉整棵树（见 CRemoteDataObject::Prewarm）。
+                    obj->Prewarm();
+                }
                 hr = SHCreateDataObject(m_pidl, cidl, apidl, inner, riid, ppv);
                 inner->Release();
                 ProbeLog(L"[DATAOBJ] attached inner cidl=%u site='%s' path='%s' hr=0x%08X probe=%d",

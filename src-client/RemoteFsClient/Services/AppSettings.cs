@@ -30,6 +30,10 @@ public sealed class AppSettings
     /// 与扩展 DLL 读的是**同一个注册表值**：HKCU\Software\ExplorerRemoteFs\DownloadDir。</summary>
     public string DownloadDir { get; set; } = DefaultDownloadDir;
 
+    /// <summary>Ctrl+C 产出「传输票据」(.erfdl) 而不是文件载荷 —— 双击票据才真正下载到
+    /// 票据所在目录。与扩展 DLL 读的是同一个注册表值：UseTransferTicket（DWORD）。</summary>
+    public bool UseTransferTicket { get; set; }
+
     public static string DefaultMetadataCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "MetadataCache");
     public static string DefaultFileCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "FileCache");
     public static string DefaultDownloadDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
@@ -51,6 +55,7 @@ public sealed class AppSettings
                 SizeFormat = NormalizeSizeFormat(key?.GetValue("SizeFormat") as string),
                 Terminal = NormalizeTerminal(key?.GetValue("Terminal") as string),
                 DownloadDir = NormalizeDirectory(key?.GetValue("DownloadDir") as string, DefaultDownloadDir),
+                UseTransferTicket = Convert.ToInt32(key?.GetValue("UseTransferTicket") ?? 0) != 0,
             };
         }
         catch { return new AppSettings(); }
@@ -74,6 +79,7 @@ public sealed class AppSettings
         key.SetValue("Terminal", NormalizeTerminal(Terminal), RegistryValueKind.String);
         DownloadDir = NormalizeDirectory(DownloadDir, DefaultDownloadDir); Directory.CreateDirectory(DownloadDir);
         key.SetValue("DownloadDir", DownloadDir, RegistryValueKind.String);
+        key.SetValue("UseTransferTicket", UseTransferTicket ? 1 : 0, RegistryValueKind.DWord);
     }
 
     public static string NormalizeDirectory(string? path, string fallback)

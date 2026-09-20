@@ -187,6 +187,17 @@ Root: HKCU; Subkey: "Software\Classes\RemoteFsFileType\shellex\PropertySheetHand
 Root: HKCU; Subkey: "Software\Classes\RemoteFsFileType\shell\open\command"; ValueType: string; ValueName: ""; \
     ValueData: """{app}\cli\ExplorerRemoteFs.Cli.exe"" open ""%1"""; Flags: uninsdeletekey
 
+; ── 传输票据 .erfdl（双击→常驻服务解析并把任务下载到票据所在目录）───────────
+;   票据里只有 magic/version/jobId；文件清单与目标只存在服务侧 —— 见 TransferTicketService。
+Root: HKCU; Subkey: "Software\Classes\.erfdl"; ValueType: string; ValueName: ""; \
+    ValueData: "ERF.TransferTicket"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\ERF.TransferTicket"; ValueType: string; ValueName: ""; \
+    ValueData: "{#AppShortName} 传输票据"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\ERF.TransferTicket\DefaultIcon"; ValueType: string; ValueName: ""; \
+    ValueData: "{app}\client\RemoteFsClient.exe,0"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\ERF.TransferTicket\shell\open\command"; ValueType: string; ValueName: ""; \
+    ValueData: """{app}\client\RemoteFsClient.exe"" --open-ticket ""%1"""; Flags: uninsdeletekey
+
 ; ── 导航窗格里的入口 + 隐藏它自己的桌面图标 ───────────────────────────────
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{#NsFolderClsid}"; \
     ValueType: string; ValueName: ""; ValueData: "{#AppShortName}"; Flags: uninsdeletekey
