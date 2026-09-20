@@ -644,6 +644,10 @@ public:
         std::vector<Item> items;
         std::vector<CFolderFetch *> fetches;
         BOOL cold = FALSE;
+        // 2026-09-20 探针：量化"源端复制冻结"——展开发生在哪个线程、遍历多少目录、
+        // 其中多少目录必须走同步网络列举、总共耗时多久（对比 UI 线程 id 即可判断）。
+        const ULONGLONG t0 = GetTickCount64();
+        UINT dirs = 0, coldDirs = 0;
         for (size_t i = 0; i < _tops.size(); i++)
         {
             CFolderFetch *fetch = nullptr;
@@ -655,7 +659,7 @@ public:
                 fetch = new (std::nothrow) CFolderFetch(_tops[i].site.c_str(), full.c_str());
                 if (fetch) fetches.push_back(fetch);
             }
-            ExpandInto(items, cold, _tops[i], fetch, cacheOnly);
+            ExpandInto(items, cold, _tops[i], fetch, cacheOnly, dirs, coldDirs);
         }
         if (cold)
         {
@@ -663,6 +667,9 @@ public:
             // pointers before releasing, so nothing can dereference them later.
             for (size_t i = 0; i < items.size(); i++) items[i].fetch = nullptr;
             for (size_t i = 0; i < fetches.size(); i++) fetches[i]->Release();
+            ProbeLog(L"[DATAOBJ] expand COLD cacheOnly=%d tid=%lu dirs=%u coldDirs=%u items=%u elapsedMs=%llu",
+                     (int)cacheOnly, GetCurrentThreadId(), dirs, coldDirs, (UINT)items.size(),
+                     GetTickCount64() - t0);
             return FALSE;
         }
         if (items.size() >= kMaxItems)
@@ -677,13 +684,17 @@ public:
             for (size_t i = 0; i < fetches.size(); i++) fetches[i]->Release();
             ProbeLog(L"[DATAOBJ] tree hits cap=%u -> refuse (would silently copy a partial tree)",
                      (UINT)kMaxItems);
+            ProbeLog(L"[DATAOBJ] expand CAP cacheOnly=%d tid=%lu dirs=%u coldDirs=%u items=%u elapsedMs=%llu",
+                     (int)cacheOnly, GetCurrentThreadId(), dirs, coldDirs, (UINT)items.size(),
+                     GetTickCount64() - t0);
             return FALSE;
         }
         _items.swap(items);
         for (size_t i = 0; i < fetches.size(); i++) _fetches.push_back(fetches[i]);
         _expanded = TRUE;
-        ProbeLog(L"[DATAOBJ] expanded tops=%u items=%u cacheOnly=%d", (UINT)_tops.size(),
-                 (UINT)_items.size(), (int)cacheOnly);
+        ProbeLog(L"[DATAOBJ] expand done cacheOnly=%d tid=%lu tops=%u dirs=%u coldDirs=%u items=%u elapsedMs=%llu",
+                 (int)cacheOnly, GetCurrentThreadId(), (UINT)_tops.size(), dirs, coldDirs,
+                 (UINT)_items.size(), GetTickCount64() - t0);
         return TRUE;
     }
 
@@ -710,13 +721,15 @@ public:
         ProbeLog(L"[DATAOBJ] listing fetch failed -> refuse formats tops=%u", (UINT)_tops.size());
     }
 
-    void ExpandInto(std::vector<Item> &out, BOOL &cold, const Item &dir, CFolderFetch *fetch, BOOL cacheOnly)
+    void ExpandInto(std::vector<Item> &out, BOOL &cold, const Item &dir, CFolderFetch *fetch, BOOL cacheOnly,
+                    UINT &dirs, UINT &coldDirs)
     {
         if (out.size() >= kMaxItems) return;     // capped, but still a valid tree
         Item it = dir;
         it.fetch = fetch;
         out.push_back(it);
         if (!dir.isFolder) return;
+        ++dirs;
 
         std::wstring full = dir.folder;
         if (!full.empty() && full[full.size() - 1] != L'/') full += L'/';
@@ -728,6 +741,7 @@ public:
         if (!have)
         {
             cold = TRUE;
+            ++coldDirs;
             if (cacheOnly) FtpPrefetchQuiet(dir.site.c_str(), full.c_str());
             ProbeLog(L"[DATAOBJ] %s '%s'", cacheOnly ? L"cold" : L"list failed", full.c_str());
             return;
@@ -744,7 +758,7 @@ public:
             it2.mtime = kids[k].dwMtime;
             it2.isFolder = kids[k].fIsFolder;
             it2.fetch = fetch;       // inherit the folder's fetch context
-            ExpandInto(out, cold, it2, fetch, cacheOnly);
+            ExpandInto(out, cold, it2, fetch, cacheOnly, dirs, coldDirs);
         }
     }
 
@@ -767,8 +781,8 @@ public:
         // Probe only the descriptor query (lindex == -1); per-file contents
         // queries (lindex >= 0) would storm the log during a copy.
         if (fmt->lindex < 0)
-            ProbeLog(L"[DATAOBJ] GetData enter fmt=0x%04X suppressed=%d",
-                     (UINT)fmt->cfFormat, (int)BeingProbed());
+            ProbeLog(L"[DATAOBJ] GetData enter fmt=0x%04X suppressed=%d tid=%lu",
+                     (UINT)fmt->cfFormat, (int)BeingProbed(), GetCurrentThreadId());
         ExpandIfNeeded();
         if (!_expanded) return DV_E_FORMATETC;   // cold tree while the shell probes us
 
