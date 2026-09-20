@@ -253,6 +253,23 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"SFTP get: {remotePath} -> {localPath}");
     }
 
+    /// <summary>直传流：把远程文件**直接**写进给定的输出流（服务侧往命名管道里吐，
+    /// 不再落本地临时文件）。目标文件由 Explorer 直接写 —— 省掉一次完整拷贝和一份磁盘占用。</summary>
+    public void DownloadToStream(string remotePath, Stream output, Action<long, long>? progress = null,
+                                 CancellationToken token = default)
+    {
+        token.ThrowIfCancellationRequested();
+        EnsureConnected();
+        if (_client is null) return;
+        long total = 0;
+        try { total = _client.GetAttributes(remotePath).Size; } catch { }
+        IProgress<DownloadFileProgressReport>? reporter = progress is null
+            ? null
+            : new SafeProgress<DownloadFileProgressReport>(r => progress((long)r.TotalBytesDownloaded, total));
+        _client.DownloadFileAsync(remotePath, output, reporter, token).GetAwaiter().GetResult();
+        Utils.ShellLog.Write($"SFTP stream: {remotePath}");
+    }
+
     public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false,
                        CancellationToken token = default, Action? waitWhilePaused = null)
     {

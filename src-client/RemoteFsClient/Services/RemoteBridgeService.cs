@@ -47,7 +47,7 @@ public sealed class RemoteBridgeService : IDisposable
                 // Explorer may ask for the target directory and its item data in
                 // parallel. Keep several pipe instances available; backend I/O is
                 // still serialized below because a provider session is not thread-safe.
-                await using var pipe = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 4,
+                await using var pipe = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 8,
                     PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                 await pipe.WaitForConnectionAsync(token);
                 await HandleRequestAsync(pipe, token);
@@ -230,6 +230,34 @@ public sealed class RemoteBridgeService : IDisposable
             }
             var putJob = StartFetchJob(putSite, putRemote, putLocal, putBatch ?? string.Empty, isDir: false, isPut: true);
             await writer.WriteLineAsync("STARTED " + putJob.Id);
+            return;
+        }
+
+        // FETCHSTREAM：把远程文件**直接以字节流**回给调用方（DLL 的 IStream），
+        // 不再落 %TEMP% 临时文件 —— 目标文件由 Explorer 直接写，省掉一次完整拷贝
+        // 和一份磁盘占用，失败/取消时半成品由 Explorer 自己删（等价 .part 语义）。
+        // 协议：写 FETCHSTREAM/site/remote/batchId → 回一行 `OK <jobId>` → 随后同一
+        // 管道上就是原始字节，直到服务关闭管道；失败在开头回 `FAIL: ...`。
+        if (string.Equals(operation, "FETCHSTREAM", StringComparison.Ordinal))
+        {
+            string? stSite = await reader.ReadLineAsync(token);
+            string? stRemote = await reader.ReadLineAsync(token);
+            string? stBatch = await reader.ReadLineAsync(token);
+            if (string.IsNullOrWhiteSpace(stSite) || string.IsNullOrWhiteSpace(stRemote))
+            {
+                await writer.WriteLineAsync("FAIL: invalid fetchstream request");
+                return;
+            }
+            var stJob = new FetchJob
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Site = stSite!, Remote = stRemote!, Local = "", BatchId = stBatch ?? string.Empty,
+            };
+            _fetchJobs[stJob.Id] = stJob;
+            await writer.WriteLineAsync("OK " + stJob.Id);
+            Log($"stream start id='{stJob.Id}' site='{stSite}' remote='{stRemote}' batch='{stBatch}'");
+            await StreamFetchAsync(stJob, stream);
+            _ = Task.Delay(TimeSpan.FromMinutes(5)).ContinueWith(t => _fetchJobs.TryRemove(stJob.Id, out var _));
             return;
         }
 
@@ -549,6 +577,63 @@ public sealed class RemoteBridgeService : IDisposable
             bool cleaned = DeleteIncompleteFetchOutput(localPath);
             Log($"fetch failed id='{job.Id}' site='{siteName}' remote='{remotePath}' temp='{localPath}' cleaned={cleaned} bytes={job.Done}/{job.Total} free={AvailableBytes(localPath)} batch='{batchId}' exception='{SanitizeBridgeError(ex.ToString())}'");
             return new(FetchJobState.Failed, message);
+        }
+    }
+
+    /// <summary>直传流：把远程文件**直接**写进调用方的流（命名管道），不落本地临时文件。
+    /// 暂停/取消都作用在这条流上；调用方关掉管道即视为取消。</summary>
+    private async Task StreamFetchAsync(FetchJob job, Stream output)
+    {
+        var siteName = job.Site; var remotePath = job.Remote; var batchId = job.BatchId;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, job.Cts.Token);
+        TransferTask? task = null;
+        try
+        {
+            cancellation.Token.ThrowIfCancellationRequested();
+            var connection = FindConnection(siteName);
+            var remote = NormalizeRemotePath(remotePath);
+            var fileName = System.IO.Path.GetFileName(remote);
+            task = _transfers?.BeginManagedTask("download", siteName, fileName, remote,
+                () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }), batchId);
+            using var fs = ProviderFactory.Create(connection);
+            await Task.Run(() =>
+            {
+                cancellation.Token.ThrowIfCancellationRequested();
+                fs.EnsureConnected();
+                cancellation.Token.ThrowIfCancellationRequested();
+                fs.DownloadToStream(remote, output, (done, total) =>
+                {
+                    job.Done = done; job.Total = total;
+                    if (task is not null)
+                    {
+                        _transfers?.WaitWhilePaused(task, cancellation.Token);
+                        _transfers?.UpdateManagedTask(task, done, total, fileName);
+                    }
+                }, cancellation.Token);
+            }, cancellation.Token);
+            Volatile.Write(ref job.State, (int)FetchJobState.Done);
+            if (task is not null) _transfers?.CompleteManagedTask(task, true, null);
+            Log($"stream done id='{job.Id}' site='{siteName}' remote='{remote}' bytes={job.Done} batch='{batchId}'");
+        }
+        catch (Exception ex)
+        {
+            // 调用方关掉管道（用户取消/放弃）也是取消：IOException / 断管 / OCE。
+            bool cancelled = cancellation.IsCancellationRequested || ex is IOException ||
+                             ex.InnerException is IOException || ex is OperationCanceledException;
+            if (cancelled)
+            {
+                Volatile.Write(ref job.State, (int)FetchJobState.Cancelled);
+                if (task is not null) _transfers?.CompleteManagedTask(task, false, null, cancelled: true);
+                Log($"stream cancelled id='{job.Id}' site='{siteName}' remote='{remotePath}' bytes={job.Done} batch='{batchId}'");
+            }
+            else
+            {
+                string message = SanitizeBridgeError(ex.Message);
+                job.Message = message;
+                Volatile.Write(ref job.State, (int)FetchJobState.Failed);
+                if (task is not null) _transfers?.CompleteManagedTask(task, false, message);
+                Log($"stream failed id='{job.Id}' site='{siteName}' remote='{remotePath}' bytes={job.Done} exception='{SanitizeBridgeError(ex.ToString())}'");
+            }
         }
     }
 

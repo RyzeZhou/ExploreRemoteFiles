@@ -211,6 +211,22 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"FTP get: {remotePath} -> {localPath}");
     }
 
+    /// <summary>直传流：把远程文件直接写进给定输出流（服务侧往命名管道吐，不落本地文件）。</summary>
+    public void DownloadToStream(string remotePath, Stream output, Action<long, long>? progress = null,
+                                 CancellationToken token = default)
+    {
+        token.ThrowIfCancellationRequested();
+        EnsureConnected();
+        if (_client is null) return;
+        Action<FtpProgress>? fp = null;
+        if (progress is not null || token.CanBeCanceled)
+            fp = p => { token.ThrowIfCancellationRequested(); progress?.Invoke(p.TransferredBytes, 0); };
+        // FluentFTP 53：DownloadStream 返回 bool（true = 成功）。
+        if (!_client.DownloadStream(output, remotePath, 0, fp, 0))
+            throw new InvalidOperationException($"FTP stream download failed: {remotePath}");
+        Utils.ShellLog.Write($"FTP stream: {remotePath}");
+    }
+
     public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false,
                        CancellationToken token = default, Action? waitWhilePaused = null)
     {

@@ -580,6 +580,61 @@ inline FtpBridgeFetchState FtpBridgeFetchDir(PCWSTR site, PCWSTR remoteDir, PCWS
     return FtpBridgeFetchWait(L"FETCHDIR", site, remoteDir, localRoot, batchId, response);
 }
 
+// 直传流：让常驻服务把远程文件**直接**以字节写回同一个管道（DLL 的 IStream 直接读），
+// 不再落本地临时文件 —— 目标文件由 Explorer 直接写，省掉一次完整拷贝与一份磁盘占用。
+// 协议：写 FETCHSTREAM/site/remote/batchId → 回一行 `OK <jobId>`（或 `FAIL: ...`）
+// → 之后管道上就是原始字节，直到服务关闭管道。
+// 注意：**头一行必须逐字节读** —— 用 FtpBridgeReadReply 会一次读 512 字节，
+// 把紧随其后的文件数据一起吞掉。
+inline BOOL FtpBridgeStreamStart(PCWSTR site, PCWSTR remote, PCWSTR batchId,
+                                 HANDLE &pipeOut, std::string &jobId, std::string &error)
+{
+    pipeOut = INVALID_HANDLE_VALUE;
+    jobId.clear();
+    error.clear();
+    HANDLE pipe = FtpBridgeOpenPipe();
+    if (pipe == INVALID_HANDLE_VALUE)
+    {
+        error = "bridge unavailable";
+        ProbeLog(L"[DL] stream: bridge unavailable site='%s'", site ? site : L"");
+        return FALSE;
+    }
+    BOOL sent = FtpBridgeWriteLine(pipe, L"FETCHSTREAM") &&
+                FtpBridgeWriteLine(pipe, site ? site : L"") &&
+                FtpBridgeWriteLine(pipe, remote ? remote : L"") &&
+                FtpBridgeWriteLine(pipe, (batchId && batchId[0]) ? batchId : L"-");
+    if (!sent)
+    {
+        error = "write failed";
+        CloseHandle(pipe);
+        return FALSE;
+    }
+    std::string line;
+    const ULONGLONG deadline = GetTickCount64() + 60000;
+    while (GetTickCount64() < deadline && line.size() < 256)
+    {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) break;   // 服务关了连接
+        if (avail == 0) { Sleep(10); continue; }
+        char c = 0; DWORD got = 0;
+        if (!ReadFile(pipe, &c, 1, &got, NULL) || got != 1) break;
+        if (c == '\n') break;
+        if (c != '\r') line.push_back(c);
+    }
+    if (line.rfind("OK ", 0) != 0)
+    {
+        error = line.empty() ? "no reply" : line;
+        ProbeLog(L"[DL] stream start FAILED site='%s' remote='%s' reply='%hs'",
+                 site ? site : L"", remote ? remote : L"", line.c_str());
+        CloseHandle(pipe);
+        return FALSE;
+    }
+    jobId = line.substr(3);
+    pipeOut = pipe;
+    ProbeLog(L"[DL] stream start ok site='%s' remote='%s' job=%hs", site ? site : L"", remote ? remote : L"", jobId.c_str());
+    return TRUE;
+}
+
 // 上传：把本地文件送到远程（粘贴 / 编辑回写 / 跨站点复制的上传段）。
 // 与 FETCH 走完全相同的"发起 + 轮询 + 取消"链路，只是 op 为 PUT；
 // 目标远程路径 = remote，本地源文件 = local。

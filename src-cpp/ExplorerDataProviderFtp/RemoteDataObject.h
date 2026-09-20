@@ -115,23 +115,13 @@ public:
     {
         LONG n = InterlockedDecrement(&_ref);
         if (n == 0)
-        {            // CFSTR_FILECONTENTS is prefetched before the first byte reaches the
-            // copy engine. _pos == 0 and _done == TRUE therefore do NOT mean the
-            // download completed. A released stream after FETCH began is Explorer's
-            // cancellation signal and must stop the resident service job.
-            // 只有"**一个字节都没交出去**"的流在释放时才算取消信号：否则 Shell 只是
-            // 用完释放（或 sniff 流提前释放），一发 CANCEL 会把**整批**（含正在跑的正主）
-            // 一起取消 —— 实测表现为队列里两条任务、然后"磁盘操作失败"。
-            if (_fetchStarted && !_jobDone && !_cancelled && !_cancelRequested &&
-                !_batchId.empty() && _pos == 0)
+        {            // 直传流：关掉管道即取消/放弃**这一个**文件的服务端任务（每流一个 job，
+            // 不会像按 batch 取消那样连坐同批其它文件）。
+            if (_fetchStarted && !_jobDone && _pipe != INVALID_HANDLE_VALUE)
             {
-                _cancelRequested = TRUE;
-                ProbeLog(L"[DL] cancel requested by stream release batch='%s' remote='%s' pos=%llu",
-                         _batchId.c_str(), _remote.c_str(), (unsigned long long)_pos);
-                std::string reply;
-                BOOL confirmed = FtpBridgeCancel(_batchId.c_str(), reply);
-                ProbeLog(L"[DL] cancel request confirmed=%d batch='%s' reply='%hs'",
-                         (int)confirmed, _batchId.c_str(), reply.c_str());
+                ProbeLog(L"[DL] stream release -> close pipe remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
+                CloseHandle(_pipe);
+                _pipe = INVALID_HANDLE_VALUE;
             }
             delete this;
         }
@@ -164,56 +154,56 @@ public:
             return STG_E_READFAULT;
         }
 
-        // 边下边读：等到"这次要读的那一段"已经落盘（或任务终态）。
+        // 直传流：等管道里有数据（或管道关闭）。
         const ULONGLONG tWait = GetTickCount64();
+        DWORD avail = 0;
         for (;;)
         {
-            if (_pos < OnDiskSize()) break;
+            if (!PeekNamedPipe(_pipe, NULL, 0, NULL, &avail, NULL)) { avail = 0; break; }  // 管道已关
+            if (avail > 0) break;
             if (ReleasedByShell())
             {
-                ProbeLog(L"[DL] Read aborted: stream released remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
+                ProbeLog(L"[DL] stream Read aborted: released remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
                 return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-            }
-            if (PollJobTerminal())
-            {
-                if (_pos < OnDiskSize()) break;
-                if (_cancelled)
-                {
-                    ProbeLog(L"[DL] Read cancelled mid-stream site='%s' remote='%s' pos=%llu",
-                             _site.c_str(), _remote.c_str(), (unsigned long long)_pos);
-                    return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-                }
-                if (_jobFailed && _pos == 0) return STG_E_READFAULT;
-                break;   // 正常结束 → 下面 ReadFile 返回 EOF
             }
             PumpMessages();   // 让复制对话框保持响应（否则暂停时表现为"无响应"）
             Sleep(20);
         }
 
-        ULONGLONG avail = OnDiskSize();
-        if (_pos >= avail) { if (pcbRead) *pcbRead = 0; return S_FALSE; }   // EOF
-        ULONGLONG canRead = avail - _pos;
-        if ((ULONGLONG)cb > canRead) cb = (ULONG)canRead;
-
         DWORD got = 0;
-        if (!ReadFile(_h, pv, cb, &got, NULL))
+        ULONG want = ((ULONGLONG)cb > (ULONGLONG)avail) ? avail : cb;
+        if (want > 0 && !ReadFile(_pipe, pv, want, &got, NULL)) got = 0;
+        if (got == 0)
         {
-            ProbeLog(L"[DL] ReadFile failed cb=%lu err=%lu local='%s'",
-                     (unsigned long)cb, (unsigned long)GetLastError(), _local.c_str());
-            return STG_E_READFAULT;
+            // 管道关闭：正常 EOF，或服务侧失败/取消 —— 用 FETCHSTATUS 判定。
+            PollJobTerminal();
+            if (_cancelled)
+            {
+                ProbeLog(L"[DL] stream Read cancelled remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
+                return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+            }
+            if (_jobFailed)
+            {
+                ProbeLog(L"[DL] stream Read FAILED remote='%s' pos=%llu", _remote.c_str(), (unsigned long long)_pos);
+                return STG_E_READFAULT;
+            }
+            ProbeLog(L"[DL] stream Read EOF remote='%s' pos=%llu size=%llu", _remote.c_str(),
+                     (unsigned long long)_pos, (unsigned long long)_size);
+            if (pcbRead) *pcbRead = 0;
+            return S_FALSE;
         }
         ULONGLONG waited = GetTickCount64() - tWait;
         ++_readCount;
         if (!_loggedFirstRead || waited >= 500 || _readCount <= 5)
         {
             _loggedFirstRead = TRUE;
-            ProbeLog(L"[DL] Read tid=%lu n=%d cb=%lu got=%lu pos=%llu onDisk=%llu waitedMs=%llu local='%s'",
+            ProbeLog(L"[DL] stream Read tid=%lu n=%d cb=%lu got=%lu pos=%llu avail=%lu waitedMs=%llu remote='%s'",
                      GetCurrentThreadId(), _readCount, (unsigned long)cb, (unsigned long)got,
-                     (unsigned long long)_pos, (unsigned long long)avail, waited, _local.c_str());
+                     (unsigned long long)_pos, (unsigned long)avail, waited, _remote.c_str());
         }
         if (pcbRead) *pcbRead = got;
         _pos += got;
-        return got == 0 ? S_FALSE : S_OK;
+        return S_OK;
     }
     STDMETHODIMP Write(const void *, ULONG, ULONG *) override { return STG_E_ACCESSDENIED; }
 
@@ -221,9 +211,21 @@ public:
     {
         RefGuard guard(this);
         if (!Ensure()) return _cancelled ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : STG_E_READFAULT;
-        LARGE_INTEGER zero = {};
-        if (!SetFilePointerEx(_h, move, &zero, origin)) return STG_E_INVALIDFUNCTION;
-        _pos = (ULONGLONG)zero.QuadPart;
+        ULONGLONG target;
+        if (origin == STREAM_SEEK_SET)      target = (ULONGLONG)move.QuadPart;
+        else if (origin == STREAM_SEEK_CUR) target = _pos + (ULONGLONG)move.QuadPart;
+        else if (origin == STREAM_SEEK_END) target = _size + (ULONGLONG)move.QuadPart;
+        else return STG_E_INVALIDFUNCTION;
+        if (target < _pos) return STG_E_INVALIDFUNCTION;   // 直传流只能向前（复制场景不会回退）
+        while (_pos < target)                              // 向前跳过：丢弃中间字节
+        {
+            char scratch[65536];
+            ULONG want = (ULONG)((target - _pos) > sizeof(scratch) ? sizeof(scratch) : (target - _pos));
+            ULONG got = 0;
+            HRESULT hr = Read(scratch, want, &got);
+            if (FAILED(hr)) return hr;
+            if (got == 0) break;
+        }
         if (newPos) newPos->QuadPart = _pos;
         return S_OK;
     }
@@ -272,114 +274,31 @@ public:
 private:
     ~CRemoteStream()
     {
+        if (_pipe != INVALID_HANDLE_VALUE) CloseHandle(_pipe);
         if (_h != INVALID_HANDLE_VALUE) CloseHandle(_h);
         if (!_local.empty()) DeleteFileW(_local.c_str());
     }
 
     BOOL Ensure()
     {
-        if (_done) return _h != INVALID_HANDLE_VALUE;
-        if (_cancelled || _cancelRequested) return FALSE; // cancellation is terminal; never retry it
+        if (_done) return _pipe != INVALID_HANDLE_VALUE;
+        if (_cancelled || _cancelRequested) return FALSE;   // 取消是终态，不重试
         _done = TRUE;
         _fetchStarted = TRUE;
-        WCHAR tmp[MAX_PATH] = {}, dir[MAX_PATH] = {};
-        if (!GetTempPathW(ARRAYSIZE(tmp), tmp)) return FALSE;
-        StringCchCopyW(dir, ARRAYSIZE(dir), tmp);
-        StringCchCatW(dir, ARRAYSIZE(dir), L"rfs-dataobj");
-        CreateDirectoryW(dir, NULL);
-        static LONG s_seq = 0;
-        LONG seq = InterlockedIncrement(&s_seq);
-        WCHAR name[MAX_PATH] = {};
-        StringCchPrintfW(name, ARRAYSIZE(name), L"%s\\%u_%ld_%s", dir, GetCurrentProcessId(), seq,
-                         PathFindFileNameW(_remote.c_str()));
-        _local = name;
-        DeleteFileW(_local.c_str());
-        ULARGE_INTEGER freeBytes = {};
-        BOOL hasFreeBytes = GetDiskFreeSpaceExW(dir, &freeBytes, NULL, NULL);
-        ProbeLog(L"[DL] Ensure start tid=%lu site='%s' remote='%s' size=%llu free=%llu has_free=%d -> '%s' batch='%s'",
-                 GetCurrentThreadId(), _site.c_str(), _remote.c_str(), (unsigned long long)_size,
-                 (unsigned long long)freeBytes.QuadPart, (int)hasFreeBytes, _local.c_str(), _batchId.c_str());
-        const ULONGLONG tEnsure = GetTickCount64();
-
-        // 边下边读：只**发起** FETCH（不等它下完），等本地文件开始有数据就返回；
-        // 之后 Read() 再按需等待更多字节。这样第一次 Read 不再被"整个文件下完"卡住
-        // —— 之前实测 6 GB 文件在调用线程上干等 10.5 s，就是这里。
-        if (!FtpBridgeFetchStart(L"FETCH", _site.c_str(), _remote.c_str(), _local.c_str(), _batchId.c_str(), _jobId))
+        const ULONGLONG t0 = GetTickCount64();
+        ProbeLog(L"[DL] stream Ensure start tid=%lu site='%s' remote='%s' size=%llu batch='%s'",
+                 GetCurrentThreadId(), _site.c_str(), _remote.c_str(), (unsigned long long)_size, _batchId.c_str());
+        std::string err;
+        if (!FtpBridgeStreamStart(_site.c_str(), _remote.c_str(), _batchId.c_str(), _pipe, _jobId, err))
         {
-            ProbeLog(L"[DL] Ensure FAILED: cannot start fetch site='%s' remote='%s' batch='%s'",
-                     _site.c_str(), _remote.c_str(), _batchId.c_str());
-            DeleteFileW(_local.c_str());
-            _local.clear();
+            ProbeLog(L"[DL] stream Ensure FAILED remote='%s' err='%hs'", _remote.c_str(), err.c_str());
             _done = FALSE;
             return FALSE;
         }
         _jobDone = FALSE;
         _jobFailed = FALSE;
-        ProbeLog(L"[DL] ensure started job=%hs remote='%s' batch='%s'", _jobId.c_str(), _remote.c_str(), _batchId.c_str());
-
-        const ULONGLONG deadline = tEnsure + 120000;   // 最多等 2 分钟开始出数据
-        for (;;)
-        {
-            WIN32_FILE_ATTRIBUTE_DATA fa = {};
-            if (GetFileAttributesExW(_local.c_str(), GetFileExInfoStandard, &fa)) break;
-            if (PollJobTerminal()) break;
-            if (GetTickCount64() > deadline) break;
-            if (ReleasedByShell()) break;
-            PumpMessages();
-            Sleep(20);
-        }
-        if (ReleasedByShell())
-        {
-            _cancelled = TRUE;
-            ProbeLog(L"[DL] ensure aborted: stream released remote='%s'", _remote.c_str());
-            DeleteFileW(_local.c_str());
-            _local.clear();
-            return FALSE;
-        }
-        // 打开本地临时文件：允许共享读/写/删（写方可能还在写、失败时会被删）。
-        // 若写方以独占方式打开（例如 FTP 后端），会持续 ERROR_SHARING_VIOLATION(32)：
-        // 这时**不立刻失败**，等它写完再开 —— 该路退化成"下完再读"，但不会误报磁盘错误。
-        const ULONGLONG openDeadline = GetTickCount64() + 120000;
-        for (;;)
-        {
-            _h = CreateFileW(_local.c_str(), GENERIC_READ,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-            if (_h != INVALID_HANDLE_VALUE) break;
-            DWORD err = GetLastError();
-            if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION)
-            {
-                ProbeLog(L"[DL] Ensure FAILED: cannot open local '%s' err=%lu cancelled=%d failed=%d",
-                         _local.c_str(), (unsigned long)err, (int)_cancelled, (int)_jobFailed);
-                DeleteFileW(_local.c_str());
-                _local.clear();
-                if (!_cancelled) _done = FALSE;    // 普通失败可重试；取消是终态
-                return FALSE;
-            }
-            if (GetTickCount64() > openDeadline)
-            {
-                ProbeLog(L"[DL] Ensure FAILED: open timed out (sharing) '%s'", _local.c_str());
-                DeleteFileW(_local.c_str());
-                _local.clear();
-                if (!_cancelled) _done = FALSE;
-                return FALSE;
-            }
-            PollJobTerminal();   // 顺便刷新终态（失败/取消时 Read 据此收尾）
-            if (ReleasedByShell())
-            {
-                _cancelled = TRUE;
-                ProbeLog(L"[DL] ensure aborted (sharing wait): stream released '%s'", _local.c_str());
-                DeleteFileW(_local.c_str());
-                _local.clear();
-                return FALSE;
-            }
-            PumpMessages();
-            Sleep(20);
-        }
-        _downloadReady = TRUE;
-        ProbeLog(L"[DL] ensure opened tid=%lu elapsedMs=%llu local='%s' size_on_disk=%llu expected=%llu",
-                 GetCurrentThreadId(), GetTickCount64() - tEnsure, _local.c_str(),
-                 (unsigned long long)OnDiskSize(), (unsigned long long)_size);
+        ProbeLog(L"[DL] stream Ensure ok tid=%lu elapsedMs=%llu job=%hs remote='%s'",
+                 GetCurrentThreadId(), GetTickCount64() - t0, _jobId.c_str(), _remote.c_str());
         return TRUE;
     }
 
@@ -411,6 +330,7 @@ private:
     std::wstring _batchId;
     ULONGLONG _size, _pos;
     HANDLE _h;
+    HANDLE _pipe = INVALID_HANDLE_VALUE;   // 直传流：服务端 FETCHSTREAM 的管道句柄
     BOOL _done;                 // Ensure has begun; not equivalent to a completed download
     BOOL _fetchStarted;         // a FETCH job exists and can be cancelled by stream release
     BOOL _downloadReady;        // local file opened successfully

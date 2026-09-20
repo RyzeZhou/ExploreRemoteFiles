@@ -39,6 +39,13 @@ public interface IRemoteFileSystem : IDisposable
     void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false,
                   CancellationToken token = default);
 
+    /// <summary>把远程文件**直接**写进给定的输出流（不落本地临时文件）。
+    /// progress(已传字节, 总字节) 可选；token 取消时尽快中断。
+    /// 服务侧的"直传流"（Service → 命名管道 → DLL 的 IStream）靠它 ——
+    /// 目标文件由 Explorer 直接写，省掉一次完整拷贝和一份磁盘占用。</summary>
+    void DownloadToStream(string remotePath, Stream output, Action<long, long>? progress = null,
+                          CancellationToken token = default);
+
     /// <summary>上传本地文件到远程路径。progress(已传字节, 总字节) 可选；resume 时从断点续传。
     /// token 取消时实现必须**尽快中断**上传（服务侧的传输队列靠它取消）。
     /// waitWhilePaused：每次从本地流读一块之前调用一次，用于**安全地暂停上传** ——
