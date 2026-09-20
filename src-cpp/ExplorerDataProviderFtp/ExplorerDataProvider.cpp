@@ -1396,32 +1396,44 @@ public:
             ProbeLog(L"[XFER] OpenItem: 不是我们的子项 site='%s' folder='%s' riid=%08X", m_site, m_folder, riid.Data1);
             return E_INVALIDARG;
         }
-        if (isFolder)
-        {
-            // 目录由 EnterFolder + 递归的 OpenItem 处理；这里不该被问到。
-            ProbeLog(L"[XFER] OpenItem(folder) -> E_NOTIMPL '%s'", name);
-            return E_NOTIMPL;
-        }
 
         std::wstring full = m_folder;
         if (full.empty() || full[full.size() - 1] != L'/') full += L'/';
         full += name;
 
-        // 大小：优先用父目录缓存；缓存没有就同步列一次 —— OpenItem 跑在 Shell 的复制
-        // **工作线程**上，允许阻塞（这正是"重活别占 UI 线程"的落点）。
+        // 大小/时间：优先用父目录缓存；缓存没有就同步列一次 —— OpenItem 跑在 Shell 的
+        // 复制**工作线程**上，允许阻塞（这正是"重活别占 UI 线程"的落点）。
         ULONGLONG size = 0;
+        DWORD mtime = 0;
         FTPENTRY found;
-        if (FtpCacheFindOne(m_site, m_folder, name, &found)) size = found.dwSize;
+        if (FtpCacheFindOne(m_site, m_folder, name, &found)) { size = found.dwSize; mtime = found.dwMtime; }
         else
         {
             std::vector<FTPENTRY> entries;
             if (FtpListCachedAll(m_site, m_folder, entries))
                 for (auto const &e : entries)
-                    if (0 == StrCmp(e.szName, name)) { size = e.dwSize; break; }
+                    if (0 == StrCmp(e.szName, name)) { size = e.dwSize; mtime = e.dwMtime; break; }
         }
 
-        ProbeLog(L"[XFER] OpenItem tid=%lu site='%s' remote='%s' size=%llu riid=%08X flags=0x%08X batch='%s'",
-                 GetCurrentThreadId(), m_site, full.c_str(), size, riid.Data1, (unsigned)flags, m_batchId);
+        ProbeLog(L"[XFER] OpenItem tid=%lu site='%s' remote='%s' size=%llu folder=%d riid=%08X flags=0x%08X batch='%s'",
+                 GetCurrentThreadId(), m_site, full.c_str(), size, (int)isFolder, riid.Data1, (unsigned)flags, m_batchId);
+
+        // 复制引擎**先**要 IShellItemResources（属性/大小/时间/资源），之后才要 IStream。
+        // 实测它第一个要的就是 {ff5693be-...}；不实现就直接 E_NOINTERFACE
+        // （用户看到的"0x80004002 不支持的接口"）。
+        if (IsEqualIID(riid, ERF_IID_IShellItemResources))
+        {
+            CRemoteItemResources *res = new (std::nothrow) CRemoteItemResources(
+                m_site, full.c_str(), name, size, isFolder, mtime, m_batchId);
+            if (!res) return E_OUTOFMEMORY;
+            hr = res->QueryInterface(riid, ppv);
+            res->Release();
+            if (FAILED(hr)) ProbeLog(L"[XFER] OpenItem(resources) QI failed hr=0x%08X", hr);
+            return hr;
+        }
+
+        // 目录只提供资源信息，不提供内容流（递归由 EnterFolder + 逐项 OpenItem 完成）。
+        if (isFolder) return E_NOINTERFACE;
 
         CRemoteStream *stream = new (std::nothrow) CRemoteStream(m_site, full.c_str(), size, m_batchId);
         if (!stream) return E_OUTOFMEMORY;

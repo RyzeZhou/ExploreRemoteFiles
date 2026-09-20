@@ -49,6 +49,11 @@ struct IDataObjectAsyncCapability : public IUnknown
 static const GUID ERF_IID_IDataObjectAsyncCapability =
 { 0x3d8b0590, 0xf691, 0x11d2, { 0x8e, 0xa9, 0x00, 0x60, 0x97, 0xdf, 0x5b, 0xd4 } };
 
+// IShellItemResources {ff5693be-2ce0-4d48-b5c5-40817d1acdb9}
+// 自带 GUID，避免依赖 ShObjIdl_core.h 里 EXTERN_C 的 IID 及其所在库。
+static const GUID ERF_IID_IShellItemResources =
+{ 0xff5693be, 0x2ce0, 0x4d48, { 0xb5, 0xc5, 0x40, 0x81, 0x7d, 0x1a, 0xcd, 0xb9 } };
+
 // Local path of the transfer CLI (per-user install location).
 inline std::wstring RfsCliPath()
 {
@@ -306,6 +311,107 @@ private:
     BOOL _cancelRequested;      // stream-release cancellation was sent to the service
     BOOL _loggedFirstRead = FALSE;
 };
+
+// ---------------------------------------------------------------------------
+// IShellItemResources（{ff5693be-2ce0-4d48-b5c5-40817d1acdb9}）
+//
+// Shell 的复制引擎经 ITransferSource::OpenItem 取源项时，**先**要这个接口拿
+// 属性/大小/时间/资源描述，之后才要 IStream。不实现它就直接 E_NOINTERFACE
+// （用户看到的就是"0x80004002 不支持的接口"）。
+//
+// 这里给出的都是我们已知的元数据（缓存里的 size/mtime + 名字），资源方面只支持
+// 默认资源 —— 也就是文件内容流本身（OpenResource(IID_IStream)）。
+// ---------------------------------------------------------------------------
+class CRemoteItemResources : public IShellItemResources
+{
+public:
+    CRemoteItemResources(PCWSTR site, PCWSTR remote, PCWSTR name, ULONGLONG size,
+                         BOOL isFolder, DWORD mtimeUnix, PCWSTR batchId)
+        : _ref(1), _site(site ? site : L""), _remote(remote ? remote : L""),
+          _name(name ? name : L""), _size(size), _isFolder(isFolder),
+          _mtimeUnix(mtimeUnix), _batchId(batchId ? batchId : L"")
+    {
+        DllAddRef();
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, ERF_IID_IShellItemResources))
+        {
+            *ppv = static_cast<IShellItemResources *>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&_ref); }
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        LONG n = InterlockedDecrement(&_ref);
+        if (n == 0) delete this;
+        return n;
+    }
+
+    STDMETHODIMP GetAttributes(DWORD *pdwAttributes) override
+    {
+        if (!pdwAttributes) return E_POINTER;
+        *pdwAttributes = _isFolder ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+        return S_OK;
+    }
+    STDMETHODIMP GetSize(ULONGLONG *pullSize) override
+    {
+        if (!pullSize) return E_POINTER;
+        *pullSize = _size;
+        return S_OK;
+    }
+    STDMETHODIMP GetTimes(FILETIME *pftCreation, FILETIME *pftWrite, FILETIME *pftAccess) override
+    {
+        ULARGE_INTEGER li;
+        li.QuadPart = (ULONGLONG)_mtimeUnix * 10000000ULL + 116444736000000000ULL;
+        if (pftCreation) { pftCreation->dwLowDateTime = li.LowPart; pftCreation->dwHighDateTime = li.HighPart; }
+        if (pftWrite)    { pftWrite->dwLowDateTime = li.LowPart;    pftWrite->dwHighDateTime = li.HighPart; }
+        if (pftAccess)   { pftAccess->dwLowDateTime = li.LowPart;   pftAccess->dwHighDateTime = li.HighPart; }
+        return S_OK;
+    }
+    STDMETHODIMP SetTimes(const FILETIME *, const FILETIME *, const FILETIME *) override { return E_NOTIMPL; }
+    STDMETHODIMP GetResourceDescription(const SHELL_ITEM_RESOURCE *, LPWSTR *ppszDescription) override
+    {
+        if (!ppszDescription) return E_POINTER;
+        return SHStrDupW(_name.c_str(), ppszDescription);
+    }
+    STDMETHODIMP EnumResources(IEnumResources **ppenumr) override
+    {
+        if (ppenumr) *ppenumr = NULL;
+        return E_NOTIMPL;   // 没有额外资源：默认资源就是文件内容流
+    }
+    STDMETHODIMP SupportsResource(const SHELL_ITEM_RESOURCE *) override { return S_FALSE; }
+    STDMETHODIMP OpenResource(const SHELL_ITEM_RESOURCE *, REFIID riid, void **ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (_isFolder) return E_NOINTERFACE;
+        if (!IsEqualIID(riid, IID_IStream) && !IsEqualIID(riid, IID_ISequentialStream)) return E_NOINTERFACE;
+        CRemoteStream *stream = new (std::nothrow) CRemoteStream(_site.c_str(), _remote.c_str(), _size, _batchId.c_str());
+        if (!stream) return E_OUTOFMEMORY;
+        HRESULT hr = stream->QueryInterface(riid, ppv);
+        stream->Release();
+        return hr;
+    }
+    STDMETHODIMP CreateResource(const SHELL_ITEM_RESOURCE *, REFIID, void **) override { return E_NOTIMPL; }
+    STDMETHODIMP MarkForDelete() override { return E_NOTIMPL; }
+
+private:
+    ~CRemoteItemResources() { DllRelease(); }
+
+    LONG _ref;
+    std::wstring _site, _remote, _name, _batchId;
+    ULONGLONG _size;
+    BOOL _isFolder;
+    DWORD _mtimeUnix;
+};
+
 // ---------------------------------------------------------------------------
 // Folder fetch: 整个目录树的下载**交给常驻服务**（一个文件夹 = 一个队列任务），
 // 下载到本地临时根目录，流再从本地树里读。
