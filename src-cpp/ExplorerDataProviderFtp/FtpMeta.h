@@ -861,6 +861,24 @@ inline BOOL FtpMetadataCacheFile(PCWSTR site, PCWSTR path, PWSTR out, UINT cch)
     WCHAR dir[MAX_PATH] = {}; if (!FtpMetadataCacheDirectory(dir, ARRAYSIZE(dir))) return FALSE;
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\ExplorerRemoteFs-meta-%016llX.bin", dir, FtpMetadataCacheHash(site, path)));
 }
+// 一次性清理旧版"一个目录一个 .bin"的遗留文件（缓存而已，删了会自动重拉）。
+inline void FtpLegacyCacheSweep()
+{
+    WCHAR dir[MAX_PATH] = {}, pattern[MAX_PATH] = {};
+    if (!FtpMetadataCacheDirectory(dir, ARRAYSIZE(dir))) return;
+    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\ExplorerRemoteFs-meta-*.bin", dir))) return;
+    WIN32_FIND_DATAW data = {}; HANDLE find = FindFirstFileW(pattern, &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+    int removed = 0;
+    do
+    {
+        WCHAR file[MAX_PATH] = {};
+        if (SUCCEEDED(StringCchPrintfW(file, ARRAYSIZE(file), L"%s\\%s", dir, data.cFileName)) && DeleteFileW(file)) removed++;
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    if (removed) ProbeLog(L"[DB] legacy .bin cache files removed n=%d", removed);
+}
+
 // ── 目录缓存的存储层：SQLite（2026-09-20 起）──────────────────────────────
 // 以前是"一个目录一个 .bin 文件"，散落一目录；现在统一进
 //   <MetadataCachePath>\erf-cache.db
@@ -919,6 +937,7 @@ inline sqlite3 *FtpDb()
                 if (sqlite3_exec(db, kSchema, NULL, NULL, &err) == SQLITE_OK)
                 {
                     s_db = db; s_state = 1;
+                    FtpLegacyCacheSweep();
                 }
                 else
                 {
@@ -1022,11 +1041,7 @@ inline void FtpDiskCacheClear()
 {
     sqlite3 *db = FtpDb();
     if (db) sqlite3_exec(db, "DELETE FROM dir_cache", NULL, NULL, NULL);
-    // 顺带清掉旧版"一个目录一个 .bin"的遗留文件（一次性迁移）。
-    WCHAR dir[MAX_PATH] = {}, pattern[MAX_PATH] = {}; if (!FtpMetadataCacheDirectory(dir, ARRAYSIZE(dir))) return;
-    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\ExplorerRemoteFs-meta-*.bin", dir))) return;
-    WIN32_FIND_DATAW data = {}; HANDLE find = FindFirstFileW(pattern, &data); if (find == INVALID_HANDLE_VALUE) return;
-    do { WCHAR file[MAX_PATH] = {}; if (SUCCEEDED(StringCchPrintfW(file, ARRAYSIZE(file), L"%s\\%s", dir, data.cFileName))) DeleteFileW(file); } while (FindNextFileW(find, &data)); FindClose(find);
+    FtpLegacyCacheSweep();      // 顺带清掉旧版遗留文件（正常情况下 FtpDb 初始化时已经清过）
 }
 inline void FtpCacheClear()
 {
