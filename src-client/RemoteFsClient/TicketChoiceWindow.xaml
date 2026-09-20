@@ -1,0 +1,20 @@
+<Window x:Class="RemoteFsClient.TicketChoiceWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="580" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" ShowInTaskbar="True" Topmost="True">
+    <!-- 传输票据的决策框：按钮文字就是选项本身（「迁移到新目录」「在新目录重新下载」…），
+         不用"是/否/取消"那种对不上号的通用按钮。纯文本，不写 Markdown 标记。 -->
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock x:Name="MessageText" TextWrapping="Wrap" LineHeight="21"/>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,22,0,0">
+            <Button x:Name="PrimaryButton" Click="OnPrimary" IsDefault="True" Padding="16,6" Margin="0,0,8,0"/>
+            <Button x:Name="SecondaryButton" Click="OnSecondary" Padding="16,6" Margin="0,0,8,0"/>
+            <Button x:Name="CancelButton" Click="OnCancel" IsCancel="True" Padding="16,6"/>
+        </StackPanel>
+    </Grid>
+</Window>

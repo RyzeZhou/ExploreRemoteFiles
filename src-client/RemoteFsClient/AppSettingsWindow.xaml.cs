@@ -84,11 +84,11 @@ public partial class AppSettingsWindow : Window
             : "Ctrl+C 只产出一张「传输票据」(.erfdl)，不复制文件本体";
         TicketModeHint.Text = Ui.IsEnglish
             ? "Remote\u2192local: Ctrl+C in a remote folder puts a small .erfdl file on the clipboard. Paste it anywhere, move it where you want the data to land, then double-click it \u2014 the download starts into the ticket's own folder. The ticket carries only an id; the file list and paths stay in the local database."
-            : "远程\u2192本地：在远程文件夹里 Ctrl+C，剪贴板上是一张小票据。粘贴到任意位置，把它**移到你想让数据落地的地方**，再双击 —— 就会下载到票据所在目录。票据里只有一个编号，文件清单与路径只存在本地数据库。";
+            : "远程\u2192本地：在远程文件夹里 Ctrl+C，剪贴板上是一张小票据。粘贴到任意位置，把它移到你想让数据落地的地方，再双击 —— 就会下载到「票据当前所在目录」。票据里只有一个编号，文件清单与路径只存在本地数据库。";
 
         AssocHintText.Text = Ui.IsEnglish
             ? ".erfdl files are ERF transfer tickets. Double-clicking one starts the transfer into the folder where the ticket currently is. Re-register the association if it was lost (e.g. after reinstalling Explorer, another tool stole the extension, or you moved the program)."
-            : ".erfdl 是易远传的「传输票据」：双击它就会把任务下载到**票据当前所在目录**。若关联丢失（重装资源管理器、被其它软件抢占、程序搬家等），点下面的按钮重新关联。";
+            : ".erfdl 是易远传的「传输票据」：双击它就会把任务下载到「票据当前所在目录」。若关联丢失（重装资源管理器、被其它软件抢占、程序搬家等），点下面的按钮重新关联。";
         AssocReassocButton.Content = Ui.IsEnglish ? "Re-register .erfdl" : "重新关联 .erfdl";
 
         SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");

@@ -191,7 +191,7 @@ public static class Ui
 
             // ── 「列显示」标签页（列顺序自定义） ────────────────────────────
             ["ColumnTab"] = ("列显示", "Columns"),
-            ["ColumnHint"] = ("调整该站点在资源管理器里的默认列顺序。注意：资源管理器会按文件夹记住你自己拖过的顺序与列宽，这里的设置只影响**新建或重置后的视图**；最前面的「站点选择」页列固定，不受影响。", "Sets the default column order for this site in Explorer. Explorer remembers the order and widths you drag per folder, so this only affects new or reset views; the site-picker columns are fixed."),
+            ["ColumnHint"] = ("调整该站点在资源管理器里的默认列顺序。注意：资源管理器会按文件夹记住你自己拖过的顺序与列宽，这里的设置只影响「新建或重置后的视图」；最前面的「站点选择」页列固定，不受影响。", "Sets the default column order for this site in Explorer. Explorer remembers the order and widths you drag per folder, so this only affects new or reset views; the site-picker columns are fixed."),
             ["ColumnMoveUp"] = ("上移", "Move up"),
             ["ColumnMoveDown"] = ("下移", "Move down"),
             ["ColumnReset"] = ("恢复默认顺序", "Reset to default"),

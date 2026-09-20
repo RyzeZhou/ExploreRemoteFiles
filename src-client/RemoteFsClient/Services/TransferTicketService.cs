@@ -308,18 +308,18 @@ public sealed class TransferTicketService
             bool destChanged = previous.Length > 0 && !string.Equals(previous, dest, StringComparison.OrdinalIgnoreCase);
             if (destChanged)
             {
-                var choice = AskOnUi(
-                    $"该任务此前下载到：\n{previous}\n\n现在票据在：\n{dest}\n\n要把已下载的文件**迁移**到新目录，\n还是在新目录**重新下载**（忽略原目录）？",
-                    "传输票据：目录已改变", MessageBoxButton.YesNoCancel);
-                if (choice == MessageBoxResult.Cancel) return "FAIL: 用户取消";
-                if (choice == MessageBoxResult.Yes) MigrateDoneFiles(rec, dest);
+                var choice = Ask("传输票据：目录已改变",
+                    $"该任务此前下载到：\n{previous}\n\n现在票据在：\n{dest}\n\n已下载的文件怎么处理？",
+                    "迁移到新目录", "在新目录重新下载", "取消");
+                if (choice == TicketChoice.Cancel) return "FAIL: 用户取消";
+                if (choice == TicketChoice.Primary) MigrateDoneFiles(rec, dest);
             }
             else if (previous.Length > 0)
             {
-                var again = AskOnUi(
+                var again = Ask("传输票据",
                     $"该任务此前已下载到：\n{dest}\n\n要重新下载一次吗？",
-                    "传输票据", MessageBoxButton.YesNo);
-                if (again != MessageBoxResult.Yes) return "FAIL: 用户取消";
+                    "重新下载", null, "取消");
+                if (again != TicketChoice.Primary) return "FAIL: 用户取消";
             }
 
             // 冲突检查：同名 / 大小写同名 —— 只有冲突才问用户
@@ -329,11 +329,11 @@ public sealed class TransferTicketService
                 string target = Path.Combine(dest, item.Name);
                 string? existing = FindConflict(dest, item.Name);
                 if (existing is null) { plan.Add((item, target)); continue; }
-                var c = AskOnUi(
-                    $"目标目录已存在同名项：\n{existing}\n\n要覆盖它，还是保留两者（重命名新文件）？",
-                    "传输票据：命名冲突", MessageBoxButton.YesNoCancel);
-                if (c == MessageBoxResult.Cancel) return "FAIL: 用户取消";
-                if (c == MessageBoxResult.Yes) plan.Add((item, target));
+                var c = Ask("传输票据：命名冲突",
+                    $"目标目录已存在同名项：\n{existing}\n\n怎么处理？",
+                    "覆盖它", "保留两者（新的加序号）", "取消");
+                if (c == TicketChoice.Cancel) return "FAIL: 用户取消";
+                if (c == TicketChoice.Primary) plan.Add((item, target));
                 else plan.Add((item, UniquePath(dest, item.Name)));
             }
 
@@ -412,14 +412,21 @@ public sealed class TransferTicketService
         Log($"migrate done moved={moved.Count} -> '{newDest}'");
     }
 
-    private MessageBoxResult AskOnUi(string message, string title, MessageBoxButton buttons)
+    /// <summary>
+    /// 走 UI 线程弹决策框。**按钮文字就是选项本身**（不是"是/否/取消"），
+    /// <paramref name="secondary"/> 传 null 就只显示两个选项。
+    /// </summary>
+    private TicketChoice Ask(string title, string message, string primary, string? secondary = null, string? cancel = null)
     {
         try
         {
-            if (_dispatcher.CheckAccess())
-                return MessageBox.Show(message, title, buttons, MessageBoxImage.Question);
-            return _dispatcher.Invoke(() => MessageBox.Show(message, title, buttons, MessageBoxImage.Question));
+            return _dispatcher.Invoke(() =>
+            {
+                var window = new TicketChoiceWindow(title, message, primary, secondary, cancel);
+                window.ShowDialog();
+                return window.Choice;
+            });
         }
-        catch { return MessageBoxResult.Cancel; }
+        catch { return TicketChoice.Cancel; }
     }
 }
