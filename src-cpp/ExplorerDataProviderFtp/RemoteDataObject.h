@@ -327,13 +327,25 @@ private:
 // 默认资源 —— 也就是文件内容流本身（OpenResource(IID_IStream)）。
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// IEnumResources：我们没有"额外资源"（默认资源就是文件内容流本身），所以给一个
-// **空的**枚举器。返回 E_NOTIMPL 会让复制引擎直接以 0x80004001 中止。
+// 内容资源 GUID：由提供方自定义（SDK 没有预定义常量）。Shell 会**按我们枚举的**
+// 资源来取内容，所以枚举一个"数据资源"即可。实测枚举为空时 Shell 会直接收工
+// （既不来要 IStream，也不报错）—— 那正是"只传了占位、没有下载"的原因。
+// {8f2a1c66-7b0d-4a5e-9d3f-6c1b2e4a5f70}
 // ---------------------------------------------------------------------------
-class CEmptyEnumResources : public IEnumResources
+static const GUID ERF_GUID_DataResource =
+{ 0x8f2a1c66, 0x7b0d, 0x4a5e, { 0x9d, 0x3f, 0x6c, 0x1b, 0x2e, 0x4a, 0x5f, 0x70 } };
+
+// ---------------------------------------------------------------------------
+// IEnumResources：枚举本项的**一个**内容资源（文件数据流本身）。
+// ---------------------------------------------------------------------------
+class CShellItemResourceEnum : public IEnumResources
 {
 public:
-    CEmptyEnumResources() : _ref(1) { DllAddRef(); }
+    CShellItemResourceEnum(const GUID &guid, PCWSTR name) : _ref(1), _guid(guid), _index(0)
+    {
+        if (name) StringCchCopyW(_name, ARRAYSIZE(_name), name);
+        DllAddRef();
+    }
 
     STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
     {
@@ -355,23 +367,37 @@ public:
         return n;
     }
 
-    STDMETHODIMP Next(ULONG, SHELL_ITEM_RESOURCE *, ULONG *pceltFetched) override
+    STDMETHODIMP Next(ULONG celt, SHELL_ITEM_RESOURCE *psir, ULONG *pceltFetched) override
     {
-        if (pceltFetched) *pceltFetched = 0;
-        return S_FALSE;   // 没有更多资源
+        ULONG n = 0;
+        while (n < celt && _index < 1 && psir)
+        {
+            psir[n].guidType = _guid;
+            StringCchCopyW(psir[n].szName, ARRAYSIZE(psir[n].szName), _name);
+            ++n;
+            ++_index;
+        }
+        if (pceltFetched) *pceltFetched = n;
+        return (n == celt) ? S_OK : S_FALSE;
     }
-    STDMETHODIMP Skip(ULONG) override { return S_FALSE; }
-    STDMETHODIMP Reset() override { return S_OK; }
+    STDMETHODIMP Skip(ULONG celt) override { _index = min(1, _index + (LONG)celt); return S_OK; }
+    STDMETHODIMP Reset() override { _index = 0; return S_OK; }
     STDMETHODIMP Clone(IEnumResources **ppenumr) override
     {
         if (!ppenumr) return E_POINTER;
-        *ppenumr = new (std::nothrow) CEmptyEnumResources();
-        return *ppenumr ? S_OK : E_OUTOFMEMORY;
+        CShellItemResourceEnum *e = new (std::nothrow) CShellItemResourceEnum(_guid, _name);
+        if (!e) { *ppenumr = NULL; return E_OUTOFMEMORY; }
+        e->_index = _index;
+        *ppenumr = e;
+        return S_OK;
     }
 
 private:
-    ~CEmptyEnumResources() { DllRelease(); }
+    ~CShellItemResourceEnum() { DllRelease(); }
     LONG _ref;
+    GUID _guid;
+    LONG _index;
+    WCHAR _name[260] = {};
 };
 
 class CRemoteItemResources : public IShellItemResources
@@ -436,27 +462,29 @@ public:
         ProbeLog(L"[XFER] IShellItemResources::SetTimes (no-op) '%s'", _name.c_str());
         return S_OK;   // 源项时间不回写；返回 E_NOTIMPL 会让引擎中止
     }
-    STDMETHODIMP GetResourceDescription(const SHELL_ITEM_RESOURCE *, LPWSTR *ppszDescription) override
+    STDMETHODIMP GetResourceDescription(const SHELL_ITEM_RESOURCE *pcsir, LPWSTR *ppszDescription) override
     {
-        ProbeLog(L"[XFER] IShellItemResources::GetResourceDescription '%s'", _name.c_str());
+        ProbeLog(L"[XFER] IShellItemResources::GetResourceDescription '%s' guidType=%08X", _name.c_str(), pcsir ? pcsir->guidType.Data1 : 0);
         if (!ppszDescription) return E_POINTER;
         return SHStrDupW(_name.c_str(), ppszDescription);
     }
     STDMETHODIMP EnumResources(IEnumResources **ppenumr) override
     {
-        ProbeLog(L"[XFER] IShellItemResources::EnumResources '%s' -> empty", _name.c_str());
+        ProbeLog(L"[XFER] IShellItemResources::EnumResources '%s' -> 1 data resource", _name.c_str());
         if (!ppenumr) return E_POINTER;
-        *ppenumr = new (std::nothrow) CEmptyEnumResources();
+        *ppenumr = new (std::nothrow) CShellItemResourceEnum(ERF_GUID_DataResource, _name.c_str());
         return *ppenumr ? S_OK : E_OUTOFMEMORY;
     }
-    STDMETHODIMP SupportsResource(const SHELL_ITEM_RESOURCE *) override
+    STDMETHODIMP SupportsResource(const SHELL_ITEM_RESOURCE *pcsir) override
     {
-        ProbeLog(L"[XFER] IShellItemResources::SupportsResource '%s' -> S_FALSE", _name.c_str());
-        return S_FALSE;
+        // 对**任何**资源都说支持：内容只有一个（文件数据流），Shell 用哪个 GUID 来问都给它。
+        ProbeLog(L"[XFER] IShellItemResources::SupportsResource '%s' guidType=%08X -> S_OK", _name.c_str(), pcsir ? pcsir->guidType.Data1 : 0);
+        return S_OK;
     }
-    STDMETHODIMP OpenResource(const SHELL_ITEM_RESOURCE *, REFIID riid, void **ppv) override
+    STDMETHODIMP OpenResource(const SHELL_ITEM_RESOURCE *pcsir, REFIID riid, void **ppv) override
     {
-        ProbeLog(L"[XFER] IShellItemResources::OpenResource '%s' riid=%08X", _name.c_str(), riid.Data1);
+        ProbeLog(L"[XFER] IShellItemResources::OpenResource tid=%lu '%s' guidType=%08X riid=%08X",
+                 GetCurrentThreadId(), _name.c_str(), pcsir ? pcsir->guidType.Data1 : 0, riid.Data1);
         if (!ppv) return E_POINTER;
         *ppv = NULL;
         if (_isFolder) return E_NOINTERFACE;
