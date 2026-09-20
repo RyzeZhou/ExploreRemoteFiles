@@ -469,19 +469,18 @@ public partial class App : System.Windows.Application
             if (rootElement is null) return null;
             var tabViewCondition = new PropertyCondition(
                 AutomationElement.ClassNameProperty, "Microsoft.UI.Xaml.Controls.TabView");
-            var tabViews = rootElement.FindAll(TreeScope.Descendants, tabViewCondition);
-            if (tabViews is null || tabViews.Count == 0) return null;
-            foreach (AutomationElement tabView in tabViews)
-            {
-                if (!tabView.TryGetCurrentPattern(SelectionPattern.Pattern, out var patternObject))
-                    continue;
-                var selectionPattern = (SelectionPattern)patternObject;
-                var selected = selectionPattern.Current.GetSelection();
-                if (selected is null || selected.Length == 0) continue;
-                var name = selected[0].Current.Name;
-                ErfLog($"UIA active-tab name='{name}'");
-                return string.IsNullOrWhiteSpace(name) ? null : name;
-            }
+            // FindFirst 而不是 FindAll：Explorer 的 UIA 子树很大，找到 TabView 就停，
+            // 不再遍历整棵树（这是之前 ~550ms 开销的主要来源）。
+            var tabView = rootElement.FindFirst(TreeScope.Descendants, tabViewCondition);
+            if (tabView is null) return null;
+            if (!tabView.TryGetCurrentPattern(SelectionPattern.Pattern, out var patternObject))
+                return null;
+            var selectionPattern = (SelectionPattern)patternObject;
+            var selected = selectionPattern.Current.GetSelection();
+            if (selected is null || selected.Length == 0) return null;
+            var name = selected[0].Current.Name;
+            ErfLog($"UIA active-tab name='{name}'");
+            return string.IsNullOrWhiteSpace(name) ? null : name;
         }
         catch (Exception ex)
         {
@@ -511,17 +510,20 @@ public partial class App : System.Windows.Application
 
         ErfLog($"in-place navigation anchor=0x{anchor.ToInt64():X}; anchorRoot=0x{anchorRoot.ToInt64():X}; currentRoot=0x{currentRoot.ToInt64():X}");
 
-        // 活动标签判定：协议被激活时前台窗口就是用户正输入的 Explorer 窗口
-        // （RemoteFsClient 启动不抢前台），所以锚点窗口/当前前台窗口即是探测目标。
-        // 用 UIA SelectionPattern 拿"当前活动标签"名称，名字与 ShellWindows 的
-        // LocationName 一一对应 → 最高分档。旧打分作为 UIA 不可用时的兜底。
+        // 活动标签判定（延迟到"确有歧义"时才做）：
+        //   · Win11 一个窗口多标签共享同一个顶层 HWND，ShellWindows 每条目的 HWND 都是
+        //     窗口级 → 同窗口各标签得分天然并列，靠句柄无法区分；
+        //   · UIA SelectionPattern 能读出**当前活动标签**的名称，与条目 LocationName 对应，
+        //     但跨进程读 XAML 树代价高（实测 200~550ms）。
+        // 所以先按句柄打分；只有最高分出现多个并列候选时，才付这次 UIA 代价去消歧。
         var probeRoot = anchorRoot != IntPtr.Zero ? anchorRoot : currentRoot;
-        var activeTabName = TryGetActiveTabName(probeRoot);
 
         object? shellWindows = null;
         object? bestBrowser = null;
         var bestTab = IntPtr.Zero;
         var bestScore = 0;
+        var bestIndex = -1;
+        var tieIndexes = new List<int>();
         try
         {
             var type = Type.GetTypeFromCLSID(ShellWindowsClsid);
@@ -580,10 +582,7 @@ public partial class App : System.Windows.Application
                     }
 
                     var score = 0;
-                    if (!string.IsNullOrEmpty(activeTabName) && locationName == activeTabName &&
-                        tabRoot == probeRoot)
-                        score = 5;   // UIA 确认的活动标签（最高优先）
-                    else if (anchor != IntPtr.Zero && tabHandle == anchor) score = 4;
+                    if (anchor != IntPtr.Zero && tabHandle == anchor) score = 4;
                     else if (anchor != IntPtr.Zero && (IsChild(tabHandle, anchor) || IsChild(anchor, tabHandle))) score = 3;
                     else if (anchorRoot != IntPtr.Zero && tabRoot == anchorRoot) score = 2;
                     else if (currentRoot != IntPtr.Zero && tabRoot == currentRoot) score = 1;
@@ -599,6 +598,14 @@ public partial class App : System.Windows.Application
                         browserObject = null;          // 所有权移交给 bestBrowser，交给下面的 finally 释放
                         bestTab = tabHandle;
                         bestScore = score;
+                        bestIndex = index;
+                        tieIndexes.Clear();
+                        tieIndexes.Add(index);
+                    }
+                    else if (score == bestScore)
+                    {
+                        // 同窗口多标签的常规情形：句柄分完全并列，先记下来待消歧。
+                        tieIndexes.Add(index);
                     }
                 }
                 catch (Exception ex)
@@ -622,6 +629,63 @@ public partial class App : System.Windows.Application
             {
                 ErfLog("no ShellWindows entry matched the source tab; falling back to a new window");
                 return false;
+            }
+
+            // 并列消歧：最高分有多个候选（Win11 多标签的常态）时才读一次活动标签。
+            // 命中就把选择切到"当前活动标签"对应的条目；读不到或没命中就保持原选择。
+            if (tieIndexes.Count > 1)
+            {
+                var activeTabName = TryGetActiveTabName(probeRoot);
+                ErfLog($"ambiguous candidates={tieIndexes.Count}; active-tab='{activeTabName}'");
+                if (!string.IsNullOrEmpty(activeTabName))
+                {
+                    foreach (var tieIndex in tieIndexes)
+                    {
+                        if (tieIndex == bestIndex) continue;
+                        object? tieBrowser = null;
+                        try
+                        {
+                            tieBrowser = shellWindows.GetType().InvokeMember(
+                                "Item",
+                                System.Reflection.BindingFlags.InvokeMethod | System.Reflection.BindingFlags.GetProperty,
+                                null,
+                                shellWindows,
+                                [tieIndex]);
+                            if (tieBrowser is null) continue;
+                            var tieName = Convert.ToString(tieBrowser.GetType().InvokeMember(
+                                "LocationName",
+                                System.Reflection.BindingFlags.GetProperty,
+                                null,
+                                tieBrowser,
+                                null));
+                            if (tieName != activeTabName) continue;
+
+                            var tieHandle = new IntPtr(Convert.ToInt64(tieBrowser.GetType().InvokeMember(
+                                "HWND",
+                                System.Reflection.BindingFlags.GetProperty,
+                                null,
+                                tieBrowser,
+                                null)));
+                            if (bestBrowser is not null && Marshal.IsComObject(bestBrowser))
+                                Marshal.FinalReleaseComObject(bestBrowser);
+                            bestBrowser = tieBrowser;
+                            tieBrowser = null;
+                            bestTab = tieHandle;
+                            bestIndex = tieIndex;
+                            ErfLog($"active-tab disambiguation -> ShellWindows[{tieIndex}] name='{tieName}'");
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            ErfLog($"disambiguation probe [{tieIndex}] failed; {ex.Message}");
+                        }
+                        finally
+                        {
+                            if (tieBrowser is not null && Marshal.IsComObject(tieBrowser))
+                                Marshal.FinalReleaseComObject(tieBrowser);
+                        }
+                    }
+                }
             }
 
             // Navigate2 accepts Shell parsing names and keeps the matched
