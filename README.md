@@ -8,7 +8,7 @@
 
 ---
 
-## ⚠️ 风险提示：这是早期版本（Alpha），请谨慎使用
+## ⚠️ 风险提示：这是早期版本（Alpha）且为 Vibe Coding 产物，请谨慎使用
 
 - **没有经过充分测试**：目前只在作者自己的两台机器上实测过（Windows 10 22H2 / Windows 11），
   **没有大规模用户验证**，**没有代码签名**。请把它当作"能用但还毛糙"的早期软件。
@@ -29,11 +29,18 @@
 
 导航窗格里多一个「易远传」，点进去就是远程 Linux 目录，列、排序、右键菜单都跟本地一致：
 
-![在资源管理器里打开 SFTP 目录](assets/Explorer打开SFTP目录.png)
+<table>
+  <tr>
+    <td><img src="assets/Explorer打开SFTP目录.png" alt="Explorer打开SFTP目录" width="320"></td>
+    <td><img src="assets/属性页可更改权限或所有者.png" alt="属性页可更改权限或所有者" width="320"></td>
+  </tr>
+  <tr align="center">
+    <td>资源管理器里打开 SFTP 目录</td>
+    <td>属性页：可更改权限或所有者</td>
+  </tr>
+</table>
 
-右键属性就是 Linux 那一套：所有者、属组、`rwxr-xr-x` 与数字权限都能看、都能改（含递归）：
-
-![属性页：可更改权限或所有者](assets/属性页可更改权限或所有者.png)
+右键属性就是 Linux 那一套：所有者、属组、`rwxr-xr-x` 与数字权限都能看、都能改（含递归）。
 
 ---
 
