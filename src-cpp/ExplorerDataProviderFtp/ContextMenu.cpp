@@ -1701,19 +1701,45 @@ static DWORD WINAPI BgCopyThreadProc(LPVOID p)
                 continue;
             }
             REMOTEMETA meta = {}; if (!ReadRemoteMeta(c->site, c->folder, nm.c_str(), &meta) || meta.fIsFolder) { ok = FALSE; continue; }
+
+            // 「复制到本地文件夹」：**直接下到目标目录**的临时名，再原子改名 —— 不再经
+            // %LOCALAPPDATA%\...\FileCache 中转（那是双写：先下一份、再 CopyFile 一份）。
+            // 这也让半成品落在目标位置（等价 WinSCP 的 .part 语义）。
+            if (c->target == COPY_LOCAL_FOLDER)
+            {
+                WCHAR localTarget[MAX_PATH] = {};
+                StringCchPrintf(localTarget, ARRAYSIZE(localTarget), L"%s\\%s", c->targetPath, nm.c_str());
+                // 工作线程没有可用的 owner 窗口，覆盖确认用 NULL owner。
+                if (PathFileExistsW(localTarget) && IDYES != MessageBoxW(NULL, ExplorerText(L"confirm.overwrite_local", L"目标位置已有同名文件，要覆盖吗？", L"A file with the same name already exists. Replace it?"), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_YESNO | MB_ICONWARNING)) continue;
+                WCHAR part[MAX_PATH + 16] = {};
+                StringCchPrintf(part, ARRAYSIZE(part), L"%s.rfs-part", localTarget);
+                DeleteFileW(part);
+                std::string getReply;
+                if (FtpBridgeFetch(c->site, src, part, batchId, getReply) != FtpBridgeFetchState::Done)
+                {
+                    ok = FALSE;
+                    DeleteFileW(part);
+                    continue;
+                }
+                if (!MoveFileExW(part, localTarget, MOVEFILE_REPLACE_EXISTING))
+                {
+                    ProbeLog(L"[COPY] rename .rfs-part failed err=%lu part='%s' target='%s'",
+                             GetLastError(), part, localTarget);
+                    DeleteFileW(part);
+                    ok = FALSE;
+                }
+                continue;
+            }
+
+            // 跨站点复制：本机仍要中转（下载到缓存再上传），保持原样。
             WCHAR local[MAX_PATH] = {};
             if (!TempLocalPath(L"Copy", c->site, nm.c_str(), local, ARRAYSIZE(local))) { ok = FALSE; continue; }
             std::string getReply;
             if (FtpBridgeFetch(c->site, src, local, batchId, getReply) != FtpBridgeFetchState::Done) { ok = FALSE; continue; }
-            if (c->target == COPY_OTHER_SITE) {
+            {
                 WCHAR remote[700] = {}; if (c->targetPath[0] == L'/' && !c->targetPath[1]) StringCchPrintf(remote, ARRAYSIZE(remote), L"/%s", nm.c_str()); else StringCchPrintf(remote, ARRAYSIZE(remote), L"%s/%s", c->targetPath, nm.c_str());
                 std::string putReply;
                 if (FtpBridgePut(c->targetSite, remote, local, batchId, putReply) != FtpBridgeFetchState::Done) ok = FALSE;
-            } else {
-                WCHAR localTarget[MAX_PATH] = {}; StringCchPrintf(localTarget, ARRAYSIZE(localTarget), L"%s\\%s", c->targetPath, nm.c_str());
-                // 工作线程没有可用的 owner 窗口，覆盖确认用 NULL owner。
-                if (PathFileExistsW(localTarget) && IDYES != MessageBoxW(NULL, ExplorerText(L"confirm.overwrite_local", L"目标位置已有同名文件，要覆盖吗？", L"A file with the same name already exists. Replace it?"), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_YESNO | MB_ICONWARNING)) { DeleteFileW(local); continue; }
-                if (!CopyFileW(local, localTarget, FALSE)) ok = FALSE;
             }
             DeleteFileW(local);
         }
