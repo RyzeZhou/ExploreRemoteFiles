@@ -225,14 +225,18 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         {
             try
             {
-                // 取消检查放在进度回调里：SSH.NET 在下载循环中调用它，抛异常即中断下载。
-                // 没有它的话，服务侧 cancellation.Cancel() 对一个正在下的大文件完全无效
-                //（用户实测："取消都无法取消"）。
-                _client.DownloadFile(remotePath, fs, downloaded =>
-                {
-                    token.ThrowIfCancellationRequested();
-                    progress?.Invoke((long)downloaded, total);
-                });
+                // 取消走 API 自己的 CancellationToken，**绝不能**在进度回调里抛异常：
+                // SSH.NET 的同步 DownloadFile 把回调丢到线程池执行（内部 ThreadPoolProgress
+                // + 写死 CancellationToken.None），回调里抛 OperationCanceledException 会变成
+                // 线程池未处理异常、直接终止常驻服务进程（2026-09-20 用户实测："点取消后服务
+                // 程序崩溃"），而且那个回调也取消不了下载、只会炸进程。
+                // 异步重载把 token 交给 SFTP 请求本身：取消时 ReadAsync/WriteAsync 抛出的 OCE
+                // 回到 GetResult() 的调用线程，由上层按"用户取消"处理；进度回调只负责上报
+                // （以及服务侧的暂停闸门），经 SafeProgress 包装后永不抛出。
+                IProgress<DownloadFileProgressReport>? reporter = progress is null
+                    ? null
+                    : new SafeProgress<DownloadFileProgressReport>(r => progress((long)r.TotalBytesDownloaded, total));
+                _client.DownloadFileAsync(remotePath, fs, reporter, token).GetAwaiter().GetResult();
             }
             catch
             {
@@ -252,7 +256,10 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         long total = 0;
         try { total = new FileInfo(localPath).Length; } catch { }
         using var fs = File.OpenRead(localPath);
-        _client.UploadFile(fs, remotePath, uploaded => progress?.Invoke((long)uploaded, total));
+        // 与 Download 同理：同步 UploadFile 同样经 ThreadPoolProgress 在线程池上执行回调，
+        // 回调抛出即终止宿主进程，进度上报必须永不抛出。
+        _client.UploadFile(fs, remotePath,
+            new SafeProgress<ulong>(uploaded => progress?.Invoke((long)uploaded, total)).Report);
         progress?.Invoke(total, total);
         Utils.ShellLog.Write($"SFTP put: {localPath} -> {remotePath}");
     }

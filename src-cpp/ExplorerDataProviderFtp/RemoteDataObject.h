@@ -310,6 +310,7 @@ public:
         StringCchPrintfW(_batchId, ARRAYSIZE(_batchId), L"dir-%u-%ld",
                          (unsigned)GetCurrentProcessId(), _seq);
         InitializeCriticalSection(&_cs);
+        DllAddRef();   // 2026-09-20: the fetch thread below outlives every COM ref
     }
 
     ~CFolderFetch()
@@ -317,6 +318,7 @@ public:
         // 没有进程要杀了：下载跑在常驻服务里，取消走队列窗口的「取消」按钮。
         DeleteTree(_localRoot);
         DeleteCriticalSection(&_cs);
+        DllRelease();
     }
 
     LONG AddRef() { return InterlockedIncrement(&_ref); }

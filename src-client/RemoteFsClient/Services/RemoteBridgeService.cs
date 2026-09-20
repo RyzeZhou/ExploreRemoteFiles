@@ -336,7 +336,7 @@ public sealed class RemoteBridgeService : IDisposable
 
             progress = _operationQueue?.Begin(siteName, path,
                 RemoteOperationQueueWindow.OperationKind.Delete,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
+                () => { try { cancellation.Cancel(); } catch { } });
             progress?.Update(0, 0, Ui.IsEnglish ? "Waiting for remote connection" : "等待远程连接");
 
             await _providerGate.WaitAsync(cancellation.Token);
@@ -488,8 +488,11 @@ public sealed class RemoteBridgeService : IDisposable
             var remote = NormalizeRemotePath(remotePath);
             if (string.IsNullOrWhiteSpace(localPath)) return new(FetchJobState.Failed, "missing local path");
             var fileName = System.IO.Path.GetFileName(localPath);
+            // Cancel runs inline on the UI thread when the user clicks 取消; hand the
+            // actual token cancel to the thread pool so SSH.NET teardown never blocks
+            // the UI thread, and never let a throwing registration escape.
             task = _transfers?.BeginManagedTask("download", siteName, fileName, remote,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } }, batchId);
+                () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }), batchId);
             using var fs = ProviderFactory.Create(connection);
             await Task.Run(() =>
             {
@@ -499,7 +502,11 @@ public sealed class RemoteBridgeService : IDisposable
                 fs.Download(remote, localPath, (done, total) =>
                 {
                     job.Done = done; job.Total = total;
-                    if (task is not null) _transfers?.UpdateManagedTask(task, done, total, fileName);
+                    if (task is not null)
+                    {
+                        _transfers?.WaitWhilePaused(task, cancellation.Token);
+                        _transfers?.UpdateManagedTask(task, done, total, fileName);
+                    }
                 }, false, cancellation.Token);
             }, cancellation.Token);
             // A CANCEL racing the final progress callback still wins over success.
@@ -544,7 +551,7 @@ public sealed class RemoteBridgeService : IDisposable
             var folderName = System.IO.Path.GetFileName(remote.TrimEnd('/'));
             if (string.IsNullOrEmpty(folderName)) folderName = remote;
             task = _transfers?.BeginManagedTask("download", siteName, folderName, remote,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } }, batchId);
+                () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }), batchId);
             _transfers?.UpdateManagedTask(task!, 0, 0, Ui.IsEnglish ? "Scanning remote folder" : "正在扫描远程目录");
             using var fs = ProviderFactory.Create(connection);
             await Task.Run(() =>
@@ -561,11 +568,13 @@ public sealed class RemoteBridgeService : IDisposable
                 foreach (var file in files)
                 {
                     cancellation.Token.ThrowIfCancellationRequested();
+                    _transfers?.WaitWhilePaused(task, cancellation.Token);   // pause between files too
                     try
                     {
                         var dir = System.IO.Path.GetDirectoryName(file.Local);
                         if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir);
-                        fs.Download(file.Remote, file.Local, null, false, cancellation.Token);
+                        fs.Download(file.Remote, file.Local,
+                            (_, _) => _transfers?.WaitWhilePaused(task, cancellation.Token), false, cancellation.Token);
                         downloaded++;
                     }
                     catch (OperationCanceledException) { throw; }
@@ -639,7 +648,7 @@ public sealed class RemoteBridgeService : IDisposable
 
             progress = _operationQueue?.Begin(siteName, path,
                 RemoteOperationQueueWindow.OperationKind.Chmod,
-                () => { try { cancellation.Cancel(); } catch (ObjectDisposedException) { } });
+                () => { try { cancellation.Cancel(); } catch { } });
             progress?.Update(0, 0, Ui.IsEnglish ? "Waiting for remote connection" : "等待远程连接");
 
             await _providerGate.WaitAsync(cancellation.Token);

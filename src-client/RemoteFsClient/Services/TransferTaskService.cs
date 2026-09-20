@@ -161,6 +161,15 @@ public sealed class TransferTaskService
     private CancellationTokenSource? _cts;
     private readonly Dictionary<string, Action> _managedCancels = new(StringComparer.Ordinal);
 
+    // ---- pause gates --------------------------------------------------------
+    // CLI jobs publish a named event (JobReporter) that the service flips by name.
+    // Service-managed downloads (FETCH/FETCHDIR) have no such process, so the
+    // service owns the gate itself: the download worker waits on it inside the
+    // progress callback (which runs on the SSH.NET transfer thread), which stops
+    // reading/writing without tearing the connection down.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ManualResetEventSlim> _managedGates
+        = new(StringComparer.Ordinal);
+
     // ---- progress coalescing (2026-09-20: "service GUI frozen during copy") --
     // The transfer reports progress per chunk; each report was BeginInvoke'd to
     // the UI thread at Normal priority, which outranks Input — a fast transfer
@@ -328,6 +337,16 @@ public sealed class TransferTaskService
     public void TogglePause(TransferTask task)
     {
         if (task is null || task.IsFinished) return;
+        // Service-managed transfer: the gate lives in this process.
+        if (_managedGates.TryGetValue(task.Id, out var managedGate))
+        {
+            bool paused;
+            if (task.IsPaused) { managedGate.Set(); paused = false; }
+            else { managedGate.Reset(); paused = true; }
+            task.SetPaused(paused);
+            Log($"PAUSE managed id={task.Id} paused={paused}");
+            return;
+        }
         try
         {
             using EventWaitHandle gate = EventWaitHandle.OpenExisting(GatePrefix + task.Id + ".Gate");
@@ -340,14 +359,35 @@ public sealed class TransferTaskService
         }
     }
 
-    /// <summary>Cancel = terminate the CLI process performing the transfer.</summary>
+    /// <summary>Blocks the transfer thread while this task is paused. Called from
+    /// the download progress callback, i.e. on the SSH.NET transfer thread — it
+    /// must never throw (that is the pause gate, not cancellation). Returns as
+    /// soon as the token is cancelled so a cancel stays prompt while paused.</summary>
+    public void WaitWhilePaused(TransferTask? task, CancellationToken token)
+    {
+        if (task is null) return;
+        if (!_managedGates.TryGetValue(task.Id, out var gate)) return;
+        while (!gate.IsSet)
+        {
+            if (token.IsCancellationRequested) return;
+            if (gate.Wait(100)) return;
+        }
+    }
+
+    /// <summary>Cancel = terminate the CLI process performing the transfer, or
+    /// cancel the service-managed job's token.</summary>
     public void Cancel(TransferTask task)
     {
         if (task is null || task.IsFinished) return;
+        // Show the pending state before running the cancel callback: for managed
+        // jobs that callback may block briefly while SSH.NET tears the request down.
+        task.MarkCancelRequested();
         if (_managedCancels.TryGetValue(task.Id, out var cancelManaged))
         {
-            cancelManaged();
-            task.MarkCancelRequested();
+            // Cancel() invokes registrations inline on the calling (UI) thread and
+            // may throw an AggregateException if any of them throws. Never let it
+            // escape into the WPF dispatcher.
+            try { cancelManaged(); } catch { }
             return;
         }
         try { if (task.Pid > 0) Process.GetProcessById(task.Pid).Kill(); } catch { }
@@ -400,6 +440,7 @@ public sealed class TransferTaskService
             Name = name, RemotePath = remotePath, BatchId = batchId,
         };
         _managedCancels[task.Id] = cancel;
+        _managedGates[task.Id] = new ManualResetEventSlim(true);   // signaled = running
         Tasks.Insert(0, task);
         JobStarted?.Invoke();
         Log($"BEGIN managed id={task.Id} server={server} dir={direction} name={name}");
@@ -427,6 +468,11 @@ public sealed class TransferTaskService
             return;
         }
         _managedCancels.Remove(task.Id);
+        if (_managedGates.TryRemove(task.Id, out var gate))
+        {
+            try { gate.Set(); } catch { }
+            try { gate.Dispose(); } catch { }
+        }
         ForgetProgress(task.Id);
         if (task.IsFinished) return;
         if (cancelled)

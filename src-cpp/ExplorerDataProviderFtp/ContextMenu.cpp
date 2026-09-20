@@ -240,6 +240,7 @@ static DWORD WINAPI DeleteRemoteThreadProc(LPVOID p)
 
     if (c->notifyPidl) ILFree(c->notifyPidl);
     delete c;
+    DllRelease();
     return 0;
 }
 
@@ -307,9 +308,11 @@ HRESULT DeleteRemoteShellItem(IShellItem *psiSource, PIDLIST_ABSOLUTE notifyPidl
     ProbeLog(L"[XFER] Delete remote item queued (async) site='%s' full='%s' parent='%s' name='%s' folder=%d flags=0x%08X seq=%u",
              site, full, parent, name, isFolder, flags, (UINT)c->seq);
 
+    DllAddRef();   // 2026-09-20: pin the module until the delete worker returns
     HANDLE h = CreateThread(NULL, 0, DeleteRemoteThreadProc, c, 0, NULL);
     if (!h)
     {
+        DllRelease();
         if (c->notifyPidl) ILFree(c->notifyPidl);
         delete c;
         return E_OUTOFMEMORY;
@@ -549,6 +552,7 @@ static DWORD WINAPI MetaWarmThread(LPVOID p)
         PostMessageW(pm->dlg, WM_APP_ERF_META_READY, 0, 0);
     delete c;
     PropMetaRelease(pm);
+    DllRelease();
     return 0;
 }
 static void MetaWarmStart(PROPMETA *pm)
@@ -556,9 +560,10 @@ static void MetaWarmStart(PROPMETA *pm)
     MetaWarmCtx *c = new (std::nothrow) MetaWarmCtx{ pm };
     if (!c) return;
     PropMetaAddRef(pm);
+    DllAddRef();   // 2026-09-20: pin the module until the meta warm worker returns
     HANDLE h = CreateThread(NULL, 0, MetaWarmThread, c, 0, NULL);
     if (h) CloseHandle(h);
-    else { delete c; PropMetaRelease(pm); }
+    else { DllRelease(); delete c; PropMetaRelease(pm); }
 }
 
 // FTP/FTPS have no standard owner/group mutation. SFTP can issue SETSTAT;
@@ -1235,6 +1240,7 @@ static DWORD WINAPI EditWatch(LPVOID p)
     DeleteFileW(c->local);
     if (c->notify) ILFree(c->notify);
     CoTaskMemFree(c);   // allocated via CoTaskMemAlloc
+    DllRelease();
     return 0;
 }
 static BOOL StartEditWatch(PCWSTR site, PCWSTR remote, PCWSTR local,
@@ -1247,8 +1253,10 @@ static BOOL StartEditWatch(PCWSTR site, PCWSTR remote, PCWSTR local,
     StringCchCopy(c->local, ARRAYSIZE(c->local), local);
     c->deferredCreate = deferredCreate;
     c->notify = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    DllAddRef();   // 2026-09-20: pin the module while the edit watcher runs (up to 30 min)
     HANDLE thread = CreateThread(NULL, 0, EditWatch, c, 0, NULL);
     if (thread) { CloseHandle(thread); return TRUE; }
+    DllRelease();
     if (c->notify) ILFree(c->notify);
     CoTaskMemFree(c);
     return FALSE;
@@ -1274,6 +1282,7 @@ static DWORD WINAPI DownloadJobProc(LPVOID p)
     {
         MessageBoxW(NULL, ExplorerText(L"error.download_failed", L"下载失败。", L"Download failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
         delete j;
+        DllRelease();
         return 1;
     }
     if (j->kind == 1)
@@ -1295,6 +1304,7 @@ static DWORD WINAPI DownloadJobProc(LPVOID p)
             MessageBoxW(NULL, ExplorerText(L"error.edit_watch_failed", L"已打开文件，但无法启动自动上传监视。", L"The file was created and opened, but automatic upload monitoring could not start."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
     }
     delete j;
+    DllRelease();
     return 0;
 };
 static void StartDownloadJob(PCWSTR site, PCWSTR remote, PCWSTR local, int kind)
@@ -1303,9 +1313,10 @@ static void StartDownloadJob(PCWSTR site, PCWSTR remote, PCWSTR local, int kind)
     if (!j) return;
     j->site = site ? site : L""; j->remote = remote ? remote : L""; j->local = local ? local : L"";
     j->kind = kind;
+    DllAddRef();   // 2026-09-20: pin the module until the download worker returns
     HANDLE h = CreateThread(NULL, 0, DownloadJobProc, j, 0, NULL);
     if (h) CloseHandle(h);
-    else delete j;
+    else { DllRelease(); delete j; }
 }
 struct DownloadBatch
 {
@@ -1323,6 +1334,7 @@ static DWORD WINAPI DownloadBatchProc(LPVOID p)
     StringCchPrintf(msg, ARRAYSIZE(msg), ExplorerText(L"info.downloaded_to", L"已下载 %d 个文件到：\n%s", L"Downloaded %d files to:\n%s"), ok, b->dir.c_str());
     MessageBoxW(NULL, msg, ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONINFORMATION);
     delete b;
+    DllRelease();
     return 0;
 }
 struct ClipJob
@@ -1366,6 +1378,7 @@ static DWORD WINAPI ClipJobProc(LPVOID p)
         }
     }
     delete j;
+    DllRelease();
     return 0;
 }
 static void OpenRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, BOOL edit)
@@ -1401,9 +1414,10 @@ static void DownloadFiles(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, 
         WCHAR local[MAX_PATH]; StringCchPrintf(local,ARRAYSIZE(local),L"%s%s",dir,names[i]);
         b->files.emplace_back(full, local);
     }
+    DllAddRef();   // 2026-09-20: pin the module until the batch download returns
     HANDLE h = CreateThread(NULL, 0, DownloadBatchProc, b, 0, NULL);
     if (h) CloseHandle(h);
-    else delete b;
+    else { DllRelease(); delete b; }
 }
 static void CopyClipboard(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count)
 {
@@ -1417,9 +1431,10 @@ static void CopyClipboard(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, 
     if (!j) return;
     j->site = site ? site : L""; j->dir = dir; j->folder = folder ? folder : L"";
     for (int k = 0; k < count; k++) j->names.push_back(names[k]);
+    DllAddRef();   // 2026-09-20: pin the module until the clipboard worker returns
     HANDLE h = CreateThread(NULL, 0, ClipJobProc, j, 0, NULL);
     if (h) CloseHandle(h);
-    else delete j;
+    else { DllRelease(); delete j; }
 }enum COPYTARGET { COPY_ORIGINAL = 0, COPY_SAME_SITE = 1, COPY_OTHER_SITE = 2, COPY_LOCAL_FOLDER = 3 };
 typedef struct {
     WCHAR sourceSite[64]; WCHAR sourceFolder[600]; PCWSTR *names; int count;
@@ -2341,6 +2356,7 @@ static DWORD WINAPI ChmodRemoteThreadProc(LPVOID p)
                 ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
         }
         delete c;
+        DllRelease();
         return 0;
     }
     if (ok)
@@ -2357,6 +2373,7 @@ static DWORD WINAPI ChmodRemoteThreadProc(LPVOID p)
     }
 
     delete c;
+    DllRelease();
     return 0;
 }
 
@@ -2370,9 +2387,10 @@ static void StartChmodRecursiveAsync(PCWSTR site, PCWSTR path, PCWSTR modeOctal)
     StringCchCopyW(c->mode, ARRAYSIZE(c->mode), modeOctal ? modeOctal : L"644");
     PathParent(c->path, c->parent, ARRAYSIZE(c->parent));
 
+    DllAddRef();   // 2026-09-20: pin the module until the chmod worker returns
     HANDLE t = CreateThread(NULL, 0, ChmodRemoteThreadProc, c, 0, NULL);
     if (t) CloseHandle(t);
-    else { delete c; ProbeLog(L"[TERM] async chmod: CreateThread failed err=%lu", GetLastError()); }
+    else { DllRelease(); delete c; ProbeLog(L"[TERM] async chmod: CreateThread failed err=%lu", GetLastError()); }
 }
 
 // ── 把 VS Code 窗口请到前台 ────────────────────────────────────────────────
@@ -2392,7 +2410,7 @@ struct TerminalFocusRequest
 static DWORD WINAPI TerminalFocusThread(LPVOID param)
 {
     TerminalFocusRequest *req = reinterpret_cast<TerminalFocusRequest *>(param);
-    if (!req) return 0;
+    if (!req) { DllRelease(); return 0; }
     const DWORD step = 250;
     for (DWORD waited = 0; waited <= req->timeoutMs; waited += step)
     {
@@ -2407,6 +2425,7 @@ static DWORD WINAPI TerminalFocusThread(LPVOID param)
         Sleep(step);
     }
     delete req;
+    DllRelease();
     return 0;
 }
 
@@ -2417,8 +2436,9 @@ static void FocusVscodeWindowAsync(PCWSTR alias, DWORD timeoutMs)
     if (!req) return;
     req->alias = alias;
     req->timeoutMs = timeoutMs;
+    DllAddRef();   // 2026-09-20: pin the module until the focus worker returns
     HANDLE t = CreateThread(NULL, 0, TerminalFocusThread, req, 0, NULL);
-    if (t) CloseHandle(t); else delete req;
+    if (t) CloseHandle(t); else { DllRelease(); delete req; }
 }
 // ── Windows Terminal：用 fragment 定义我们的 profile（不改用户的 settings.json）──
 // WT 会扫描 %LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\<App>\*.json，

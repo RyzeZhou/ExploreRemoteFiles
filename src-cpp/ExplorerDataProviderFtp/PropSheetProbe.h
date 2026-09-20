@@ -35,6 +35,10 @@
 #pragma once
 
 #include "ProbeLog.h"
+// Module lifetime: this header starts its own worker thread (sampler), which
+// must pin the DLL itself -- DllCanUnloadNow only counts COM objects.
+void DllAddRef();
+void DllRelease();
 #include <strsafe.h>
 #include <vector>
 #include <string>
@@ -232,6 +236,7 @@ inline DWORD WINAPI SamplerProc(LPVOID)
             Sleep(10);
     }
     ProbeLog(L"[PROBE] sampler thread exit");
+    DllRelease();
     return 0;
 }
 
@@ -249,6 +254,7 @@ inline void Start(HWND hDlg)
     }
     InterlockedExchange(&s.stop, 0);
     s.started = GetTickCount64();
+    DllAddRef();   // 2026-09-20: pin the module while the sampler runs
     s.thread = CreateThread(NULL, 0, SamplerProc, NULL, 0, NULL);
     if (s.thread)
     {
@@ -257,6 +263,7 @@ inline void Start(HWND hDlg)
     }
     else
     {
+        DllRelease();
         ProbeLog(L"[PROBE] sampler FAILED to start, err=%lu", GetLastError());
     }
 }
