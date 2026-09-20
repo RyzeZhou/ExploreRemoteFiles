@@ -249,17 +249,22 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"SFTP get: {remotePath} -> {localPath}");
     }
 
-    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false)
+    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false,
+                       CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         EnsureConnected();
         if (_client is null) return;
         long total = 0;
         try { total = new FileInfo(localPath).Length; } catch { }
         using var fs = File.OpenRead(localPath);
-        // 与 Download 同理：同步 UploadFile 同样经 ThreadPoolProgress 在线程池上执行回调，
-        // 回调抛出即终止宿主进程，进度上报必须永不抛出。
-        _client.UploadFile(fs, remotePath,
-            new SafeProgress<ulong>(uploaded => progress?.Invoke((long)uploaded, total)).Report);
+        // 与 Download 同理：同步 UploadFile 把回调丢到线程池执行、写死 CancellationToken.None，
+        // 回调里抛异常会终止宿主进程。改走带 token 的异步重载；进度回调经 SafeProgress 永不抛出。
+        IProgress<UploadFileProgressReport>? reporter = progress is null
+            ? null
+            : new SafeProgress<UploadFileProgressReport>(r => progress((long)r.TotalBytesUploaded, total));
+        _client.UploadFileAsync(fs, remotePath, true /* canOverride：与旧行为一致 */, reporter, token)
+               .GetAwaiter().GetResult();
         progress?.Invoke(total, total);
         Utils.ShellLog.Write($"SFTP put: {localPath} -> {remotePath}");
     }

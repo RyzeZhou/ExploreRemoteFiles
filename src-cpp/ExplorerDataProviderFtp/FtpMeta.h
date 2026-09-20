@@ -520,6 +520,14 @@ inline FtpBridgeFetchState FtpBridgeFetchDir(PCWSTR site, PCWSTR remoteDir, PCWS
 {
     return FtpBridgeFetchWait(L"FETCHDIR", site, remoteDir, localRoot, batchId, response);
 }
+
+// 上传：把本地文件送到远程（粘贴 / 编辑回写 / 跨站点复制的上传段）。
+// 与 FETCH 走完全相同的"发起 + 轮询 + 取消"链路，只是 op 为 PUT；
+// 目标远程路径 = remote，本地源文件 = local。
+inline FtpBridgeFetchState FtpBridgePut(PCWSTR site, PCWSTR remote, PCWSTR local, PCWSTR batchId, std::string &response)
+{
+    return FtpBridgeFetchWait(L"PUT", site, remote, local, batchId, response);
+}
 // 递归修改权限：走常驻服务（与 DELETE 同一条路）。
 // 为什么不能在这里同步跑 CLI：属性页的「确定」在 Explorer 的 UI 线程上，树一大就整窗卡死，
 // 而且 RunCli 有 30 秒超时会把 CLI 直接杀掉（大目录必然超时，改到一半就断）。

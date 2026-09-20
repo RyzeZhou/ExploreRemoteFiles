@@ -39,8 +39,10 @@ public interface IRemoteFileSystem : IDisposable
     void Download(string remotePath, string localPath, Action<long, long>? progress = null, bool resume = false,
                   CancellationToken token = default);
 
-    /// <summary>上传本地文件到远程路径。progress(已传字节, 总字节) 可选；resume 时从断点续传。</summary>
-    void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false);
+    /// <summary>上传本地文件到远程路径。progress(已传字节, 总字节) 可选；resume 时从断点续传。
+    /// token 取消时实现必须**尽快中断**上传（服务侧的传输队列靠它取消）。</summary>
+    void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false,
+                CancellationToken token = default);
 
     /// <summary>修改远程权限（chmod；mode 为 8 进制数字，如 640）。</summary>
     void SetPermissions(string path, int mode);

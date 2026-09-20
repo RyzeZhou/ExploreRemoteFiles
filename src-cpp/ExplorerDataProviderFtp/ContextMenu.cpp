@@ -159,6 +159,15 @@ static int RunCli(PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2, std::string *c
     CloseHandle(pi.hThread);CloseHandle(pi.hProcess);return code==0?0:-1;
 }
 
+// 每次用户级传输操作一个批次 id：传输队列据此分组，取消时也只取消这一批
+//（不能用固定的 "-"，否则取消一个会连坐其它菜单传输）。
+static void MakeTransferBatchId(PWSTR out, UINT cch)
+{
+    static volatile LONG s_seq = 0;
+    StringCchPrintfW(out, cch, L"%u-%llu-%ld",
+                     (unsigned)GetCurrentProcessId(), GetTickCount64(), InterlockedIncrement(&s_seq));
+}
+
 // 递归改权限的异步入口（实现在文件后面的终端辅助区）。属性页在 UI 线程上调用它，
 // 真正的工作交给常驻服务 + 工作线程，所以这里必须先声明。
 static void StartChmodRecursiveAsync(PCWSTR site, PCWSTR path, PCWSTR modeOctal);
@@ -1319,7 +1328,10 @@ static BOOL UploadEditedFile(EDITCTX *c, BOOL *remoteCreated)
         if (RunCli(c->site, L"touch", c->remote, NULL, NULL) != 0) return FALSE;
         *remoteCreated = TRUE;
     }
-    if (RunCli(c->site, L"put", c->local, c->remote, NULL) != 0) return FALSE;
+    // 回写走常驻服务传输队列（进度/取消与其它传输统一）。
+    WCHAR batchId[64]; MakeTransferBatchId(batchId, ARRAYSIZE(batchId));
+    std::string putReply;
+    if (FtpBridgePut(c->site, c->remote, c->local, batchId, putReply) != FtpBridgeFetchState::Done) return FALSE;
     if (c->deferredCreate)
     {
         WCHAR parent[600] = {};
@@ -1400,7 +1412,10 @@ struct DownloadJob
 static DWORD WINAPI DownloadJobProc(LPVOID p)
 {
     DownloadJob *j = static_cast<DownloadJob *>(p);
-    if (RunCli(j->site.c_str(), L"get", j->remote.c_str(), j->local.c_str(), NULL) != 0)
+    // 走常驻服务传输队列（会话复用 + 进度 + 可取消），不再每次起一个 CLI 进程。
+    WCHAR batchId[64]; MakeTransferBatchId(batchId, ARRAYSIZE(batchId));
+    std::string bridgeReply;
+    if (FtpBridgeFetch(j->site.c_str(), j->remote.c_str(), j->local.c_str(), batchId, bridgeReply) != FtpBridgeFetchState::Done)
     {
         MessageBoxW(NULL, ExplorerText(L"error.download_failed", L"下载失败。", L"Download failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
         delete j;
@@ -1450,8 +1465,12 @@ static DWORD WINAPI DownloadBatchProc(LPVOID p)
 {
     DownloadBatch *b = static_cast<DownloadBatch *>(p);
     int ok = 0;
+    WCHAR batchId[64]; MakeTransferBatchId(batchId, ARRAYSIZE(batchId));
     for (auto &f : b->files)
-        if (RunCli(b->site.c_str(), L"get", f.first.c_str(), f.second.c_str(), NULL) == 0) ++ok;
+    {
+        std::string bridgeReply;
+        if (FtpBridgeFetch(b->site.c_str(), f.first.c_str(), f.second.c_str(), batchId, bridgeReply) == FtpBridgeFetchState::Done) ++ok;
+    }
     WCHAR msg[512];
     StringCchPrintf(msg, ARRAYSIZE(msg), ExplorerText(L"info.downloaded_to", L"已下载 %d 个文件到：\n%s", L"Downloaded %d files to:\n%s"), ok, b->dir.c_str());
     MessageBoxW(NULL, msg, ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONINFORMATION);
@@ -1472,11 +1491,13 @@ static DWORD WINAPI ClipJobProc(LPVOID p)
     std::vector<std::wstring> paths;
     WCHAR local[MAX_PATH];
     WCHAR full[700];
+    WCHAR batchId[64]; MakeTransferBatchId(batchId, ARRAYSIZE(batchId));
     for (auto &nm : j->names)
     {
         StringCchPrintf(local, ARRAYSIZE(local), L"%s%s", j->dir.c_str(), nm.c_str());
         JoinPath(j->folder.c_str(), nm.c_str(), full, ARRAYSIZE(full));
-        if (RunCli(j->site.c_str(), L"get", full, local, NULL) == 0) paths.push_back(local);
+        std::string bridgeReply;
+        if (FtpBridgeFetch(j->site.c_str(), full, local, batchId, bridgeReply) == FtpBridgeFetchState::Done) paths.push_back(local);
     }
     if (paths.empty())
     {
@@ -1669,6 +1690,7 @@ static DWORD WINAPI BgCopyThreadProc(LPVOID p)
 {
     BgCopyCtx *c = static_cast<BgCopyCtx *>(p);
     BOOL ok = TRUE;
+    WCHAR batchId[64]; MakeTransferBatchId(batchId, ARRAYSIZE(batchId));
     try
     {
         for (auto const &nm : c->names)
@@ -1679,10 +1701,14 @@ static DWORD WINAPI BgCopyThreadProc(LPVOID p)
                 continue;
             }
             REMOTEMETA meta = {}; if (!ReadRemoteMeta(c->site, c->folder, nm.c_str(), &meta) || meta.fIsFolder) { ok = FALSE; continue; }
-            WCHAR local[MAX_PATH] = {}; if (!TempLocalPath(L"Copy", c->site, nm.c_str(), local, ARRAYSIZE(local)) || RunCli(c->site, L"get", src, local, NULL) != 0) { ok = FALSE; continue; }
+            WCHAR local[MAX_PATH] = {};
+            if (!TempLocalPath(L"Copy", c->site, nm.c_str(), local, ARRAYSIZE(local))) { ok = FALSE; continue; }
+            std::string getReply;
+            if (FtpBridgeFetch(c->site, src, local, batchId, getReply) != FtpBridgeFetchState::Done) { ok = FALSE; continue; }
             if (c->target == COPY_OTHER_SITE) {
                 WCHAR remote[700] = {}; if (c->targetPath[0] == L'/' && !c->targetPath[1]) StringCchPrintf(remote, ARRAYSIZE(remote), L"/%s", nm.c_str()); else StringCchPrintf(remote, ARRAYSIZE(remote), L"%s/%s", c->targetPath, nm.c_str());
-                if (RunCli(c->targetSite, L"put", local, remote, NULL) != 0) ok = FALSE;
+                std::string putReply;
+                if (FtpBridgePut(c->targetSite, remote, local, batchId, putReply) != FtpBridgeFetchState::Done) ok = FALSE;
             } else {
                 WCHAR localTarget[MAX_PATH] = {}; StringCchPrintf(localTarget, ARRAYSIZE(localTarget), L"%s\\%s", c->targetPath, nm.c_str());
                 // 工作线程没有可用的 owner 窗口，覆盖确认用 NULL owner。
@@ -1921,13 +1947,16 @@ static DWORD WINAPI PasteJobProc(LPVOID p)
 {
     PasteJob *j = static_cast<PasteJob *>(p);
     BOOL ok = TRUE;
+    WCHAR batchId[64]; MakeTransferBatchId(batchId, ARRAYSIZE(batchId));
     for (auto const &local : j->files)
     {
         WCHAR name[MAX_PATH];
         StringCchCopy(name, ARRAYSIZE(name), PathFindFileNameW(local.c_str()));
         WCHAR full[700]; JoinPath(j->folder, name, full, ARRAYSIZE(full));
         ProbeLog(L"[UPLOAD] put '%s' -> '%s'", local.c_str(), full);
-        if (RunCli(j->site, L"put", local.c_str(), full, NULL) != 0) ok = FALSE;
+        // 上传走常驻服务传输队列（会话复用 + 进度 + 可取消），不再起 CLI 进程。
+        std::string putReply;
+        if (FtpBridgePut(j->site, full, local.c_str(), batchId, putReply) != FtpBridgeFetchState::Done) ok = FALSE;
         else
         {
             ULONGLONG sz = 0;

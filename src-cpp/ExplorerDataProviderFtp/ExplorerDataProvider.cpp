@@ -762,6 +762,7 @@ try
         return hr;
     }
     std::vector<FTPENTRY> items;
+    const ULONGLONG tList = GetTickCount64();
     if (!FtpListCachedAll(m_szSiteName, m_szRemotePath, items))
     {
         // Round-trip contract: Explorer resolves an item's FORPARSING name back
@@ -769,6 +770,15 @@ try
         // item look invalid/reconciling to the shell.
         ProbeLog(L"[PARSE] LIST-FAIL level=%d site='%s' path='%s' name='%s'", m_nLevel, m_szSiteName, m_szRemotePath, component);
         return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+    {
+        // 身份解析正常应从 m_recentItems 快照命中（零 I/O）。落到这里说明名字不在
+        // 当前视图快照里（例如地址栏输入了更深/更早的路径）——这是一次**同步**远程
+        // 列举，会占住调用线程；只在明显偏慢时留证（2026-09-20）。
+        ULONGLONG dt = GetTickCount64() - tList;
+        if (dt >= 50)
+            ProbeLog(L"[PARSE] slow LIST level=%d site='%s' path='%s' name='%s' items=%u elapsedMs=%llu",
+                     m_nLevel, m_szSiteName, m_szRemotePath, component, (UINT)items.size(), dt);
     }
     for (auto const &item : items)
     {
@@ -911,12 +921,11 @@ try
             }
             return S_OK; // out-of-memory: empty enumeration, UPDATEDIR will follow
         }
-        // Cold + transfer/storage enumeration (SHCONTF_STORAGE, no ENABLE_ASYNC):
-        // fall through to the unseeded enumerator below, whose Initialize() does
-        // the blocking FtpListCachedAll. The copy/drag/delete engine must receive
-        // the real children; Explorer runs this inside the transfer with its own
-        // progress UI, so correctness beats an instant reply here.
-        ProbeLog(L"[ENUM] sync-list(transfer/storage) flags=0x%X path='%s'", grfFlags, m_szRemotePath);
+        // NOTE (2026-09-20): 到这里其实不可达 —— `!haveSnap`（占位条目）与
+        // `haveSnap`（暖快照）两支都在上面 return 了，而且都是**已播种**的枚举器，
+        // 所以 CFolderViewImplEnumIDList::Initialize 对远程目录**从不下发网络 LIST**。
+        // 保留这个点只为防回归：将来若有人改回"未播种 + 同步 Initialize"，这里会大声记一条。
+        ProbeLog(L"[ENUM] WARN unseeded sync-list reached flags=0x%X path='%s' -> 会阻塞调用线程", grfFlags, m_szRemotePath);
     }
     else
     {
@@ -2668,6 +2677,10 @@ HRESULT CFolderViewImplEnumIDList::Initialize()
     else
     {
         std::vector<FTPENTRY> entries;
+        // 只有"未播种"的枚举器会走到这里。当前 EnumObjects 对远程目录一律播种
+        //（命中快照用快照、冷目录用占位条目 + 后台预取），所以正常路径不会到这里；
+        // 真到了这里就是在调用线程上同步拉一次远程列表，必须留证据（2026-09-20）。
+        ProbeLog(L"[ENUM] Initialize unseeded network LIST level=%d site='%s' path='%s'", m_nLevel, m_szSite, m_szPath);
         if (!FtpListCachedAll(m_szSite, m_szPath, entries)) return E_FAIL;
         m_aData.reserve(entries.size());
         for (auto const &entry : entries)

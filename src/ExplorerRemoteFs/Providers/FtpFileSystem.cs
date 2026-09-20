@@ -211,15 +211,18 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"FTP get: {remotePath} -> {localPath}");
     }
 
-    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false)
+    public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false,
+                       CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         EnsureConnected();
         if (_client is null) return;
         long total = 0;
         try { total = new FileInfo(localPath).Length; } catch { }
         Action<FtpProgress>? fp = null;
-        if (progress is not null)
-            fp = p => progress(p.TransferredBytes, total);
+        if (progress is not null || token.CanBeCanceled)
+            // FluentFTP 在传输线程上调用 fp：抛 OCE 即中断上传（与 Download 同一取消机制）。
+            fp = p => { token.ThrowIfCancellationRequested(); progress?.Invoke(p.TransferredBytes, total); };
         // FtpRemoteExists.Resume makes FluentFTP issue REST and continue from
         // the remote file's current size.
         var mode = resume ? FtpRemoteExists.Resume : FtpRemoteExists.Overwrite;

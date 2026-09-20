@@ -214,6 +214,25 @@ public sealed class RemoteBridgeService : IDisposable
             return;
         }
 
+        // PUT：把本地文件上传到远程（粘贴 / 编辑回写 / 跨站点复制的上传段）。
+        // 与 FETCH 完全同形：立刻回 jobId，上传在后台跑，进传输队列（有进度、可取消）。
+        if (string.Equals(operation, "PUT", StringComparison.Ordinal))
+        {
+            string? putSite = await reader.ReadLineAsync(token);
+            string? putRemote = await reader.ReadLineAsync(token);
+            string? putLocal = await reader.ReadLineAsync(token);
+            string? putBatch = await reader.ReadLineAsync(token);
+            if (string.IsNullOrWhiteSpace(putSite) || string.IsNullOrWhiteSpace(putRemote) ||
+                string.IsNullOrWhiteSpace(putLocal))
+            {
+                await writer.WriteLineAsync("FAIL: invalid put request");
+                return;
+            }
+            var putJob = StartFetchJob(putSite, putRemote, putLocal, putBatch ?? string.Empty, isDir: false, isPut: true);
+            await writer.WriteLineAsync("STARTED " + putJob.Id);
+            return;
+        }
+
         // FETCHSTATUS：查询一个后台下载任务。短请求，秒回 —— 扩展侧靠它区分
         // "还在下" / "下完了" / "失败了" / "被用户取消了"。
         if (string.Equals(operation, "FETCHSTATUS", StringComparison.Ordinal))
@@ -378,6 +397,7 @@ public sealed class RemoteBridgeService : IDisposable
     {
         public string Id = "";
         public string Site = "", Remote = "", Local = "", BatchId = "";
+        public bool IsPut;              // true = 上传（PUT），false = 下载（FETCH/FETCHDIR）
         public long Done, Total;
         public int State = (int)FetchJobState.Running;
         public string Message = "";
@@ -387,22 +407,22 @@ public sealed class RemoteBridgeService : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, FetchJob> _fetchJobs = new();
 
     /// <summary>登记一个后台下载并立即返回（调用方把 job.Id 回给扩展）。</summary>
-    private FetchJob StartFetchJob(string site, string remote, string local, string batchId, bool isDir)
+    private FetchJob StartFetchJob(string site, string remote, string local, string batchId, bool isDir, bool isPut = false)
     {
         var job = new FetchJob
         {
             Id = Guid.NewGuid().ToString("N"),
-            Site = site, Remote = remote, Local = local, BatchId = batchId,
+            Site = site, Remote = remote, Local = local, BatchId = batchId, IsPut = isPut,
         };
         _fetchJobs[job.Id] = job;
-        Log($"fetch queued id='{job.Id}' site='{site}' remote='{remote}' temp='{local}' batch='{batchId}' kind={(isDir ? "dir" : "file")} free={AvailableBytes(local)}");
+        Log($"fetch queued id='{job.Id}' site='{site}' remote='{remote}' temp='{local}' batch='{batchId}' kind={(isPut ? "put" : isDir ? "dir" : "file")} free={AvailableBytes(local)}");
         _ = Task.Run(async () =>
         {
             try
             {
-                FetchResult result = isDir
-                    ? await FetchDirAsync(job)
-                    : await FetchAsync(job);
+                FetchResult result = isPut
+                    ? await PutAsync(job)
+                    : (isDir ? await FetchDirAsync(job) : await FetchAsync(job));
                 job.Message = result.Message;
                 Volatile.Write(ref job.State, (int)result.State);
                 Log($"fetch terminal id='{job.Id}' batch='{job.BatchId}' state={result.State} message='{result.Message}'");
@@ -531,6 +551,58 @@ public sealed class RemoteBridgeService : IDisposable
             return new(FetchJobState.Failed, message);
         }
     }
+
+    /// <summary>上传一个本地文件到远程（粘贴 / 编辑回写 / 跨站点复制）。
+    /// 与 FetchAsync 同构：走**传输队列**、进度聚合到同一个任务上、取消是终态。</summary>
+    private async Task<FetchResult> PutAsync(FetchJob job)
+    {
+        var siteName = job.Site; var remotePath = job.Remote; var localPath = job.Local; var batchId = job.BatchId;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, job.Cts.Token);
+        TransferTask? task = null;
+        try
+        {
+            cancellation.Token.ThrowIfCancellationRequested();
+            var connection = FindConnection(siteName);
+            var remote = NormalizeRemotePath(remotePath);
+            if (string.IsNullOrWhiteSpace(localPath) || !File.Exists(localPath))
+                return new(FetchJobState.Failed, "missing local file");
+            var fileName = System.IO.Path.GetFileName(localPath);
+            task = _transfers?.BeginManagedTask("upload", siteName, fileName, remote,
+                () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }), batchId);
+            using var fs = ProviderFactory.Create(connection);
+            await Task.Run(() =>
+            {
+                cancellation.Token.ThrowIfCancellationRequested();
+                fs.EnsureConnected();
+                cancellation.Token.ThrowIfCancellationRequested();
+                fs.Upload(localPath, remote, (done, total) =>
+                {
+                    job.Done = done; job.Total = total;
+                    // 注意：SSH.NET 的上传进度回调跑在**会话的消息线程**上，在这里阻塞会把整条
+                    // 连接卡住（与下载的传输线程不同）。所以上传只支持取消、不做暂停闸门阻塞。
+                    if (task is not null) _transfers?.UpdateManagedTask(task, done, total, fileName);
+                }, false, cancellation.Token);
+            }, cancellation.Token);
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (task is not null) _transfers?.CompleteManagedTask(task, true, null);
+            Log($"put done id='{job.Id}' site='{siteName}' remote='{remote}' src='{localPath}' bytes={job.Total} batch='{batchId}'");
+            return new(FetchJobState.Done, "");
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, null, cancelled: true);
+            Log($"put cancelled id='{job.Id}' site='{siteName}' remote='{remotePath}' src='{localPath}' bytes={job.Done}/{job.Total} batch='{batchId}'");
+            return new(FetchJobState.Cancelled, "");
+        }
+        catch (Exception ex)
+        {
+            string message = SanitizeBridgeError(ex.Message);
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, message);
+            Log($"put failed id='{job.Id}' site='{siteName}' remote='{remotePath}' src='{localPath}' bytes={job.Done}/{job.Total} exception='{SanitizeBridgeError(ex.ToString())}'");
+            return new(FetchJobState.Failed, message);
+        }
+    }
+
     /// <summary>递归下载一个远程目录到本地根：**一个文件夹 = 一个队列任务**（用户要求），
     /// 同时拖多个文件夹时每个文件夹各自一组。
     ///
