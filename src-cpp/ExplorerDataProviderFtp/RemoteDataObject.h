@@ -24,6 +24,31 @@
 #include "ProbeLog.h"
 #include "FtpMeta.h"
 
+// ---------------------------------------------------------------------------
+// IDataObjectAsyncCapability（{3D8B0590-F691-11d2-8EA9-006097DF5BD4}）
+//
+// 用途：告诉 Shell「这个数据对象可以**异步**取」。Explorer 的复制引擎在遇到慢数据源
+// （网络/慢设备）时，会在后台线程上调用我们的 IDataObject::GetData，并用它自己的进度
+// 窗口，而不是压住窗口线程。这正是"Ctrl+C 复制时源端 Explorer 假死"的对症解。
+//
+// 这里自带接口声明与 GUID，避免依赖 shldisp.h 及其 IID 所在库（ShlDisp.h 只做
+// EXTERN_C 声明，定义在别的 lib 里）。若将来某处已 include 了 ShlDisp.h，用它自己的
+// 接口定义，不重复声明。
+// ---------------------------------------------------------------------------
+#ifndef __IDataObjectAsyncCapability_INTERFACE_DEFINED__
+#define __IDataObjectAsyncCapability_INTERFACE_DEFINED__
+struct IDataObjectAsyncCapability : public IUnknown
+{
+    virtual HRESULT STDMETHODCALLTYPE SetAsyncMode(BOOL fDoOpAsync) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAsyncMode(BOOL *pfIsOpAsync) = 0;
+    virtual HRESULT STDMETHODCALLTYPE StartOperation(IBindCtx *pbcReserved) = 0;
+    virtual HRESULT STDMETHODCALLTYPE InOperation(BOOL *pfInAsyncOp) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EndOperation(HRESULT hResult, IBindCtx *pbcReserved, DWORD dwEffects) = 0;
+};
+#endif
+static const GUID ERF_IID_IDataObjectAsyncCapability =
+{ 0x3d8b0590, 0xf691, 0x11d2, { 0x8e, 0xa9, 0x00, 0x60, 0x97, 0xdf, 0x5b, 0xd4 } };
+
 // Local path of the transfer CLI (per-user install location).
 inline std::wstring RfsCliPath()
 {
@@ -557,7 +582,7 @@ private:
 // ---------------------------------------------------------------------------
 // Data object: descriptors up front, contents lazily.
 // ---------------------------------------------------------------------------
-class CRemoteDataObject : public IDataObject
+class CRemoteDataObject : public IDataObject, public IDataObjectAsyncCapability
 {
 public:
     struct Item
@@ -651,7 +676,53 @@ public:
             AddRef();
             return S_OK;
         }
+        if (IsEqualIID(riid, ERF_IID_IDataObjectAsyncCapability))
+        {
+            *ppv = static_cast<IDataObjectAsyncCapability *>(this);
+            AddRef();
+            return S_OK;
+        }
         return E_NOINTERFACE;
+    }
+
+    // ---- IDataObjectAsyncCapability ---------------------------------------
+    // 只要 Shell 问起/设置这个接口，就留一条日志 —— 这是判断 A 方案在 Win11 上
+    // 到底有没有被采纳的唯一证据（如果一直没有任何 [ASYNC] 行，说明复合数据对象
+    // 没把接口透出去，得走 B）。
+    STDMETHODIMP SetAsyncMode(BOOL fDoOpAsync) override
+    {
+        ProbeLog(L"[ASYNC] SetAsyncMode %d tid=%lu", (int)fDoOpAsync, GetCurrentThreadId());
+        _asyncMode = fDoOpAsync;
+        return S_OK;
+    }
+    STDMETHODIMP GetAsyncMode(BOOL *pfIsOpAsync) override
+    {
+        if (!pfIsOpAsync) return E_POINTER;
+        *pfIsOpAsync = _asyncMode;
+        ProbeLog(L"[ASYNC] GetAsyncMode -> %d tid=%lu", (int)_asyncMode, GetCurrentThreadId());
+        return S_OK;
+    }
+    STDMETHODIMP StartOperation(IBindCtx * /*pbcReserved*/) override
+    {
+        ProbeLog(L"[ASYNC] StartOperation tid=%lu", GetCurrentThreadId());
+        _inOperation = TRUE;
+        // 越早开始后台预热越好：即使随后那次 GetData 仍在调用线程上同步执行，
+        // 也能直接吃缓存，而不是自己再拉一遍网络。
+        Prewarm();
+        return S_OK;
+    }
+    STDMETHODIMP InOperation(BOOL *pfInAsyncOp) override
+    {
+        if (!pfInAsyncOp) return E_POINTER;
+        *pfInAsyncOp = _inOperation;
+        return S_OK;
+    }
+    STDMETHODIMP EndOperation(HRESULT /*hResult*/, IBindCtx * /*pbcReserved*/, DWORD /*dwEffects*/) override
+    {
+        ProbeLog(L"[ASYNC] EndOperation tid=%lu", GetCurrentThreadId());
+        _inOperation = FALSE;
+        _asyncMode = FALSE;
+        return S_OK;
     }
     STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&_ref); }
     STDMETHODIMP_(ULONG) Release() override
@@ -731,6 +802,11 @@ public:
     {
         if (_expanded) return;
         if (TryExpand(TRUE)) return;             // warm: answered without blocking
+
+        // 冷路径：把线程与 async 状态记下来 —— 判断 Shell 是否把这次展开放在了
+        // 后台线程（async=1 且 tid 与窗口线程不同）还是仍在窗口线程上。
+        ProbeLog(L"[DATAOBJ] ExpandIfNeeded cold tid=%lu async=%d inOp=%d suppressed=%d",
+                 GetCurrentThreadId(), (int)_asyncMode, (int)_inOperation, (int)BeingProbed());
 
         if (BeingProbed())
         {
@@ -963,4 +1039,6 @@ private:
     BOOL _probeBorn = FALSE;        // created inside a shell menu/drag probe window
     DWORD _probeTick = 0;           // and when that happened (see BeingProbed)
     BOOL _prewarmStarted = FALSE;   // background subtree warm-up already kicked off
+    BOOL _asyncMode = FALSE;        // IDataObjectAsyncCapability: target opted into async
+    BOOL _inOperation = FALSE;      // IDataObjectAsyncCapability: between Start/EndOperation
 };
