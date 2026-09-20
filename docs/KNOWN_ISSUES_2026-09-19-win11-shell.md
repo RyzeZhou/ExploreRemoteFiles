@@ -1094,7 +1094,8 @@ HKCU\Software\ExplorerRemoteFs\DownloadDir   (REG_SZ)
 
 1. 编译：`dotnet publish src-client/RemoteFsClient`（或随 Win10 侧 build-release 全量编译）。
 2. 安装后用**操作同一套**：同一 Explorer 窗口开 ≥2 个标签，切到**非第一个**标签，地址栏输
-   `erf:site:/path` → 预期**只在该标签直达**；`%TEMP%emotefs-erf.log` 应见
+   `erf:site:/path` → 预期**只在该标签直达**；`%TEMP%
+emotefs-erf.log` 应见
    `UIA active-tab name='...'` 与对应条目的 `score=5`。
 3. 回归普通路径（地址栏 `易远传/WSL/R`、`::{CLSID}\WSL/R`）：应不受影响（根本不进协议通道）。
 
@@ -1105,3 +1106,45 @@ HKCU\Software\ExplorerRemoteFs\DownloadDir   (REG_SZ)
   不存在"用命令在现有窗口开新标签"。
 - "保存工作区 = 一组路径恢复成一个窗口多标签"：公开 API 层做不了（无按清单开多标签的接口；
   多标签只能 UI 手势 Ctrl+T 创建，或 UIA 自动化逐标签导航 —— 属另一功能，未实现）。
+
+
+### 实测确认修复生效 + 性能优化（2026-09-20 深夜）
+
+**修复生效证据**（本机 Win11 25H2，装 9fc32fb 客户端后实测三次）：
+
+```
+UIA active-tab name='ui'     -> ShellWindows[11] name='ui'     score=5
+UIA active-tab name='此电脑'  -> ShellWindows[14] name='此电脑'  score=5
+```
+
+同一窗口 `0x618F6` 下四个 ERF 标签（`R` / `B` / `main` / `此电脑`）在旧逻辑里**全部 score=4 并列**、
+只选中枚举序最小的 `[11]`；新逻辑精确命中活动标签 `[14]`。**"固定跳第一个标签"根治。**
+
+**慢的本质（用户问，已确认）**：两条通道耗时结构不同 ——
+
+| | 原生 `易远传/WSL/R`、`::{CLSID}\…` | `erf:WSL:/etc` |
+|---|---|---|
+| 谁解析 | **Explorer 自己**（进程内直接调 `ParseDisplayName`） | Shell 判 scheme → **另起进程** |
+| 跳数 | **1** | **5**：启进程 → IPC 转常驻服务 → COM 枚举 ShellWindows → 跨进程 UIA 读 XAML 树 → COM `Navigate2` |
+| 活动标签 | **天然成立** | 必须**事后回推** |
+
+`xxx:` 在 Win11 一律先判 scheme（实测钉死），无法降级为命名空间解析 —— 所以 `erf:` 前缀注定多这几跳。
+实测分段：进程启动+IPC ≈130ms、**UIA ≈550ms**、枚举+导航 ≈60ms。
+
+**优化（提交 `707fed9`）**：
+
+1. `TryGetActiveTabName` 的 `FindAll`（遍历整棵 UIA 子树）→ **`FindFirst`**（找到 TabView 即停）——
+   550ms 的主要来源；
+2. UIA 探测由"枚举前无条件调用"→ **延迟到确有歧义时**：先按句柄打分并记录并列候选
+   （`tieIndexes`），仅当最高分并列 >1 个时才读一次活动标签消歧；未命中则保持原选择（不更差）。
+
+**为什么不用 `if (是Win11)` 平台判断**（用户提出，已确认没必要）：
+
+| 场景 | 行为 |
+|---|---|
+| Win11 多标签（有歧义） | 并列 → 调 UIA → 消歧 ✅ |
+| Win10 / 单标签（无歧义） | `tieIndexes.Count == 1` → **完全不调 UIA，零开销** ✅ |
+| Win10 若意外并列 | UIA 在经典地址栏（`ToolbarWindow32`）找不到 XAML `TabView` → `FindFirst` 返回 null → **保持原选择**，无害降级 ✅ |
+| 第三方壳（StartAllback / ExplorerPatcher）改写地址栏 | 行为分支照常工作；平台分支会误判 ✅ |
+
+即：Win10 天然走"无歧义"快路径，判据放在**行为**（是否真有歧义）而不是**平台**，更稳。
