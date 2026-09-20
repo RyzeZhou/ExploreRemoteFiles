@@ -191,6 +191,118 @@ static void RefreshLocalFast(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE pidl)
     FtpPrefetchQuiet(site, folder);
 }
 
+// ---------------------------------------------------------------------------
+// 通用后台 CLI 写操作（2026-09-20）
+//
+// 背景：`RunCli` 是 CreateProcessW + WaitForSingleObject（默认 30s），而且每次都是
+// 新进程 + 新连接。在 Explorer 的 UI 线程上直接调用，就是一次几百毫秒到几秒的假死
+//（属性页「确定」、右键「新建文件夹 / 重命名 / 移动到 / 创建副本」全都如此）。
+// 用户定调：**所有传输、权限修改、删除都必须在后台进行**。
+//
+// 范式与 StartDeleteRemote / StartChmodRecursiveAsync / DownloadJobProc 一致：
+// UI 线程只投递参数（全部拷贝成自己的副本），工作线程执行 CLI，成功后走统一的
+// AfterRemoteMutation 刷新管线，失败用 NULL owner 弹窗（绝不碰可能已销毁的 hwnd）。
+// ---------------------------------------------------------------------------
+enum BgAfter
+{
+    BG_NONE = 0,
+    BG_REFRESH,        // AfterRemoteMutation(refreshSite, refreshFolder, notify)
+    BG_PATCH_ADD,      // 新建目录：FtpCachePatchAdd + 立即刷新
+    BG_PATCH_RENAME,   // 重命名：FtpCachePatchRename + 立即刷新
+};
+
+struct BgCliStep
+{
+    WCHAR site[64];
+    WCHAR verb[16];
+    WCHAR p1[700];
+    WCHAR p2[700];
+};
+
+struct BgCliJob
+{
+    std::vector<BgCliStep> steps;
+    BgAfter after = BG_REFRESH;
+    WCHAR refreshSite[64] = {};
+    WCHAR refreshFolder[600] = {};
+    WCHAR nameA[256] = {};        // PATCH_ADD: 新名；PATCH_RENAME: 旧名
+    WCHAR nameB[256] = {};        // PATCH_RENAME: 新名
+    BOOL isFolder = FALSE;        // PATCH_ADD
+    PIDLIST_ABSOLUTE notify = NULL;
+    WCHAR failText[200] = {};     // 空 = 只记日志、不弹窗
+    DWORD timeoutMs = 30000;
+};
+
+static void BgAddStep(BgCliJob &job, PCWSTR site, PCWSTR verb, PCWSTR p1, PCWSTR p2)
+{
+    BgCliStep s = {};
+    StringCchCopy(s.site, ARRAYSIZE(s.site), site ? site : L"");
+    StringCchCopy(s.verb, ARRAYSIZE(s.verb), verb ? verb : L"");
+    StringCchCopy(s.p1, ARRAYSIZE(s.p1), p1 ? p1 : L"");
+    StringCchCopy(s.p2, ARRAYSIZE(s.p2), p2 ? p2 : L"");
+    job.steps.push_back(s);
+}
+
+static DWORD WINAPI BgCliJobProc(LPVOID p)
+{
+    BgCliJob *j = static_cast<BgCliJob *>(p);
+    BOOL ok = TRUE;
+    try
+    {
+        for (auto const &s : j->steps)
+        {
+            if (RunCli(s.site, s.verb, s.p1, (s.p2[0] ? s.p2 : NULL), NULL, j->timeoutMs) != 0)
+            {
+                // 多条目任务（移动到…）要像原来一样把每一项都试一遍，只是最后如实报失败。
+                ProbeLog(L"[BGCLI] step failed site='%s' verb='%s' p1='%s'", s.site, s.verb, s.p1);
+                ok = FALSE;
+            }
+        }
+    }
+    catch (...) { ok = FALSE; }
+
+    if (ok)
+    {
+        switch (j->after)
+        {
+        case BG_PATCH_ADD:
+            FtpCachePatchAdd(j->refreshSite, j->refreshFolder, j->nameA, j->isFolder, 0);
+            RefreshLocalFast(j->refreshSite, j->refreshFolder, j->notify);
+            break;
+        case BG_PATCH_RENAME:
+            FtpCachePatchRename(j->refreshSite, j->refreshFolder, j->nameA, j->nameB);
+            RefreshLocalFast(j->refreshSite, j->refreshFolder, j->notify);
+            break;
+        case BG_REFRESH:
+        default:
+            ProbeLog(L"[BGCLI] job done site='%s' path='%s' steps=%u", j->refreshSite, j->refreshFolder, (UINT)j->steps.size());
+            AfterRemoteMutation(j->refreshSite, j->refreshFolder, j->notify);
+            break;
+        }
+    }
+    else if (j->failText[0])
+    {
+        MessageBoxW(NULL, j->failText, ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+    }
+
+    if (j->notify) ILFree(j->notify);
+    delete j;
+    DllRelease();
+    return 0;
+}
+
+// 投递一个后台 CLI 任务。job.notify 的所有权转移给工作线程（投递失败时本函数负责释放）。
+static void StartBgCliJob(BgCliJob job)
+{
+    if (job.steps.empty()) { if (job.notify) ILFree(job.notify); return; }
+    BgCliJob *j = new (std::nothrow) BgCliJob(job);
+    if (!j) { if (job.notify) ILFree(job.notify); return; }
+    DllAddRef();   // 2026-09-20: 线程自己 pin 模块
+    HANDLE h = CreateThread(NULL, 0, BgCliJobProc, j, 0, NULL);
+    if (h) CloseHandle(h);
+    else { DllRelease(); if (j->notify) ILFree(j->notify); delete j; }
+}
+
 // Defined immediately after the transfer-source bridge below.  Keep this
 // declaration here because that bridge needs the parent remote directory.
 static void PathParent(PCWSTR full, PWSTR out, UINT cch);
@@ -859,13 +971,16 @@ static void PermApplyChown(HWND hDlg, PROPMETA *pm)
 
     WCHAR spec[160];
     StringCchPrintf(spec, ARRAYSIZE(spec), L"%s:%s", changeU ? newU : L"-", changeG ? newG : L"-");
-    if (RunCli(pm->site, L"chown", pm->path, spec, NULL) != 0)
-        MessageBoxW(hDlg, ExplorerText(L"error.owner_group_rejected", L"SFTP 服务器拒绝了所有者/组更新（名称必须能在远端解析，或直接填数字 ID）。", L"Owner/group update was rejected by the SFTP server (the name must resolve on the remote host, or use a numeric ID)."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
-    else
-    {
-        WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
-        AfterRemoteMutation(pm->site, parentDir, pm->notify);
-    }
+    // chown 走 CLI（新进程 + 新连接），绝不能在属性页的 UI 线程上等（2026-09-20）。
+    (void)hDlg;   // 失败提示改由工作线程用 NULL owner 弹出
+    BgCliJob job;
+    BgAddStep(job, pm->site, L"chown", pm->path, spec);
+    StringCchCopy(job.refreshSite, ARRAYSIZE(job.refreshSite), pm->site);
+    PathParent(pm->path, job.refreshFolder, ARRAYSIZE(job.refreshFolder));
+    job.notify = pm->notify ? ILCloneFull(pm->notify) : NULL;
+    StringCchCopy(job.failText, ARRAYSIZE(job.failText),
+        ExplorerText(L"error.owner_group_rejected", L"SFTP 服务器拒绝了所有者/组更新（名称必须能在远端解析，或直接填数字 ID）。", L"Owner/group update was rejected by the SFTP server (the name must resolve on the remote host, or use a numeric ID)."));
+    StartBgCliJob(job);
 }
 
 static PCWSTR PropertyDialogTitle(const REMOTEMETA *meta)
@@ -980,11 +1095,18 @@ static INT_PTR CALLBACK PermDlgProc(HWND hDlg,UINT msg,WPARAM wp,LPARAM lp)
                         // 递归改权限可能遍历上万个条目：**绝不能在 UI 线程上等**。
                         // 交给常驻服务（它带进度窗口和「取消」），本对话框立即关闭。
                         StartChmodRecursiveAsync(pm->site, pm->path, modeStr);
-                    } else if(RunCli(pm->site, L"chmod", pm->path, modeStr, NULL)==0){
-                        // 单个条目的 chmod 很快，保持同步：结果确定、无需进度窗口。
-                        WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
-                        AfterRemoteMutation(pm->site, parentDir, pm->notify);
-                    } else MessageBoxW(hDlg, ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
+                    } else {
+                        // 单个条目的 chmod 也不再同步：RunCli 会起新进程 + 新连接，
+                        // 在属性页的 UI 线程上等就是一次假死（2026-09-20）。
+                        BgCliJob job;
+                        BgAddStep(job, pm->site, L"chmod", pm->path, modeStr);
+                        StringCchCopy(job.refreshSite, ARRAYSIZE(job.refreshSite), pm->site);
+                        PathParent(pm->path, job.refreshFolder, ARRAYSIZE(job.refreshFolder));
+                        job.notify = pm->notify ? ILCloneFull(pm->notify) : NULL;
+                        StringCchCopy(job.failText, ARRAYSIZE(job.failText),
+                            ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."));
+                        StartBgCliJob(job);
+                    }
                 }
                 PermApplyChown(hDlg,pm);
                 if(pm->modeless) DestroyWindow(hDlg); else EndDialog(hDlg,IDOK);
@@ -1530,31 +1652,74 @@ static BOOL CopyToRemoteFolder(PCWSTR site, PCWSTR sourceFolder, PCWSTR name, PC
     else StringCchPrintf(dst, ARRAYSIZE(dst), L"%s/%s", targetFolder, targetName);
     return RunCli(site, L"dup", src, dst, NULL) == 0;
 }
+// 「复制到…」整体搬到工作线程：同站点是 dup、跨站点是 get+put、复制到本地是 get+CopyFile，
+// 无论哪种都是**传输**，按用户定调绝不能占 Explorer 的 UI 线程（2026-09-20）。
+struct BgCopyCtx
+{
+    WCHAR site[64];
+    WCHAR folder[600];
+    std::vector<std::wstring> names;
+    COPYTARGET target;
+    WCHAR targetSite[64];
+    WCHAR targetPath[700];
+    PIDLIST_ABSOLUTE notify;
+};
+
+static DWORD WINAPI BgCopyThreadProc(LPVOID p)
+{
+    BgCopyCtx *c = static_cast<BgCopyCtx *>(p);
+    BOOL ok = TRUE;
+    try
+    {
+        for (auto const &nm : c->names)
+        {
+            WCHAR src[700] = {}; JoinPath(c->folder, nm.c_str(), src, ARRAYSIZE(src));
+            if (c->target == COPY_ORIGINAL || c->target == COPY_SAME_SITE) {
+                if (!CopyToRemoteFolder(c->site, c->folder, nm.c_str(), c->target == COPY_ORIGINAL ? c->folder : c->targetPath, c->target == COPY_ORIGINAL || StrCmpI(c->folder, c->targetPath) == 0)) ok = FALSE;
+                continue;
+            }
+            REMOTEMETA meta = {}; if (!ReadRemoteMeta(c->site, c->folder, nm.c_str(), &meta) || meta.fIsFolder) { ok = FALSE; continue; }
+            WCHAR local[MAX_PATH] = {}; if (!TempLocalPath(L"Copy", c->site, nm.c_str(), local, ARRAYSIZE(local)) || RunCli(c->site, L"get", src, local, NULL) != 0) { ok = FALSE; continue; }
+            if (c->target == COPY_OTHER_SITE) {
+                WCHAR remote[700] = {}; if (c->targetPath[0] == L'/' && !c->targetPath[1]) StringCchPrintf(remote, ARRAYSIZE(remote), L"/%s", nm.c_str()); else StringCchPrintf(remote, ARRAYSIZE(remote), L"%s/%s", c->targetPath, nm.c_str());
+                if (RunCli(c->targetSite, L"put", local, remote, NULL) != 0) ok = FALSE;
+            } else {
+                WCHAR localTarget[MAX_PATH] = {}; StringCchPrintf(localTarget, ARRAYSIZE(localTarget), L"%s\\%s", c->targetPath, nm.c_str());
+                // 工作线程没有可用的 owner 窗口，覆盖确认用 NULL owner。
+                if (PathFileExistsW(localTarget) && IDYES != MessageBoxW(NULL, ExplorerText(L"confirm.overwrite_local", L"目标位置已有同名文件，要覆盖吗？", L"A file with the same name already exists. Replace it?"), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_YESNO | MB_ICONWARNING)) { DeleteFileW(local); continue; }
+                if (!CopyFileW(local, localTarget, FALSE)) ok = FALSE;
+            }
+            DeleteFileW(local);
+        }
+    }
+    catch (...) { ok = FALSE; }
+
+    if (!ok) MessageBoxW(NULL, ExplorerText(L"error.copy_failed", L"部分项目复制失败。跨站点和本地复制目前仅支持文件。", L"Some items could not be copied. Cross-site and local copies currently support files only."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+    else AfterRemoteMutation(c->site, c->folder, c->notify);
+
+    if (c->notify) ILFree(c->notify);
+    delete c;
+    DllRelease();
+    return 0;
+}
+
 static void ServerCopy(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count, PIDLIST_ABSOLUTE notifyPidl)
 {
     COPYCTX ctx = {}; StringCchCopy(ctx.sourceSite, ARRAYSIZE(ctx.sourceSite), site); StringCchCopy(ctx.sourceFolder, ARRAYSIZE(ctx.sourceFolder), folder); ctx.names = names; ctx.count = count;
     if (!PromptCopyTarget(hwnd, &ctx)) return;
-    BOOL ok = TRUE;
-    for (int i = 0; i < count; ++i) {
-        WCHAR src[700] = {}; JoinPath(folder, names[i], src, ARRAYSIZE(src));
-        if (ctx.target == COPY_ORIGINAL || ctx.target == COPY_SAME_SITE) {
-            if (!CopyToRemoteFolder(site, folder, names[i], ctx.target == COPY_ORIGINAL ? folder : ctx.targetPath, ctx.target == COPY_ORIGINAL || StrCmpI(folder, ctx.targetPath) == 0)) ok = FALSE;
-            continue;
-        }
-        REMOTEMETA meta = {}; if (!ReadRemoteMeta(site, folder, names[i], &meta) || meta.fIsFolder) { ok = FALSE; continue; }
-        WCHAR local[MAX_PATH] = {}; if (!TempLocalPath(L"Copy", site, names[i], local, ARRAYSIZE(local)) || RunCli(site, L"get", src, local, NULL) != 0) { ok = FALSE; continue; }
-        if (ctx.target == COPY_OTHER_SITE) {
-            WCHAR remote[700] = {}; if (ctx.targetPath[0] == L'/' && !ctx.targetPath[1]) StringCchPrintf(remote, ARRAYSIZE(remote), L"/%s", names[i]); else StringCchPrintf(remote, ARRAYSIZE(remote), L"%s/%s", ctx.targetPath, names[i]);
-            if (RunCli(ctx.targetSite, L"put", local, remote, NULL) != 0) ok = FALSE;
-        } else {
-            WCHAR localTarget[MAX_PATH] = {}; StringCchPrintf(localTarget, ARRAYSIZE(localTarget), L"%s\\%s", ctx.targetPath, names[i]);
-            if (PathFileExistsW(localTarget) && IDYES != MessageBoxW(hwnd, ExplorerText(L"confirm.overwrite_local", L"目标位置已有同名文件，要覆盖吗？", L"A file with the same name already exists. Replace it?"), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_YESNO | MB_ICONWARNING)) { DeleteFileW(local); continue; }
-            if (!CopyFileW(local, localTarget, FALSE)) ok = FALSE;
-        }
-        DeleteFileW(local);
-    }
-    if (!ok) MessageBoxW(hwnd, ExplorerText(L"error.copy_failed", L"部分项目复制失败。跨站点和本地复制目前仅支持文件。", L"Some items could not be copied. Cross-site and local copies currently support files only."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
-    else AfterRemoteMutation(site, folder, notifyPidl);
+    BgCopyCtx *c = new (std::nothrow) BgCopyCtx();
+    if (!c) return;
+    StringCchCopy(c->site, ARRAYSIZE(c->site), site);
+    StringCchCopy(c->folder, ARRAYSIZE(c->folder), folder);
+    c->target = ctx.target;
+    StringCchCopy(c->targetSite, ARRAYSIZE(c->targetSite), ctx.targetSite);
+    StringCchCopy(c->targetPath, ARRAYSIZE(c->targetPath), ctx.targetPath);
+    for (int i = 0; i < count; ++i) c->names.emplace_back(names[i]);
+    c->notify = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    DllAddRef();   // 2026-09-20: 线程自己 pin 模块
+    HANDLE h = CreateThread(NULL, 0, BgCopyThreadProc, c, 0, NULL);
+    if (h) CloseHandle(h);
+    else { DllRelease(); if (c->notify) ILFree(c->notify); delete c; }
 }
 static void ServerMove(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int count, PIDLIST_ABSOLUTE notifyPidl)
 {
@@ -1564,17 +1729,22 @@ static void ServerMove(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR *names, int
     // strip trailing slash for joining
     if(dst[0] && dst[wcslen(dst)-1]==L'/') dst[wcslen(dst)-1]=0;
     if(!dst[0]) StringCchCopy(dst,ARRAYSIZE(dst),L"/");
-    BOOL ok = TRUE;
+    // 逐项 rename 走后台：一次「移动到…」可能是几十个条目，UI 线程一秒都不能占（2026-09-20）。
+    BgCliJob job;
     for (int i = 0; i < count; i++)
     {
         WCHAR src[700]; JoinPath(folder,names[i],src,ARRAYSIZE(src));
         WCHAR target[700];
         if(dst[0]==L'/' && !dst[1]) StringCchPrintf(target,ARRAYSIZE(target),L"/%s",names[i]);
         else StringCchPrintf(target,ARRAYSIZE(target),L"%s/%s",dst,names[i]);
-        if(RunCli(site,L"rename",src,target,NULL)!=0) ok=FALSE;
+        BgAddStep(job, site, L"rename", src, target);
     }
-    if(!ok) MessageBoxW(hwnd,ExplorerText(L"error.move_failed",L"移动失败。",L"Move failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-    else AfterRemoteMutation(site, folder, notifyPidl);
+    StringCchCopy(job.refreshSite, ARRAYSIZE(job.refreshSite), site);
+    StringCchCopy(job.refreshFolder, ARRAYSIZE(job.refreshFolder), folder);
+    job.notify = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    StringCchCopy(job.failText, ARRAYSIZE(job.failText),
+        ExplorerText(L"error.move_failed",L"移动失败。",L"Move failed."));
+    StartBgCliJob(job);
 }
 static void DoRename(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, PIDLIST_ABSOLUTE notifyPidl)
 {
@@ -1582,12 +1752,18 @@ static void DoRename(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name, PIDLIST
     if(!PromptText(hwnd,ExplorerText(L"dialog.rename",L"重命名",L"Rename"),newName,ARRAYSIZE(newName),newName)) return;
     if(0==StrCmp(newName,name)) return;
     WCHAR src[700],dst[700]; JoinPath(folder,name,src,ARRAYSIZE(src)); JoinPath(folder,newName,dst,ARRAYSIZE(dst));
-    if(RunCli(site,L"rename",src,dst,NULL)!=0) MessageBoxW(hwnd,ExplorerText(L"error.rename_failed",L"重命名失败。",L"Rename failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR);
-    else
-    {
-        FtpCachePatchRename(site, folder, name, newName);   // optimistic
-        RefreshLocalFast(site, folder, notifyPidl);
-    }
+    // rename 走后台：RunCli 起新进程 + 新连接，UI 线程不能等（2026-09-20）。
+    BgCliJob job;
+    BgAddStep(job, site, L"rename", src, dst);
+    StringCchCopy(job.refreshSite, ARRAYSIZE(job.refreshSite), site);
+    StringCchCopy(job.refreshFolder, ARRAYSIZE(job.refreshFolder), folder);
+    StringCchCopy(job.nameA, ARRAYSIZE(job.nameA), name);
+    StringCchCopy(job.nameB, ARRAYSIZE(job.nameB), newName);
+    job.after = BG_PATCH_RENAME;
+    job.notify = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    StringCchCopy(job.failText, ARRAYSIZE(job.failText),
+        ExplorerText(L"error.rename_failed",L"重命名失败。",L"Rename failed."));
+    StartBgCliJob(job);
 }
 
 // ---- custom commands ---------------------------------------------------------
@@ -1670,13 +1846,18 @@ static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOL
     WCHAR name[256]; StringCchCopy(name, ARRAYSIZE(name), ExplorerText(L"dialog.new_folder_default", L"新建文件夹", L"New folder"));
     if (!PromptText(hwnd, ExplorerText(L"dialog.new_folder", L"新建文件夹", L"New folder"), name, ARRAYSIZE(name), name)) return;
     WCHAR full[700]; JoinPath(folder, name, full, ARRAYSIZE(full));
-    if (RunCli(site, L"mkdir", full, NULL, NULL) != 0)
-        MessageBoxW(hwnd, ExplorerText(L"error.create_folder_failed", L"创建文件夹失败。", L"Failed to create folder."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
-    else
-    {
-        FtpCachePatchAdd(site, folder, name, TRUE, 0);   // optimistic: show instantly
-        RefreshLocalFast(site, folder, notifyPidl);
-    }
+    // mkdir 走后台：RunCli 起新进程 + 新连接，右键菜单的 UI 线程不能等（2026-09-20）。
+    BgCliJob job;
+    BgAddStep(job, site, L"mkdir", full, NULL);
+    StringCchCopy(job.refreshSite, ARRAYSIZE(job.refreshSite), site);
+    StringCchCopy(job.refreshFolder, ARRAYSIZE(job.refreshFolder), folder);
+    StringCchCopy(job.nameA, ARRAYSIZE(job.nameA), name);
+    job.isFolder = TRUE;
+    job.after = BG_PATCH_ADD;
+    job.notify = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    StringCchCopy(job.failText, ARRAYSIZE(job.failText),
+        ExplorerText(L"error.create_folder_failed", L"创建文件夹失败。", L"Failed to create folder."));
+    StartBgCliJob(job);
 }
 
 // A new file is deliberately not implemented as a clipboard upload.  It
@@ -3188,12 +3369,19 @@ static INT_PTR CALLBACK PermPageProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                         // 交给常驻服务：遍历在它自己的线程上，带进度窗口与「取消」。
                         StartChmodRecursiveAsync(pm->site, pm->path, modeStr);
                     }
-                    else if (RunCli(pm->site, L"chmod", pm->path, modeStr, NULL)==0)
+                    else
                     {
-                        WCHAR parentDir[512]; PathParent(pm->path, parentDir, ARRAYSIZE(parentDir));
-                        AfterRemoteMutation(pm->site, parentDir, pm->notify);
+                        // 非递归 chmod 同样走后台：RunCli 起新进程 + 新连接，
+                        // 在「应用」的 UI 线程上等就是一次假死（2026-09-20）。
+                        BgCliJob job;
+                        BgAddStep(job, pm->site, L"chmod", pm->path, modeStr);
+                        StringCchCopy(job.refreshSite, ARRAYSIZE(job.refreshSite), pm->site);
+                        PathParent(pm->path, job.refreshFolder, ARRAYSIZE(job.refreshFolder));
+                        job.notify = pm->notify ? ILCloneFull(pm->notify) : NULL;
+                        StringCchCopy(job.failText, ARRAYSIZE(job.failText),
+                            ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."));
+                        StartBgCliJob(job);
                     }
-                    else MessageBoxW(hDlg, ExplorerText(L"error.chmod_failed", L"权限修改失败。", L"Permission update failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
                 }
                 PermApplyChown(hDlg, pm);
             }
