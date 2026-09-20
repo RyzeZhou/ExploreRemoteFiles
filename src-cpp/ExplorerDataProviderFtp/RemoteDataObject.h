@@ -125,14 +125,6 @@ public:
             }
             delete this;
         }
-        else if (_fetchStarted && !_jobDone)
-        {
-            // Shell 在下载完成前丢掉了这个流（用户取消/放弃）：唤醒可能正阻塞在
-            // Read 等待循环里的那一次调用，让它立刻以 ERROR_CANCELLED 返回。
-            ProbeLog(L"[DL] stream released mid-stream; wake blocked Read remote='%s' pos=%llu",
-                     _remote.c_str(), (unsigned long long)_pos);
-            InterlockedExchange(&_released, 1);
-        }
         return n;
     }
 
@@ -355,7 +347,12 @@ private:
             DispatchMessageW(&msg);
         }
     }
-    BOOL ReleasedByShell() { return InterlockedCompareExchange(&_released, 0, 0) != 0; }
+    BOOL ReleasedByShell()
+    {
+        // 只剩我们 Read/Seek 里的 RefGuard 那一份引用 → Shell 已经丢掉了这个流。
+        // （不能用"任何 Release 都置位"的标记：RefGuard 的 AddRef/Release 配对会误触发。）
+        return InterlockedCompareExchange(&_ref, 0, 0) <= 1;
+    }
 
     // Read/Seek 期间给自己加一份引用：抽消息时 Shell 可能释放本流（用户取消），
     // 没有这份自保就是 use-after-free。
