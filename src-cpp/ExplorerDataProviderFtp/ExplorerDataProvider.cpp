@@ -1332,6 +1332,11 @@ public:
     {
         StringCchCopy(m_site, ARRAYSIZE(m_site), site ? site : L"");
         StringCchCopy(m_folder, ARRAYSIZE(m_folder), folder ? folder : L"/");
+        // 一个视图 = 一个批次：本次复制的所有文件在传输队列里归一组，取消也只取消这一批。
+        static volatile LONG s_seq = 0;
+        StringCchPrintfW(m_batchId, ARRAYSIZE(m_batchId), L"ts-%u-%llu-%ld",
+                         (unsigned)GetCurrentProcessId(), GetTickCount64(), InterlockedIncrement(&s_seq));
+        ProbeLog(L"[XFER] CFolderTransferSource site='%s' folder='%s' batch='%s'", m_site, m_folder, m_batchId);
         DllAddRef();
     }
     ~CFolderTransferSource()
@@ -1366,17 +1371,65 @@ public:
         return S_OK;
     }
     IFACEMETHODIMP SetProperties(IPropertyChangeArray *) { return E_NOTIMPL; }
-    IFACEMETHODIMP OpenItem(IShellItem *psi, TRANSFER_SOURCE_FLAGS, REFIID riid, void **ppv)
+    IFACEMETHODIMP OpenItem(IShellItem *psi, TRANSFER_SOURCE_FLAGS flags, REFIID riid, void **ppv)
     {
-        // Tripwire: we have no way to hand out a source item's storage, so this
-        // E_NOTIMPL surfaces as "执行磁盘操作时出错" (0x80004001). The copy engine
-        // only ends up here when the clipboard object is missing
-        // FileGroupDescriptorW/FileContents -- i.e. when our inner data object was
-        // not attached. Logged (no GetDisplayName: never re-enter the shell from
-        // here) so that never goes silently wrong again.
-        ProbeLog(L"[XFER] OpenItem UNSUPPORTED site='%s' folder='%s' psi=%p riid=%08X hr=E_NOTIMPL",
-                 m_site, m_folder, psi, riid.Data1);
-        return E_NOTIMPL;
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (!psi) return E_INVALIDARG;
+
+        // 取该项的名字/类型：与文件夹同一套 PIDL 布局（见 IsOursItem/FVITEMID）。
+        PIDLIST_ABSOLUTE abs = NULL;
+        HRESULT hr = SHGetIDListFromObject(psi, &abs);
+        if (FAILED(hr) || !abs) return FAILED(hr) ? hr : E_FAIL;
+        PCUIDLIST_RELATIVE last = ILFindLastID(abs);
+        PCFVITEMID item = IsOursItem(last);
+        WCHAR name[MAX_PATH] = {};
+        BOOL isFolder = FALSE;
+        if (item)
+        {
+            StringCchCopyW(name, ARRAYSIZE(name), item->szName);
+            isFolder = item->fIsFolder;
+        }
+        ILFree(abs);
+        if (!item || !name[0])
+        {
+            ProbeLog(L"[XFER] OpenItem: 不是我们的子项 site='%s' folder='%s' riid=%08X", m_site, m_folder, riid.Data1);
+            return E_INVALIDARG;
+        }
+        if (isFolder)
+        {
+            // 目录由 EnterFolder + 递归的 OpenItem 处理；这里不该被问到。
+            ProbeLog(L"[XFER] OpenItem(folder) -> E_NOTIMPL '%s'", name);
+            return E_NOTIMPL;
+        }
+
+        std::wstring full = m_folder;
+        if (full.empty() || full[full.size() - 1] != L'/') full += L'/';
+        full += name;
+
+        // 大小：优先用父目录缓存；缓存没有就同步列一次 —— OpenItem 跑在 Shell 的复制
+        // **工作线程**上，允许阻塞（这正是"重活别占 UI 线程"的落点）。
+        ULONGLONG size = 0;
+        FTPENTRY found;
+        if (FtpCacheFindOne(m_site, m_folder, name, &found)) size = found.dwSize;
+        else
+        {
+            std::vector<FTPENTRY> entries;
+            if (FtpListCachedAll(m_site, m_folder, entries))
+                for (auto const &e : entries)
+                    if (0 == StrCmp(e.szName, name)) { size = e.dwSize; break; }
+        }
+
+        ProbeLog(L"[XFER] OpenItem tid=%lu site='%s' remote='%s' size=%llu riid=%08X flags=0x%08X batch='%s'",
+                 GetCurrentThreadId(), m_site, full.c_str(), size, riid.Data1, (unsigned)flags, m_batchId);
+
+        CRemoteStream *stream = new (std::nothrow) CRemoteStream(m_site, full.c_str(), size, m_batchId);
+        if (!stream) return E_OUTOFMEMORY;
+        hr = stream->QueryInterface(riid, ppv);
+        stream->Release();
+        if (FAILED(hr))
+            ProbeLog(L"[XFER] OpenItem QI failed riid=%08X hr=0x%08X", riid.Data1, hr);
+        return hr;
     }
     IFACEMETHODIMP MoveItem(IShellItem *, IShellItem *, LPCWSTR, TRANSFER_SOURCE_FLAGS, IShellItem **) { return E_NOTIMPL; }
     IFACEMETHODIMP RecycleItem(IShellItem *psiSource, IShellItem *, TRANSFER_SOURCE_FLAGS flags, IShellItem **ppsiNewDest)
@@ -1401,6 +1454,7 @@ private:
     long m_cRef;
     WCHAR m_site[64] = {};
     WCHAR m_folder[512] = {};
+    WCHAR m_batchId[64] = {};   // 一个视图 = 一个传输批次（队列分组 / 取消）
     PIDLIST_ABSOLUTE m_pidl;
     DWORD m_cookie;
 };

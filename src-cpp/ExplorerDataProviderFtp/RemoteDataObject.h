@@ -882,6 +882,11 @@ public:
         const BOOL wantDesc = (fmt->cfFormat == cfDesc);
         const BOOL wantContents = (fmt->cfFormat == cfContents && fmt->lindex >= 0);
         if (!wantDesc && !wantContents) return DV_E_FORMATETC;
+        // 默认不再提供虚拟文件格式（见 ErfUseVirtualFileFormats）：让 Explorer 的复制
+        // 引擎改走 ITransferSource（Shell 工作线程 + 自带进度窗口）。否则
+        // GetData(FILEDESCRIPTORW) 会同步展开整棵树、GetData(FILECONTENTS) 会阻塞等
+        // 整个文件下完 —— 两者都压在调用线程上。
+        if (!ErfUseVirtualFileFormats()) return DV_E_FORMATETC;
 
         // Probe only the descriptor query (lindex == -1); per-file contents
         // queries (lindex >= 0) would storm the log during a copy.
@@ -986,6 +991,7 @@ public:
     STDMETHODIMP QueryGetData(FORMATETC *fmt) override
     {
         if (!fmt) return E_INVALIDARG;
+        if (!ErfUseVirtualFileFormats()) return DV_E_FORMATETC;   // 走 ITransferSource（见 ErfUseVirtualFileFormats）
         CLIPFORMAT cfDesc = (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
         CLIPFORMAT cfContents = (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_FILECONTENTS);
         if (fmt->cfFormat == cfDesc && (fmt->tymed & TYMED_HGLOBAL)) return S_OK;
@@ -1004,6 +1010,12 @@ public:
         if (!out) return E_POINTER;
         *out = NULL;
         if (direction != DATADIR_GET) return E_NOTIMPL;
+        // 默认不提供虚拟文件格式：让复制走 ITransferSource（见 ErfUseVirtualFileFormats）。
+        if (!ErfUseVirtualFileFormats())
+        {
+            ProbeLog(L"[DATAOBJ] EnumFormatEtc -> 不提供虚拟文件格式（走 ITransferSource）");
+            return E_NOTIMPL;
+        }
         FORMATETC fmts[2] = {};
         fmts[0].cfFormat = (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
         fmts[0].ptd = NULL; fmts[0].dwAspect = DVASPECT_CONTENT; fmts[0].lindex = -1; fmts[0].tymed = TYMED_HGLOBAL;

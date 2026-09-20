@@ -14,6 +14,33 @@
 #include <vector>
 #include <algorithm>
 #include "ProbeLog.h"
+
+// ---------------------------------------------------------------------------
+// 复制/粘贴走哪条路（2026-09-20）：
+//   0（默认）= **不**提供 CFSTR_FILEDESCRIPTORW / CFSTR_FILECONTENTS，让 Explorer 的复制
+//              引擎改走 ITransferSource（Shell 工作线程 + 它自己的进度窗口），与删除同路，
+//              不再占用发起窗口的 UI 线程。
+//   1 = 旧行为（剪贴板虚拟文件格式）。可随时回退，无需重装。
+// 读 HKCU\Software\ExplorerRemoteFs\UseVirtualFileFormats（DWORD，缺省=0）。
+// ---------------------------------------------------------------------------
+inline BOOL ErfUseVirtualFileFormats()
+{
+    static volatile LONG s_loaded = 0;
+    static BOOL s_value = FALSE;   // 默认走 B
+    if (InterlockedCompareExchange(&s_loaded, 1, 0) == 0)
+    {
+        HKEY k = NULL;
+        if (ERROR_SUCCESS == RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", 0, KEY_READ, &k))
+        {
+            DWORD v = 0, cb = sizeof(v), type = 0;
+            if (ERROR_SUCCESS == RegQueryValueExW(k, L"UseVirtualFileFormats", NULL, &type, (LPBYTE)&v, &cb) &&
+                type == REG_DWORD)
+                s_value = (v != 0);
+            RegCloseKey(k);
+        }
+    }
+    return s_value;
+}
 // Module lifetime: worker threads below must pin the DLL (DllCanUnloadNow
 // only counts COM objects; an unpinned background thread that outlives the
 // last object crashed hosts AFTER unload: svchost _unloaded 0xc0000005,
