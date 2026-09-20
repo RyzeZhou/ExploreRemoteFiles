@@ -1144,6 +1144,79 @@ inline void FtpPrefetchQuiet(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notify
     }
 }
 
+// ---- 递归后台预热（2026-09-20：源端复制冻结取证后的缓解） ---------------------
+// 复制一个远程目录时，Shell 在**发起窗口的 UI 线程**上查询 CFSTR_FILEDESCRIPTORW，
+// 我们必须在返回前枚举整棵树；冷目录每多一个就多一次同步桥接 LIST。实测一个
+// 26535 项的**扁平**目录，一次 LIST 就占住 UI 线程 2750 ms（探针：
+// `[DATAOBJ] expand done cacheOnly=0 ... elapsedMs=2750`）。
+// 这里在数据对象刚建立（Ctrl+C / 拖拽开始 / 菜单探测）时，就把子树在后台逐个列进
+// 内存+磁盘缓存，等真正粘贴时展开基本全命中，不再在 UI 线程上等网络。
+struct FtpWarmTreeCtx
+{
+    WCHAR site[64];
+    WCHAR folder[600];
+    WCHAR key[760];          // "tree|site|folder"，与普通预取共用去重表
+    int maxDirs;
+    int maxEntries;
+};
+
+static DWORD WINAPI FtpWarmTreeThreadProc(LPVOID p)
+{
+    FtpWarmTreeCtx *c = static_cast<FtpWarmTreeCtx *>(p);
+    int dirs = 0, entries = 0;
+    try
+    {
+        std::vector<std::wstring> queue;
+        queue.push_back(c->folder);
+        for (size_t qi = 0; qi < queue.size() && dirs < c->maxDirs; ++qi)
+        {
+            std::vector<FTPENTRY> kids;
+            // 失败（网络/管道）就跳过这一棵，绝不影响别的目录。
+            if (!FtpListCachedAll(c->site, queue[qi].c_str(), kids)) continue;
+            ++dirs;
+            entries += (int)kids.size();
+            if (entries >= c->maxEntries) break;
+            for (auto const &k : kids)
+            {
+                if (!k.fIsFolder || k.fIsSymlink) continue;   // 符号链接目录不跟随
+                std::wstring child = queue[qi];
+                if (child.empty() || child[child.size() - 1] != L'/') child += L'/';
+                child += k.szName;
+                queue.push_back(child);
+            }
+        }
+        ProbeLog(L"[WARM] tree site='%s' root='%s' dirs=%d entries=%d", c->site, c->folder, dirs, entries);
+    }
+    catch (...)
+    {
+        ProbeLog(L"[WARM] tree threw site='%s' root='%s'", c->site, c->folder);
+    }
+    FtpPrefetchEnd(c->key);
+    delete c;
+    DllRelease();
+    return 0;
+}
+
+// 后台递归把 `folder` 子树列进缓存。重复调用同一个子树会被去重表挡掉。
+inline void FtpPrefetchTreeQuiet(PCWSTR site, PCWSTR folder, int maxDirs = 512, int maxEntries = 300000)
+{
+    if (!site || !site[0]) return;
+    PCWSTR dir = (folder && folder[0]) ? folder : L"/";
+    WCHAR key[760] = {};
+    StringCchPrintf(key, ARRAYSIZE(key), L"tree|%s|%s", site, dir);
+    if (!FtpPrefetchBegin(key)) return;                 // 已在预热这棵树
+    FtpWarmTreeCtx *c = new (std::nothrow) FtpWarmTreeCtx{};
+    if (!c) { FtpPrefetchEnd(key); return; }
+    StringCchCopy(c->site, ARRAYSIZE(c->site), site);
+    StringCchCopy(c->folder, ARRAYSIZE(c->folder), dir);
+    StringCchCopy(c->key, ARRAYSIZE(c->key), key);
+    c->maxDirs = maxDirs; c->maxEntries = maxEntries;
+    DllAddRef();   // 2026-09-20: 线程自己 pin 模块
+    HANDLE h = CreateThread(NULL, 0, FtpWarmTreeThreadProc, c, 0, NULL);
+    if (h) CloseHandle(h);
+    else { DllRelease(); FtpPrefetchEnd(key); delete c; }
+}
+
 // Returns count of cached entries for site+path (0 = miss/expired).
 inline int FtpCacheLookup(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxOut)
 {

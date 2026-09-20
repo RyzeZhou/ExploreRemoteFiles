@@ -385,6 +385,7 @@ public:
 
     // 等文件出现。服务回执之后（_finished）再给最后一次机会，然后如实返回失败 ——
     // 以前是靠"getr 进程退出了"判断，现在没有进程了，改看服务回执。
+    BOOL Cancelled() const { return _cancelled; }   // 服务回话说用户取消了（终态）
     BOOL WaitForFile(const std::wstring &rel)
     {
         std::wstring p = LocalPath(rel);
@@ -599,6 +600,24 @@ public:
     // the UI thread -- but it may well be the very object that ends up on the
     // clipboard, so afterwards it has to answer for real.
     void SuppressFetch() { _probeBorn = TRUE; _probeTick = GetTickCount(); }
+
+    // 数据对象刚建立（Ctrl+C / 拖拽开始 / 菜单探测）时，把选中的文件夹子树放到后台
+    // 列表预热（FtpPrefetchTreeQuiet）。理由：真正粘贴时 Shell 会在**发起窗口的 UI
+    // 线程**上查询 CFSTR_FILEDESCRIPTORW 并同步枚举整棵树；预热把这一步变成缓存命中，
+    // 不再让用户看到窗口假死（实测冷目录 26535 项一次同步 LIST = 2750 ms）。
+    void Prewarm()
+    {
+        if (_prewarmStarted) return;
+        _prewarmStarted = TRUE;
+        for (size_t i = 0; i < _tops.size(); i++)
+        {
+            if (!_tops[i].isFolder) continue;
+            std::wstring full = _tops[i].folder;
+            if (!full.empty() && full[full.size() - 1] != L'/') full += L'/';
+            full += _tops[i].name;
+            FtpPrefetchTreeQuiet(_tops[i].site.c_str(), full.c_str());
+        }
+    }
 
     // Still being probed? True inside the guard window, and for a short grace
     // period after it: the shell's own follow-up query lands milliseconds after
@@ -841,6 +860,13 @@ public:
                 it.fetch->EnsureStarted();
                 if (!it.fetch->WaitForFile(it.relPath))
                 {
+                    if (it.fetch->Cancelled())
+                    {
+                        // 用户在队列里取消了这次复制：如实回 CANCELLED，让资源管理器
+                        // 报"已取消"，而不是"移动文件或文件夹时出错"。
+                        ProbeLog(L"[DATAOBJ] fetch cancelled -> ERROR_CANCELLED '%s'", it.relPath.c_str());
+                        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+                    }
                     ProbeLog(L"[DATAOBJ] fetch wait failed '%s'", it.relPath.c_str());
                     return STG_E_READFAULT;
                 }
@@ -926,4 +952,5 @@ private:
     BOOL _expanded = FALSE;
     BOOL _probeBorn = FALSE;        // created inside a shell menu/drag probe window
     DWORD _probeTick = 0;           // and when that happened (see BeingProbed)
+    BOOL _prewarmStarted = FALSE;   // background subtree warm-up already kicked off
 };
