@@ -28,6 +28,7 @@ public partial class App : System.Windows.Application
     private WinForms.ContextMenuStrip? _trayMenu;
     private MainWindow? _manager;
     private RemoteBridgeService? _bridge;
+    private TransferTicketService? _tickets;
     private TransferTaskService? _transfers;
     private RemoteOperationQueueService? _operationQueue;
     private readonly RemoteStatusService _status = new();
@@ -106,13 +107,26 @@ public partial class App : System.Windows.Application
                 return;
             }
         }
-        bool background = pendingErfNavigation is not null || e.Args.Any(a => string.Equals(a, "--background", StringComparison.OrdinalIgnoreCase));
+        bool background = pendingErfNavigation is not null ||
+                          e.Args.Any(a => string.Equals(a, "--background", StringComparison.OrdinalIgnoreCase));
+
+        // 「传输票据」(.erfdl) 双击 → --open-ticket <path>：转给常驻服务解析并开始下载
+        // （目标 = 票据所在目录）。票据里只有 jobId，清单在服务侧。
+        string? ticketPath = GetArgumentValue(e.Args, "--open-ticket");
+        if (!string.IsNullOrWhiteSpace(ticketPath)) background = true;
         bool showRequested = e.Args.Any(a => string.Equals(a, "--show", StringComparison.OrdinalIgnoreCase));
         bool transfersRequested = e.Args.Any(a => string.Equals(a, "--transfers", StringComparison.OrdinalIgnoreCase));
 
         _singleInstance = new Mutex(true, SingleInstanceName, out bool isFirstInstance);
         if (!isFirstInstance)
         {
+            if (ticketPath is not null)
+            {
+                if (!TryForwardTicket(ticketPath, attempts: 8))
+                    ErfLog("resident service did not accept the transfer ticket");
+                Shutdown();
+                return;
+            }
             if (pendingErfNavigation is not null)
             {
                 // The resident process may have the mutex before its pipe
@@ -164,7 +178,19 @@ public partial class App : System.Windows.Application
         CreateTrayIcon();
         _bridge = new RemoteBridgeService(QueueErfNavigationAsync, _operationQueue, _status, _transfers);
         _bridge.Start();
+        _tickets = new TransferTicketService(Dispatcher, _bridge);
+        _bridge.AttachTickets(_tickets);
         ListenForShowRequests();
+        if (ticketPath is not null)
+        {
+            // 本进程就是常驻实例：把票据也走一遍自己的管道，保证与转发路径同一套逻辑。
+            string p = ticketPath;
+            _ = Task.Run(() =>
+            {
+                if (!TryForwardTicket(p, attempts: 8))
+                    ErfLog("first transfer ticket was not accepted by this instance");
+            });
+        }
         if (pendingErfNavigation is not null)
         {
             // The first ERF request also started this resident process.  Send
@@ -241,6 +267,37 @@ public partial class App : System.Windows.Application
     }
 
     private enum ErfForwardResult { Queued, Unavailable, Rejected }
+
+    /// <summary>把「传输票据」路径转给常驻服务（OPEN-TICKET）。</summary>
+    private static bool TryForwardTicket(string ticketPath, int attempts)
+    {
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            try
+            {
+                using var pipe = new NamedPipeClientStream(".", RemoteBridgeService.PipeName, PipeDirection.InOut, PipeOptions.None);
+                pipe.Connect(250);
+                using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 4096, leaveOpen: true) { AutoFlush = true };
+                using var reader = new StreamReader(pipe, new UTF8Encoding(false), false, 4096, leaveOpen: true);
+                writer.WriteLine("OPEN-TICKET");
+                writer.WriteLine(ticketPath);
+                var response = reader.ReadLine();
+                if (!string.IsNullOrWhiteSpace(response) && response.StartsWith("OK", StringComparison.Ordinal))
+                {
+                    ErfLog($"transfer ticket forwarded: {response}");
+                    return true;
+                }
+                ErfLog($"transfer ticket rejected: {response}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                ErfLog($"ticket handoff attempt {attempt + 1} failed; {ex.Message}");
+            }
+            if (attempt + 1 < attempts) Thread.Sleep(125);
+        }
+        return false;
+    }
 
     private static void OpenErfAddress(string address, IntPtr sourceWindow)
     {

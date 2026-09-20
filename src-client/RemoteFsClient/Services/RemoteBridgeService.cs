@@ -38,6 +38,50 @@ public sealed class RemoteBridgeService : IDisposable
     public void Start() => _listener ??= Task.WhenAll(
         Enumerable.Range(0, 4).Select(_ => Task.Run(() => ListenAsync(_stop.Token))));
 
+    private TransferTicketService? _tickets;
+
+    /// <summary>票据服务在 App 里创建（它反过来要引用本对象来入队），随后挂到这里。</summary>
+    public void AttachTickets(TransferTicketService tickets) => _tickets = tickets;
+
+    /// <summary>票据路径：按"我们自己的队列任务"启动一次下载（因此真暂停可用）。
+    /// 文件走 <c>&lt;目标&gt;.rfs-part</c> → 原子改名；目录下到目标目录下、以远程目录名为子目录。</summary>
+    public void StartTicketDownload(string site, string remote, string target, bool isFolder, string batchId)
+    {
+        string local = target;
+        bool atomic = false;
+        if (isFolder)
+            local = System.IO.Path.GetDirectoryName(target) ?? target;   // FetchDirAsync 会在其下建 <name>
+        else
+            atomic = true;
+        var job = new FetchJob
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Site = site, Remote = remote, Local = local, BatchId = batchId, AtomicLocal = atomic,
+        };
+        _fetchJobs[job.Id] = job;
+        Log($"ticket download queued id='{job.Id}' site='{site}' remote='{remote}' target='{target}' kind={(isFolder ? "dir" : "file")}");
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                FetchResult result = isFolder ? await FetchDirAsync(job) : await FetchAsync(job);
+                job.Message = result.Message;
+                Volatile.Write(ref job.State, (int)result.State);
+                Log($"ticket download terminal id='{job.Id}' state={result.State} message='{result.Message}'");
+            }
+            catch (Exception ex)
+            {
+                job.Message = SanitizeBridgeError(ex.Message);
+                Volatile.Write(ref job.State, (int)FetchJobState.Failed);
+                Log($"ticket download unhandled id='{job.Id}' exception='{SanitizeBridgeError(ex.ToString())}'");
+            }
+            finally
+            {
+                _ = Task.Delay(TimeSpan.FromMinutes(5)).ContinueWith(t => _fetchJobs.TryRemove(job.Id, out var _));
+            }
+        });
+    }
+
     private async Task ListenAsync(CancellationToken token)
     {
         while (!token.IsCancellationRequested)
@@ -230,6 +274,57 @@ public sealed class RemoteBridgeService : IDisposable
             }
             var putJob = StartFetchJob(putSite, putRemote, putLocal, putBatch ?? string.Empty, isDir: false, isPut: true);
             await writer.WriteLineAsync("STARTED " + putJob.Id);
+            return;
+        }
+
+        // MKTICKET：扩展在 Ctrl+C 时登记"这次要传什么"。服务登记 jobId 并回它；
+        // 票据文本（只有 magic/version/jobId）由扩展自己拼 —— 服务**不把路径写进票据**。
+        if (string.Equals(operation, "MKTICKET", StringComparison.Ordinal))
+        {
+            string? tkSite = await reader.ReadLineAsync(token);
+            string? tkCount = await reader.ReadLineAsync(token);
+            if (_tickets is null || string.IsNullOrWhiteSpace(tkSite) ||
+                !int.TryParse(tkCount, out int itemCount) || itemCount <= 0 || itemCount > 10000)
+            {
+                await writer.WriteLineAsync("FAIL: invalid mkticket request");
+                return;
+            }
+            var items = new List<TicketItem>();
+            for (int i = 0; i < itemCount; i++)
+            {
+                string? line = await reader.ReadLineAsync(token);
+                if (line is null) break;
+                var f = line.Split('\t');
+                if (f.Length < 5) continue;
+                items.Add(new TicketItem
+                {
+                    Site = tkSite!.Trim(),
+                    Remote = f[0],
+                    Name = f[1],
+                    Size = long.TryParse(f[2], out long sz) ? sz : 0,
+                    Mtime = long.TryParse(f[3], out long mt) ? mt : 0,
+                    IsFolder = f[4] == "1",
+                });
+            }
+            if (items.Count == 0) { await writer.WriteLineAsync("FAIL: no items"); return; }
+            string jobId = _tickets.CreateTicket(items);
+            await writer.WriteLineAsync("OK " + jobId);
+            return;
+        }
+
+        // OPEN-TICKET：双击 .erfdl（或命令行）转到这里。**立刻回 OK**，解析/可能的询问/入队
+        // 都放到后台 —— 否则会占着管道实例等用户点确认。
+        if (string.Equals(operation, "OPEN-TICKET", StringComparison.Ordinal))
+        {
+            string? ticketPath = await reader.ReadLineAsync(token);
+            if (_tickets is null || string.IsNullOrWhiteSpace(ticketPath))
+            {
+                await writer.WriteLineAsync("FAIL: invalid ticket");
+                return;
+            }
+            string ticketFilePath = ticketPath!;
+            await writer.WriteLineAsync("OK queued");
+            _ = Task.Run(() => { string r = _tickets.OpenTicket(ticketFilePath); Log($"open-ticket result: {r}"); });
             return;
         }
 
@@ -426,6 +521,7 @@ public sealed class RemoteBridgeService : IDisposable
         public string Id = "";
         public string Site = "", Remote = "", Local = "", BatchId = "";
         public bool IsPut;              // true = 上传（PUT），false = 下载（FETCH/FETCHDIR）
+        public bool AtomicLocal;        // true = 先下到 <Local>.rfs-part，完成后再原子改名（票据路径用）
         public long Done, Total;
         public int State = (int)FetchJobState.Running;
         public string Message = "";
@@ -527,6 +623,8 @@ public sealed class RemoteBridgeService : IDisposable
     private async Task<FetchResult> FetchAsync(FetchJob job)
     {
         var siteName = job.Site; var remotePath = job.Remote; var localPath = job.Local; var batchId = job.BatchId;
+        // 票据路径：先下到 <目标>.rfs-part，完成后再原子改名（半成品不落成正式名）。
+        string fetchPath = job.AtomicLocal ? localPath + ".rfs-part" : localPath;
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, job.Cts.Token);
         TransferTask? task = null;
         try
@@ -547,7 +645,7 @@ public sealed class RemoteBridgeService : IDisposable
                 cancellation.Token.ThrowIfCancellationRequested();
                 fs.EnsureConnected();
                 cancellation.Token.ThrowIfCancellationRequested();
-                fs.Download(remote, localPath, (done, total) =>
+                fs.Download(remote, fetchPath, (done, total) =>
                 {
                     job.Done = done; job.Total = total;
                     if (task is not null)
@@ -559,6 +657,15 @@ public sealed class RemoteBridgeService : IDisposable
             }, cancellation.Token);
             // A CANCEL racing the final progress callback still wins over success.
             cancellation.Token.ThrowIfCancellationRequested();
+            if (job.AtomicLocal)
+            {
+                try { File.Move(fetchPath, localPath, overwrite: true); }
+                catch (Exception ex)
+                {
+                    try { File.Delete(fetchPath); } catch { }
+                    throw new IOException($"无法把 {fetchPath} 改名成 {localPath}: {ex.Message}", ex);
+                }
+            }
             if (task is not null) _transfers?.CompleteManagedTask(task, true, null);
             Log($"fetch done id='{job.Id}' site='{siteName}' remote='{remote}' temp='{localPath}' bytes={job.Total} free={AvailableBytes(localPath)} batch='{batchId}'");
             return new(FetchJobState.Done, "");
@@ -566,7 +673,7 @@ public sealed class RemoteBridgeService : IDisposable
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
             if (task is not null) _transfers?.CompleteManagedTask(task, false, null, cancelled: true);
-            bool cleaned = DeleteIncompleteFetchOutput(localPath);
+            bool cleaned = DeleteIncompleteFetchOutput(fetchPath);
             Log($"fetch cancelled id='{job.Id}' site='{siteName}' remote='{remotePath}' temp='{localPath}' cleaned={cleaned} bytes={job.Done}/{job.Total} free={AvailableBytes(localPath)} batch='{batchId}'");
             return new(FetchJobState.Cancelled, "");
         }
@@ -574,7 +681,7 @@ public sealed class RemoteBridgeService : IDisposable
         {
             string message = SanitizeBridgeError(ex.Message);
             if (task is not null) _transfers?.CompleteManagedTask(task, false, message);
-            bool cleaned = DeleteIncompleteFetchOutput(localPath);
+            bool cleaned = DeleteIncompleteFetchOutput(fetchPath);
             Log($"fetch failed id='{job.Id}' site='{siteName}' remote='{remotePath}' temp='{localPath}' cleaned={cleaned} bytes={job.Done}/{job.Total} free={AvailableBytes(localPath)} batch='{batchId}' exception='{SanitizeBridgeError(ex.ToString())}'");
             return new(FetchJobState.Failed, message);
         }
