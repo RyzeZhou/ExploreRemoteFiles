@@ -1,9 +1,11 @@
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using RemoteFsClient.Services;
 
 namespace RemoteFsClient;
 
+/// <summary>应用设置：左侧导航 + 右侧具体页。功能会越加越多，所以按"一页一栏"组织。</summary>
 public partial class AppSettingsWindow : Window
 {
     public AppSettings Settings { get; }
@@ -21,21 +23,25 @@ public partial class AppSettingsWindow : Window
         MetadataCachePathBox.Text = Settings.MetadataCachePath;
         FileCachePathBox.Text = Settings.FileCachePath;
         EditorPathBox.Text = Settings.EditorPath;
+        DownloadDirBox.Text = Settings.DownloadDir;
         ExplorerLanguageBox.SelectedValue = Settings.ExplorerLanguage;
         ServiceLanguageBox.SelectedValue = Settings.ServiceLanguage;
         DefaultViewBox.SelectedValue = Settings.DefaultViewMode;
         SizeFormatBox.SelectedValue = Settings.SizeFormat;
         TerminalBox.SelectedValue = AppSettings.NormalizeTerminal(Settings.Terminal);
         ApplyLanguage();
+        RefreshAssocStatus();
+        NavList.SelectedIndex = 0;   // 触发 OnNavChanged
     }
 
     private void ApplyLanguage()
     {
         Title = Ui.T("ApplicationSettingsTitle");
-        WinScpPathLabel.Text = Ui.T("WinScpPath"); BrowseButton.Content = Ui.T("Browse");
-        MetadataCachePathLabel.Text = Ui.T("MetadataCachePath"); FileCachePathLabel.Text = Ui.T("FileCachePath");
-        BrowseMetadataCacheButton.Content = Ui.T("Browse"); BrowseFileCacheButton.Content = Ui.T("Browse");
-        DefaultEditorLabel.Text = Ui.T("DefaultEditor"); BrowseEditorButton.Content = Ui.T("Browse");
+        NavGeneral.Content = Ui.IsEnglish ? "General" : "通用";
+        NavCaches.Content = Ui.IsEnglish ? "Caches & editor" : "缓存与编辑器";
+        NavDownload.Content = Ui.IsEnglish ? "Downloads" : "下载";
+        NavAssoc.Content = Ui.IsEnglish ? "File association" : "文件关联";
+
         ExplorerLanguageLabel.Text = Ui.T("ExplorerLanguage"); ServiceLanguageLabel.Text = Ui.T("ServiceLanguage");
         DefaultViewLabel.Text = Ui.IsEnglish ? "Default view" : "默认视图";
         var viewNames = Ui.IsEnglish
@@ -44,10 +50,6 @@ public partial class AppSettingsWindow : Window
         for (int i = 0; i < DefaultViewBox.Items.Count && i < viewNames.Length; i++)
             ((ComboBoxItem)DefaultViewBox.Items[i]).Content = viewNames[i];
         SizeFormatLabel.Text = Ui.IsEnglish ? "File size format" : "文件大小格式";
-        // 默认（第一项）刻意与资源管理器一致：1 GB = 1024 MB、标签写 KB/MB。
-        // 我们是 Explorer 插件，同一个窗口里本地文件与远程文件的列不该"看起来对不上"。
-        // 后两项是给"要严格单位"的人用的：si = 1000 进制（kB/MB），iec = KiB/MiB。
-        // 底层永远是精确字节数（属性页会把字节数一并显示），口径只影响显示。
         var sizeNames = Ui.IsEnglish
             ? new[] { "Auto — same as Explorer (Windows formats it: 1.00 KB / 976 KB / 1.39 GB)",
                       "KB (1234 KB — whole KB, 1024-based)",
@@ -63,7 +65,35 @@ public partial class AppSettingsWindow : Window
         var termNames = new[] { Ui.T("TerminalWt"), Ui.T("TerminalPwsh"), Ui.T("TerminalVsCode") };
         for (int i = 0; i < TerminalBox.Items.Count && i < termNames.Length; i++)
             ((ComboBoxItem)TerminalBox.Items[i]).Content = termNames[i];
-        HintText.Text = Ui.T("CacheDirectoryHint") + Environment.NewLine + Ui.T("TerminalGlobalHint") + Environment.NewLine + Environment.NewLine + Ui.T("RestartExplorerHint"); SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");
+        GeneralHintText.Text = Ui.T("TerminalGlobalHint") + Environment.NewLine + Environment.NewLine + Ui.T("RestartExplorerHint");
+
+        WinScpPathLabel.Text = Ui.T("WinScpPath"); BrowseButton.Content = Ui.T("Browse");
+        MetadataCachePathLabel.Text = Ui.T("MetadataCachePath"); FileCachePathLabel.Text = Ui.T("FileCachePath");
+        BrowseMetadataCacheButton.Content = Ui.T("Browse"); BrowseFileCacheButton.Content = Ui.T("Browse");
+        DefaultEditorLabel.Text = Ui.T("DefaultEditor"); BrowseEditorButton.Content = Ui.T("Browse");
+        CachesHintText.Text = Ui.T("CacheDirectoryHint");
+
+        DownloadDirLabel.Text = Ui.IsEnglish ? "Default download directory" : "默认下载目录";
+        BrowseDownloadDirButton.Content = Ui.T("Browse");
+        DownloadHintText.Text = Ui.IsEnglish
+            ? "The context-menu 'Download' command saves straight here — no save dialog. If a file with the same name already exists, a \" (2)\" suffix is appended instead of overwriting."
+            : "右键「下载」会直接保存到这里，不再弹保存对话框；同名文件自动加 “ (2)”，不会覆盖已有文件。";
+
+        AssocHintText.Text = Ui.IsEnglish
+            ? ".erfdl files are ERF transfer tickets. Double-clicking one starts the transfer into the folder where the ticket currently is. Re-register the association if it was lost (e.g. after reinstalling Explorer, another tool stole the extension, or you moved the program)."
+            : ".erfdl 是易远传的「传输票据」：双击它就会把任务下载到**票据当前所在目录**。若关联丢失（重装资源管理器、被其它软件抢占、程序搬家等），点下面的按钮重新关联。";
+        AssocReassocButton.Content = Ui.IsEnglish ? "Re-register .erfdl" : "重新关联 .erfdl";
+
+        SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");
+    }
+
+    private void OnNavChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SectionGeneral is null) return;   // XAML 还没加载完
+        SectionGeneral.Visibility = NavList.SelectedIndex == 0 ? Visibility.Visible : Visibility.Collapsed;
+        SectionCaches.Visibility = NavList.SelectedIndex == 1 ? Visibility.Visible : Visibility.Collapsed;
+        SectionDownload.Visibility = NavList.SelectedIndex == 2 ? Visibility.Visible : Visibility.Collapsed;
+        SectionAssoc.Visibility = NavList.SelectedIndex == 3 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void OnBrowse(object sender, RoutedEventArgs e)
@@ -78,8 +108,10 @@ public partial class AppSettingsWindow : Window
         if (dlg.ShowDialog(this) == true) WinScpPathBox.Text = dlg.FileName;
     }
 
-    private void OnBrowseMetadataCache(object sender, RoutedEventArgs e) => BrowseFolder(MetadataCachePathBox);
-    private void OnBrowseFileCache(object sender, RoutedEventArgs e) => BrowseFolder(FileCachePathBox);
+    private void OnBrowseMetadataCache(object sender, RoutedEventArgs e) => BrowseFolder(MetadataCachePathBox, Ui.IsEnglish ? "Select metadata cache directory" : "选择元数据缓存目录");
+    private void OnBrowseFileCache(object sender, RoutedEventArgs e) => BrowseFolder(FileCachePathBox, Ui.IsEnglish ? "Select file cache directory" : "选择文件缓存目录");
+    private void OnBrowseDownloadDir(object sender, RoutedEventArgs e) => BrowseFolder(DownloadDirBox, Ui.IsEnglish ? "Select the default download directory" : "选择默认下载目录");
+
     private void OnBrowseEditor(object sender, RoutedEventArgs e)
     {
         var dlg = new Microsoft.Win32.OpenFileDialog
@@ -91,22 +123,76 @@ public partial class AppSettingsWindow : Window
         if (dlg.ShowDialog(this) == true) EditorPathBox.Text = dlg.FileName;
     }
 
-    private void BrowseFolder(System.Windows.Controls.TextBox target)
+    private void BrowseFolder(System.Windows.Controls.TextBox target, string description)
     {
         using var dlg = new System.Windows.Forms.FolderBrowserDialog
         {
-            Description = Ui.IsEnglish ? "Select cache directory" : "选择缓存目录",
+            Description = description,
             SelectedPath = target.Text.Trim(),
             UseDescriptionForTitle = true,
         };
         if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK) target.Text = dlg.SelectedPath;
     }
+
+    // ── 文件关联 ────────────────────────────────────────────────────────────
+    private const string TicketExt = ".erfdl";
+    private const string TicketProgId = "ERF.TransferTicket";
+
+    private void RefreshAssocStatus()
+    {
+        string? cmd = null;
+        try
+        {
+            using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey($@"Software\Classes\{TicketProgId}\shell\open\command");
+            cmd = k?.GetValue("") as string;
+        }
+        catch { }
+        AssocStatusText.Text = string.IsNullOrWhiteSpace(cmd)
+            ? (Ui.IsEnglish ? "Status: not associated yet." : "当前状态：尚未关联。")
+            : (Ui.IsEnglish ? $"Status: {cmd}" : $"当前状态：{cmd}");
+    }
+
+    private void OnReassociate(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            string exe = Environment.ProcessPath ?? "";
+            if (string.IsNullOrWhiteSpace(exe))
+                throw new InvalidOperationException(Ui.IsEnglish ? "Cannot determine the program path." : "无法确定程序路径。");
+            using (var ext = Microsoft.Win32.Registry.CurrentUser.CreateSubKey($@"Software\Classes\{TicketExt}"))
+                ext.SetValue("", TicketProgId, Microsoft.Win32.RegistryValueKind.String);
+            using (var prog = Microsoft.Win32.Registry.CurrentUser.CreateSubKey($@"Software\Classes\{TicketProgId}"))
+                prog.SetValue("", Ui.IsEnglish ? "ERF transfer ticket" : "易远传 传输票据", Microsoft.Win32.RegistryValueKind.String);
+            using (var cmd = Microsoft.Win32.Registry.CurrentUser.CreateSubKey($@"Software\Classes\{TicketProgId}\shell\open\command"))
+                cmd.SetValue("", $"\"{exe}\" --open-ticket \"%1\"", Microsoft.Win32.RegistryValueKind.String);
+            // 让资源管理器立刻重新读取关联（否则要等它自己刷新）
+            SHChangeNotify(ShcneAssocChanged, ShcnfIdList, IntPtr.Zero, IntPtr.Zero);
+            RefreshAssocStatus();
+            System.Windows.MessageBox.Show(
+                Ui.IsEnglish ? "The .erfdl association has been re-registered." : ".erfdl 关联已重新注册。",
+                Ui.T("Settings"), MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(
+                (Ui.IsEnglish ? "Failed to register .erfdl: " : "注册 .erfdl 关联失败：") + ex.Message,
+                Ui.T("Settings"), MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private const int ShcneAssocChanged = 0x08000000;
+    private const uint ShcnfIdList = 0x0000;
+
+    [DllImport("shell32.dll")]
+    private static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
+
     private void OnSave(object sender, RoutedEventArgs e)
     {
         Settings.WinScpPath = WinScpPathBox.Text.Trim();
         Settings.MetadataCachePath = MetadataCachePathBox.Text.Trim();
         Settings.FileCachePath = FileCachePathBox.Text.Trim();
         Settings.EditorPath = EditorPathBox.Text.Trim();
+        Settings.DownloadDir = DownloadDirBox.Text.Trim();
         Settings.ExplorerLanguage = (ExplorerLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.ServiceLanguage = (ServiceLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.DefaultViewMode = (DefaultViewBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "details";

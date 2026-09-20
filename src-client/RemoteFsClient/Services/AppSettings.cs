@@ -26,8 +26,13 @@ public sealed class AppSettings
     /// </summary>
     public string Terminal { get; set; } = "wt";
 
+    /// <summary>菜单「下载」的默认目录（"即点即下"，不再弹保存对话框）。
+    /// 与扩展 DLL 读的是**同一个注册表值**：HKCU\Software\ExplorerRemoteFs\DownloadDir。</summary>
+    public string DownloadDir { get; set; } = DefaultDownloadDir;
+
     public static string DefaultMetadataCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "MetadataCache");
     public static string DefaultFileCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "FileCache");
+    public static string DefaultDownloadDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
 
     public static AppSettings Load()
     {
@@ -45,6 +50,7 @@ public sealed class AppSettings
                 DefaultViewMode = NormalizeViewMode(key?.GetValue("DefaultViewMode") as string),
                 SizeFormat = NormalizeSizeFormat(key?.GetValue("SizeFormat") as string),
                 Terminal = NormalizeTerminal(key?.GetValue("Terminal") as string),
+                DownloadDir = NormalizeDirectory(key?.GetValue("DownloadDir") as string, DefaultDownloadDir),
             };
         }
         catch { return new AppSettings(); }
@@ -66,6 +72,8 @@ public sealed class AppSettings
         key.SetValue("DefaultViewMode", NormalizeViewMode(DefaultViewMode), RegistryValueKind.String);
         key.SetValue("SizeFormat", NormalizeSizeFormat(SizeFormat), RegistryValueKind.String);
         key.SetValue("Terminal", NormalizeTerminal(Terminal), RegistryValueKind.String);
+        DownloadDir = NormalizeDirectory(DownloadDir, DefaultDownloadDir); Directory.CreateDirectory(DownloadDir);
+        key.SetValue("DownloadDir", DownloadDir, RegistryValueKind.String);
     }
 
     public static string NormalizeDirectory(string? path, string fallback)
