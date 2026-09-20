@@ -211,20 +211,29 @@ public sealed class FtpFileSystem : IRemoteFileSystem
         Utils.ShellLog.Write($"FTP get: {remotePath} -> {localPath}");
     }
 
-    /// <summary>直传流：把远程文件直接写进给定输出流（服务侧往命名管道吐，不落本地文件）。</summary>
+    /// <summary>直传流：把远程文件直接写进给定输出流（服务侧往命名管道吐，不落本地文件）。
+    ///
+    /// 注意：FluentFTP 的 `DownloadStream` 对**不可 seek 的输出流**（命名管道）实测会
+    /// 写一小段后返回 false（SFTP 的异步下载没有这个问题）。所以 FTP 这条退化为
+    /// "下到服务侧临时文件再喂流" —— Shell 侧仍然没有任何中转，只是服务侧多一份临时文件；
+    /// 拷完立刻删除。</summary>
     public void DownloadToStream(string remotePath, Stream output, Action<long, long>? progress = null,
                                  CancellationToken token = default)
     {
         token.ThrowIfCancellationRequested();
-        EnsureConnected();
-        if (_client is null) return;
-        Action<FtpProgress>? fp = null;
-        if (progress is not null || token.CanBeCanceled)
-            fp = p => { token.ThrowIfCancellationRequested(); progress?.Invoke(p.TransferredBytes, 0); };
-        // FluentFTP 53：DownloadStream 返回 bool（true = 成功）。
-        if (!_client.DownloadStream(output, remotePath, 0, fp, 0))
-            throw new InvalidOperationException($"FTP stream download failed: {remotePath}");
-        Utils.ShellLog.Write($"FTP stream: {remotePath}");
+        string tmp = Path.Combine(Path.GetTempPath(), "rfs-stream-" + Guid.NewGuid().ToString("N") + ".part");
+        try
+        {
+            Download(remotePath, tmp, progress, false, token);
+            using (var src = File.OpenRead(tmp))
+                src.CopyTo(output);
+            output.Flush();
+            Utils.ShellLog.Write($"FTP stream: {remotePath}");
+        }
+        finally
+        {
+            try { File.Delete(tmp); } catch { }
+        }
     }
 
     public void Upload(string localPath, string remotePath, Action<long, long>? progress = null, bool resume = false,
