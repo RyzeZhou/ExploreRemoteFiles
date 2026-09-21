@@ -60,21 +60,21 @@ HRESULT CFolderViewCommandProvider::s_OnDisplay(IShellItemArray *psiItemArray, I
 HRESULT CFolderViewCommandProvider::s_OnSetting1(IShellItemArray * /* psiItemArray */, IUnknown * /* pv */)
 {
     PCWSTR text = ExplorerCommandText(IDS_SETTING1);
-    MessageBoxW(NULL, text, text, MB_OK);
+    ErfMessageBoxW(NULL, text, text, MB_OK);
     return S_OK;
 }
 
 HRESULT CFolderViewCommandProvider::s_OnSetting2(IShellItemArray * /* psiItemArray */, IUnknown * /* pv */)
 {
     PCWSTR text = ExplorerCommandText(IDS_SETTING2);
-    MessageBoxW(NULL, text, text, MB_OK);
+    ErfMessageBoxW(NULL, text, text, MB_OK);
     return S_OK;
 }
 
 HRESULT CFolderViewCommandProvider::s_OnSetting3(IShellItemArray * /* psiItemArray */, IUnknown * /* pv */)
 {
     PCWSTR text = ExplorerCommandText(IDS_SETTING3);
-    MessageBoxW(NULL, text, text, MB_OK);
+    ErfMessageBoxW(NULL, text, text, MB_OK);
     return S_OK;
 }
 

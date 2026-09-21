@@ -780,27 +780,39 @@ try
             ProbeLog(L"[PARSE] slow LIST level=%d site='%s' path='%s' name='%s' items=%u elapsedMs=%llu",
                      m_nLevel, m_szSiteName, m_szRemotePath, component, (UINT)items.size(), dt);
     }
-    for (auto const &item : items)
+    for (int attempt = 0; attempt < 2; ++attempt)
     {
-        if (0 != StrCmp(item.szName, component)) continue;
-        PIDLIST_RELATIVE current = NULL;
-        hr = CreateChildID(component, m_nLevel + 1, 1, 3, item.fIsFolder, &current);
-        if (FAILED(hr)) return hr;
-        if (next && *next)
+        for (auto const &item : items)
         {
-            IShellFolder *child = NULL;
-            hr = BindToObject(current, pbc, IID_PPV_ARGS(&child));
-            if (SUCCEEDED(hr))
+            if (0 != StrCmp(item.szName, component)) continue;
+            PIDLIST_RELATIVE current = NULL;
+            hr = CreateChildID(component, m_nLevel + 1, 1, 3, item.fIsFolder, &current);
+            if (FAILED(hr)) return hr;
+            if (next && *next)
             {
-                PIDLIST_RELATIVE tail = NULL;
-                hr = child->ParseDisplayName(hwnd, pbc, next, pchEaten, &tail, pdwAttributes);
-                if (SUCCEEDED(hr)) { *ppidl = ILCombine(current, tail); ILFree(tail); }
-                child->Release();
+                IShellFolder *child = NULL;
+                hr = BindToObject(current, pbc, IID_PPV_ARGS(&child));
+                if (SUCCEEDED(hr))
+                {
+                    PIDLIST_RELATIVE tail = NULL;
+                    hr = child->ParseDisplayName(hwnd, pbc, next, pchEaten, &tail, pdwAttributes);
+                    if (SUCCEEDED(hr)) { *ppidl = ILCombine(current, tail); ILFree(tail); }
+                    child->Release();
+                }
+                ILFree(current);
             }
-            ILFree(current);
+            else *ppidl = current;
+            return hr;
         }
-        else *ppidl = current;
-        return hr;
+        if (attempt > 0) break;
+        // 2026-09-21: 缓存里没有——可能是远端刚建的（磁盘快照最长 24h），也可能
+        // 是真没有。同步强制拉一次服务器再找一遍，找不到才报 NOT-FOUND。
+        // 这正是 16:14 那次 erf 导航失败（15 项旧快照）的路径。
+        std::vector<FTPENTRY> fresh;
+        if (!FtpListForceRefresh(m_szSiteName, m_szRemotePath, fresh)) break;
+        ProbeLog(L"[PARSE] forced-refresh retry level=%d site='%s' path='%s' name='%s' cached=%u live=%u",
+                 m_nLevel, m_szSiteName, m_szRemotePath, component, (UINT)items.size(), (UINT)fresh.size());
+        items.swap(fresh);
     }
     ProbeLog(L"[PARSE] NOT-FOUND level=%d site='%s' path='%s' name='%s' items=%u", m_nLevel, m_szSiteName, m_szRemotePath, component, (UINT)items.size());
     return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
@@ -850,7 +862,9 @@ try
         // 先内存、再磁盘快照：磁盘上那一份可能是几秒前刚写的（关窗口之前那次访问留下的），
         // 直接拿来当首屏，用户看到的就是"热目录"，而不是"正在载入…"再重拉一遍。
         // 纯本地文件读（带 8MB 上限保护），仍然绝不在 shell UI 线程上碰网络。
-        BOOL haveSnap = FtpCachePeekAllOrDisk(m_szSiteName, m_szRemotePath, snapshot);
+        BOOL haveSnap;
+        ULONGLONG snapAgeMs = 0;
+        haveSnap = FtpCachePeekAllOrDisk(m_szSiteName, m_szRemotePath, snapshot, &snapAgeMs);
         if (!haveSnap)
         {
             // Cold: never touch the network on the shell UI thread.
@@ -875,6 +889,15 @@ try
         }
         if (haveSnap)
         {
+            // 2026-09-21: 暖快照也可能很旧（磁盘快照最长 24h）。先显示旧数据保证
+            // 不卡，同时后台强制拉一次服务器、到了就通知视图重枚举——F5/重开目录
+            // 不再是"只刷 UI"。重枚举后快照是新的，不会循环触发。
+            if (snapAgeMs > FTP_CACHE_REVALIDATE_MS)
+            {
+                ProbeLog(L"[ENUM] warm-but-stale site='%s' path='%s' n=%u ageMs=%llu -> background revalidate",
+                         m_szSiteName, m_szRemotePath, (UINT)snapshot.size(), snapAgeMs);
+                FtpPrefetchQuiet(m_szSiteName, m_szRemotePath, m_pidl);
+            }
             // Warm cache: refresh the ParseDisplayName identity snapshot and
             // pre-seed the enumerator so Initialize() does not re-fetch.
             m_recentItems.clear();
@@ -2008,7 +2031,7 @@ try
     }
     if (RunFtpOperation(m_szSiteName, L"rename", oldPath, newPath) != 0)
     {
-        MessageBoxW(hwnd, ExplorerText(L"error.rename_failed", L"重命名失败。", L"Rename failed."), ExplorerText(L"dialog.remote", L"远程", L"Remote"), MB_OK | MB_ICONERROR);
+        ErfMessageBoxW(hwnd, ExplorerText(L"error.rename_failed", L"重命名失败。", L"Rename failed."), ExplorerText(L"dialog.remote", L"远程", L"Remote"), MB_OK | MB_ICONERROR);
         return E_FAIL;
     }
     BOOL folder = FALSE; int size = 0;

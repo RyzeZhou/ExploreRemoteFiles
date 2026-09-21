@@ -291,7 +291,7 @@ static DWORD WINAPI BgCliJobProc(LPVOID p)
     }
     else if (j->failText[0])
     {
-        MessageBoxW(NULL, j->failText, ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        ErfMessageBoxW(NULL, j->failText, ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
     }
 
     if (j->notify) ILFree(j->notify);
@@ -973,7 +973,7 @@ static void PermApplyChown(HWND hDlg, PROPMETA *pm)
     // 协议是 "user:group"，名字里出现 ':' 会把字段劈开。
     if ((changeU && wcschr(newU, L':')) || (changeG && wcschr(newG, L':')))
     {
-        MessageBoxW(hDlg, ExplorerText(L"error.owner_group_invalid", L"所有者/组不能包含冒号。", L"Owner/group cannot contain a colon."),
+        ErfMessageBoxW(hDlg, ExplorerText(L"error.owner_group_invalid", L"所有者/组不能包含冒号。", L"Owner/group cannot contain a colon."),
                     ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
         return;
     }
@@ -1153,7 +1153,7 @@ static void ShowCurrentFolderProperties(HWND hwnd, PCWSTR site, PCWSTR folder)
     while (lstrlen(full) > 1 && full[lstrlen(full) - 1] == L'/') full[lstrlen(full) - 1] = L'\0';
     WCHAR *slash = wcsrchr(full, L'/');
     if (!slash || !slash[1]){
-        MessageBoxW(hwnd, ExplorerText(L"info.root_no_parent", L"远程根目录没有可用于读取 Unix 元数据的父目录项。", L"The remote root has no parent entry from which to read Unix metadata."), ExplorerText(L"property.directory_properties", L"目录属性", L"Directory properties"), MB_OK | MB_ICONINFORMATION); return; }
+        ErfMessageBoxW(hwnd, ExplorerText(L"info.root_no_parent", L"远程根目录没有可用于读取 Unix 元数据的父目录项。", L"The remote root has no parent entry from which to read Unix metadata."), ExplorerText(L"property.directory_properties", L"目录属性", L"Directory properties"), MB_OK | MB_ICONINFORMATION); return; }
     StringCchCopy(name, ARRAYSIZE(name), slash + 1);
     if (slash == full) StringCchCopy(parent, ARRAYSIZE(parent), L"/");
     else { *slash = L'\0'; StringCchCopy(parent, ARRAYSIZE(parent), full); }
@@ -1185,7 +1185,7 @@ static INT_PTR CALLBACK SiteInfoDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
 static void ShowCurrentSiteInfo(HWND hwnd, PCWSTR site)
 {
     if (!FtpSiteFind(site)){
-        MessageBoxW(hwnd, ExplorerText(L"info.site_configuration_unavailable", L"当前站点配置已不可用。", L"The current site configuration is no longer available."), ExplorerText(L"property.site_properties", L"站点属性", L"Site properties"), MB_OK | MB_ICONINFORMATION); return; }
+        ErfMessageBoxW(hwnd, ExplorerText(L"info.site_configuration_unavailable", L"当前站点配置已不可用。", L"The current site configuration is no longer available."), ExplorerText(L"property.site_properties", L"站点属性", L"Site properties"), MB_OK | MB_ICONINFORMATION); return; }
     SITEINFOCTX *ctx=(SITEINFOCTX*)CoTaskMemAlloc(sizeof(*ctx));
     if(!ctx)return;
     ZeroMemory(ctx,sizeof(*ctx)); StringCchCopy(ctx->site,ARRAYSIZE(ctx->site),site);
@@ -1203,6 +1203,12 @@ static INT_PTR CALLBACK NameDlgProc(HWND h,UINT m,WPARAM w,LPARAM l)
 }
 static BOOL PromptText(HWND parent, PCWSTR caption, PWSTR buf, UINT cch, PCWSTR initial)
 {
+    // 异进程（Office 等）里不允许出现模态输入框：直接失败，让调用方按取消处理。
+    if (!ErfHostIsExplorer() && !ErfHostIsOwnTool())
+    {
+        ProbeLog(L"[UI-SUPPRESSED] PromptText foreign host caption='%s'", caption ? caption : L"");
+        return FALSE;
+    }
     PROMPTCTX c={buf,cch,caption,initial?initial:L""};
     return DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_NAMEBOX),parent,NameDlgProc,(LPARAM)&c)==IDOK && buf[0];
 }
@@ -1417,7 +1423,7 @@ static DWORD WINAPI DownloadJobProc(LPVOID p)
     std::string bridgeReply;
     if (FtpBridgeFetch(j->site.c_str(), j->remote.c_str(), j->local.c_str(), batchId, bridgeReply) != FtpBridgeFetchState::Done)
     {
-        MessageBoxW(NULL, ExplorerText(L"error.download_failed", L"下载失败。", L"Download failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        ErfMessageBoxW(NULL, ExplorerText(L"error.download_failed", L"下载失败。", L"Download failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
         delete j;
         DllRelease();
         return 1;
@@ -1426,7 +1432,7 @@ static DWORD WINAPI DownloadJobProc(LPVOID p)
     {
         if ((INT_PTR)ShellExecuteW(NULL, L"open", j->local.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
         {
-            MessageBoxW(NULL, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+            ErfMessageBoxW(NULL, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
             DeleteFileW(j->local.c_str());
         }
     }
@@ -1434,11 +1440,11 @@ static DWORD WINAPI DownloadJobProc(LPVOID p)
     {
         if (!LaunchConfiguredEditor(NULL, j->local.c_str()))
         {
-            MessageBoxW(NULL, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+            ErfMessageBoxW(NULL, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
             DeleteFileW(j->local.c_str());
         }
         else if (!StartEditWatch(j->site.c_str(), j->remote.c_str(), j->local.c_str(), FALSE, NULL))
-            MessageBoxW(NULL, ExplorerText(L"error.edit_watch_failed", L"已打开文件，但无法启动自动上传监视。", L"The file was created and opened, but automatic upload monitoring could not start."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
+            ErfMessageBoxW(NULL, ExplorerText(L"error.edit_watch_failed", L"已打开文件，但无法启动自动上传监视。", L"The file was created and opened, but automatic upload monitoring could not start."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
     }
     delete j;
     DllRelease();
@@ -1473,7 +1479,7 @@ static DWORD WINAPI DownloadBatchProc(LPVOID p)
     }
     WCHAR msg[512];
     StringCchPrintf(msg, ARRAYSIZE(msg), ExplorerText(L"info.downloaded_to", L"已下载 %d 个文件到：\n%s", L"Downloaded %d files to:\n%s"), ok, b->dir.c_str());
-    MessageBoxW(NULL, msg, ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONINFORMATION);
+    ErfMessageBoxW(NULL, msg, ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONINFORMATION);
     delete b;
     DllRelease();
     return 0;
@@ -1501,7 +1507,7 @@ static DWORD WINAPI ClipJobProc(LPVOID p)
     }
     if (paths.empty())
     {
-        MessageBoxW(NULL, ExplorerText(L"error.copy_to_clipboard_failed", L"无法下载选中的项目，未复制到剪贴板。", L"The selected item(s) could not be downloaded, so nothing was copied to the clipboard."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        ErfMessageBoxW(NULL, ExplorerText(L"error.copy_to_clipboard_failed", L"无法下载选中的项目，未复制到剪贴板。", L"The selected item(s) could not be downloaded, so nothing was copied to the clipboard."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
     }
     else
     {
@@ -1686,14 +1692,14 @@ static INT_PTR CALLBACK CopyDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             else ctx->target = COPY_ORIGINAL;
             if (ctx->target == COPY_OTHER_SITE) {
                 int sel = (int)SendDlgItemMessageW(hDlg, IDC_COPY_SITE, CB_GETCURSEL, 0, 0);
-                if (sel == CB_ERR) { MessageBoxW(hDlg, ExplorerText(L"error.copy_other_site_required", L"请选择目标站点。", L"Select a target site."), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_OK | MB_ICONWARNING); return TRUE; }
+                if (sel == CB_ERR) { ErfMessageBoxW(hDlg, ExplorerText(L"error.copy_other_site_required", L"请选择目标站点。", L"Select a target site."), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_OK | MB_ICONWARNING); return TRUE; }
                 SendDlgItemMessageW(hDlg, IDC_COPY_SITE, CB_GETLBTEXT, sel, (LPARAM)ctx->targetSite);
             } else StringCchCopy(ctx->targetSite, ARRAYSIZE(ctx->targetSite), ctx->sourceSite);
             if (ctx->target != COPY_ORIGINAL) GetDlgItemTextW(hDlg, IDC_COPY_PATH, ctx->targetPath, ARRAYSIZE(ctx->targetPath));
             if (ctx->target == COPY_SAME_SITE || ctx->target == COPY_OTHER_SITE) {
-                if (ctx->targetPath[0] != L'/') { MessageBoxW(hDlg, ExplorerText(L"error.remote_path_required", L"远程目标路径必须以 / 开头。", L"The remote target path must start with /."), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_OK | MB_ICONWARNING); return TRUE; }
+                if (ctx->targetPath[0] != L'/') { ErfMessageBoxW(hDlg, ExplorerText(L"error.remote_path_required", L"远程目标路径必须以 / 开头。", L"The remote target path must start with /."), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_OK | MB_ICONWARNING); return TRUE; }
             }
-            if (ctx->target == COPY_LOCAL_FOLDER && !PathIsDirectoryW(ctx->targetPath)) { MessageBoxW(hDlg, ExplorerText(L"error.local_folder_required", L"请选择存在的本地文件夹。", L"Select an existing local folder."), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_OK | MB_ICONWARNING); return TRUE; }
+            if (ctx->target == COPY_LOCAL_FOLDER && !PathIsDirectoryW(ctx->targetPath)) { ErfMessageBoxW(hDlg, ExplorerText(L"error.local_folder_required", L"请选择存在的本地文件夹。", L"Select an existing local folder."), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_OK | MB_ICONWARNING); return TRUE; }
             EndDialog(hDlg, IDOK); return TRUE;
         case IDCANCEL: EndDialog(hDlg, IDCANCEL); return TRUE;
         } break;
@@ -1751,7 +1757,7 @@ static DWORD WINAPI BgCopyThreadProc(LPVOID p)
                 WCHAR localTarget[MAX_PATH] = {};
                 StringCchPrintf(localTarget, ARRAYSIZE(localTarget), L"%s\\%s", c->targetPath, nm.c_str());
                 // 工作线程没有可用的 owner 窗口，覆盖确认用 NULL owner。
-                if (PathFileExistsW(localTarget) && IDYES != MessageBoxW(NULL, ExplorerText(L"confirm.overwrite_local", L"目标位置已有同名文件，要覆盖吗？", L"A file with the same name already exists. Replace it?"), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_YESNO | MB_ICONWARNING)) continue;
+                if (PathFileExistsW(localTarget) && IDYES != ErfMessageBoxW(NULL, ExplorerText(L"confirm.overwrite_local", L"目标位置已有同名文件，要覆盖吗？", L"A file with the same name already exists. Replace it?"), ExplorerText(L"dialog.copy_to", L"复制到...", L"Copy to..."), MB_YESNO | MB_ICONWARNING)) continue;
                 WCHAR part[MAX_PATH + 16] = {};
                 StringCchPrintf(part, ARRAYSIZE(part), L"%s.rfs-part", localTarget);
                 DeleteFileW(part);
@@ -1787,7 +1793,7 @@ static DWORD WINAPI BgCopyThreadProc(LPVOID p)
     }
     catch (...) { ok = FALSE; }
 
-    if (!ok) MessageBoxW(NULL, ExplorerText(L"error.copy_failed", L"部分项目复制失败。跨站点和本地复制目前仅支持文件。", L"Some items could not be copied. Cross-site and local copies currently support files only."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+    if (!ok) ErfMessageBoxW(NULL, ExplorerText(L"error.copy_failed", L"部分项目复制失败。跨站点和本地复制目前仅支持文件。", L"Some items could not be copied. Cross-site and local copies currently support files only."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
     else AfterRemoteMutation(c->site, c->folder, c->notify);
 
     if (c->notify) ILFree(c->notify);
@@ -1928,7 +1934,7 @@ static void RunCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name,
     } else {
         // local command via ShellExecute
         HINSTANCE hr=ShellExecuteW(hwnd,NULL,cmd,NULL,NULL,SW_SHOWNORMAL);
-        if((INT_PTR)hr<=32){ MessageBoxW(hwnd,ExplorerText(L"error.custom_command_failed",L"自定义命令执行失败。",L"Custom command failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR); }
+        if((INT_PTR)hr<=32){ ErfMessageBoxW(hwnd,ExplorerText(L"error.custom_command_failed",L"自定义命令执行失败。",L"Custom command failed."),ExplorerText(L"dialog.remote",L"远程操作",L"Remote"),MB_OK|MB_ICONERROR); }
     }
 }
 
@@ -1963,7 +1969,7 @@ static void NewFileRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUT
     if (!PromptText(hwnd, ExplorerText(L"dialog.new_file", L"新建文件", L"New file"), name, ARRAYSIZE(name), name)) return;
     if (wcspbrk(name, L"\\/") || 0 == lstrcmpW(name, L".") || 0 == lstrcmpW(name, L".."))
     {
-        MessageBoxW(hwnd, ExplorerText(L"error.invalid_file_name", L"文件名不能包含路径分隔符。", L"The file name cannot contain a path separator."),
+        ErfMessageBoxW(hwnd, ExplorerText(L"error.invalid_file_name", L"文件名不能包含路径分隔符。", L"The file name cannot contain a path separator."),
                     ExplorerText(L"dialog.new_file", L"新建文件", L"New file"), MB_OK | MB_ICONWARNING);
         return;
     }
@@ -1972,7 +1978,7 @@ static void NewFileRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUT
     if (!TempDir(L"Edit", site, editDir, ARRAYSIZE(editDir)) ||
         FAILED(StringCchPrintfW(local, ARRAYSIZE(local), L"%s%08X_%s", editDir, GetTickCount(), name)))
     {
-        MessageBoxW(hwnd, ExplorerText(L"error.create_file_failed", L"无法准备本地编辑缓存。", L"Unable to prepare the local editing cache."),
+        ErfMessageBoxW(hwnd, ExplorerText(L"error.create_file_failed", L"无法准备本地编辑缓存。", L"Unable to prepare the local editing cache."),
                     ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
         return;
     }
@@ -1980,19 +1986,19 @@ static void NewFileRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUT
                                NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (empty == INVALID_HANDLE_VALUE)
     {
-        MessageBoxW(hwnd, ExplorerText(L"error.create_file_failed", L"无法创建本地编辑文件。", L"Unable to create the local editing file."),
+        ErfMessageBoxW(hwnd, ExplorerText(L"error.create_file_failed", L"无法创建本地编辑文件。", L"Unable to create the local editing file."),
                     ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
         return;
     }
     CloseHandle(empty);
     if (!LaunchConfiguredEditor(hwnd, local))
     {
-        MessageBoxW(hwnd, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+        ErfMessageBoxW(hwnd, ExplorerText(L"error.open_failed", L"打开失败。", L"Open failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
         DeleteFileW(local);
         return;
     }
     if (!StartEditWatch(site, full, local, TRUE, notifyPidl))
-        MessageBoxW(hwnd, ExplorerText(L"error.edit_watch_failed", L"已创建并打开文件，但无法启动自动上传监视。", L"The file was created and opened, but automatic upload monitoring could not start."),
+        ErfMessageBoxW(hwnd, ExplorerText(L"error.edit_watch_failed", L"已创建并打开文件，但无法启动自动上传监视。", L"The file was created and opened, but automatic upload monitoring could not start."),
                     ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONWARNING);
 }
 
@@ -2034,7 +2040,7 @@ static DWORD WINAPI PasteJobProc(LPVOID p)
         }
     }
     RefreshLocalFast(j->site, j->folder, j->pidl);
-    if (!ok) MessageBoxW(NULL, ExplorerText(L"error.some_uploads_failed", L"部分文件上传失败。", L"Some files could not be uploaded."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
+    if (!ok) ErfMessageBoxW(NULL, ExplorerText(L"error.some_uploads_failed", L"部分文件上传失败。", L"Some files could not be uploaded."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
     if (j->pidl) ILFree(j->pidl);
     delete j;
     DllRelease();
@@ -2118,7 +2124,7 @@ static void BgCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, int idx)
     else
     {
         HINSTANCE hr = ShellExecuteW(hwnd, NULL, cmd, NULL, NULL, SW_SHOWNORMAL);
-        if ((INT_PTR)hr <= 32) MessageBoxW(hwnd, ExplorerText(L"error.custom_command_failed", L"自定义命令执行失败。", L"Custom command failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
+        if ((INT_PTR)hr <= 32) ErfMessageBoxW(hwnd, ExplorerText(L"error.custom_command_failed", L"自定义命令执行失败。", L"Custom command failed."), ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK|MB_ICONERROR);
     }
 }
 
@@ -2627,7 +2633,7 @@ static DWORD WINAPI ChmodRemoteThreadProc(LPVOID p)
         else
         {
             ProbeLog(L"[TERM] async chmod CLI fallback failed rc=%d", rc);
-            MessageBoxW(NULL,
+            ErfMessageBoxW(NULL,
                 ExplorerText(L"error.chmod_failed", L"权限修改失败（常驻服务未运行，已回退到命令行）。",
                                                       L"Permission update failed (resident service was not running; fell back to the CLI)."),
                 ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
@@ -2979,7 +2985,7 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
     if (!SiteIsSshCapable(site.type))
     {
         // FTP 没有 shell 通道：明确告知，而不是给一个永远失败的菜单项。
-        MessageBoxW(hwnd,
+        ErfMessageBoxW(hwnd,
             ExplorerText(L"error.terminal_needs_ssh",
                          L"该站点不是 SSH 类型（SFTP），FTP 没有 shell 通道，无法打开终端。",
                          L"This site is not SSH-based (SFTP). FTP has no shell channel, so no terminal can be opened."),
@@ -2991,7 +2997,7 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
     if (!WriteTerminalShim(site, remoteDir, shimPath, sshCmdText))
     {
         ProbeLog(L"[TERM] shim write failed err=%lu", GetLastError());
-        MessageBoxW(hwnd,
+        ErfMessageBoxW(hwnd,
             ExplorerText(L"error.terminal_shim_failed",
                          L"无法写入终端启动脚本（%LOCALAPPDATA% 不可写？）。",
                          L"Could not write the terminal launcher script (is %LOCALAPPDATA% writable?)."),
@@ -3048,7 +3054,7 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
         }
         else if (!EnsureSshConfigAlias(site, alias))
         {
-            MessageBoxW(hwnd,
+            ErfMessageBoxW(hwnd,
                 ExplorerText(L"error.terminal_ssh_config",
                              L"无法写入 %USERPROFILE%\\.ssh\\config。",
                              L"Could not write %USERPROFILE%\\.ssh\\config."),
@@ -3059,7 +3065,7 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
         std::wstring codeCmd;
         if (!ResolveCodeCmd(codeCmd))
         {
-            MessageBoxW(hwnd,
+            ErfMessageBoxW(hwnd,
                 ExplorerText(L"error.terminal_no_vscode",
                              L"未找到 VS Code 的 code.cmd。请确认已安装 VS Code（或用 code 命令所在的安装目录）。",
                              L"VS Code's code.cmd was not found. Make sure VS Code is installed."),
@@ -3106,7 +3112,7 @@ static void LaunchTerminalForSite(HWND hwnd, const FTPSITE &site, PCWSTR remoteD
     else
     {
         ProbeLog(L"[TERM] CreateProcess failed err=%lu", GetLastError());
-        MessageBoxW(hwnd,
+        ErfMessageBoxW(hwnd,
             ExplorerText(L"error.terminal_failed",
                          L"无法启动终端（未找到 wt.exe 或 powershell.exe）。",
                          L"Could not start the terminal (wt.exe or powershell.exe not found)."),
@@ -3273,7 +3279,7 @@ public:
         // mutation through DeleteRemoteShellItem, exactly like the top button.
         HRESULT hrDelete = DeleteSelectionWithNativeFileOperation(ci->hwnd, data);
         if (FAILED(hrDelete) && !IsNativeDeleteCancelled(hrDelete))
-            MessageBoxW(ci->hwnd, ExplorerText(L"error.some_deletes_failed",L"删除失败。",L"Delete failed."),
+            ErfMessageBoxW(ci->hwnd, ExplorerText(L"error.some_deletes_failed",L"删除失败。",L"Delete failed."),
                         ExplorerText(L"dialog.remote",L"远程操作",L"Remote"), MB_OK|MB_ICONERROR);
         break;
     }

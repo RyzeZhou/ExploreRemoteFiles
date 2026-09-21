@@ -223,6 +223,8 @@ private:
 
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void **ppv)
 {
+    // 每个进程第一次走到这里时记一条 [HOST]（Office 叮咚声取证用），之后是纯内存判断。
+    (void)ErfHostIsExplorer();
     return CClassFactory::CreateInstance(clsid, c_rgClassObjectInit, ARRAYSIZE(c_rgClassObjectInit), riid, ppv);
 }
 

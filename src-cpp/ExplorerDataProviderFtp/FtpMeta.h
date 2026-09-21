@@ -831,6 +831,9 @@ inline SRWLOCK &FtpCacheLock()
 #define FTP_CACHE_TTL_MS            300000ULL              // 内存新鲜期：5 分钟
 #define FTP_DISK_CACHE_MAX_AGE_MS   (24ULL * 3600 * 1000)  // 磁盘快照可用于首屏的上限：24 小时
 #define FTP_CACHE_MAX_DIRS          128                    // 内存里最多保留多少个目录快照
+#define FTP_CACHE_REVALIDATE_MS     60000ULL               // 重验阈值（2026-09-21）：首屏
+                                                           // 快照超过 60 秒就后台强制拉一次服务器并通知视图，
+                                                           // 显示不卡、数据不旧——之前 F5 只重画了旧快照。
 
 // v2 (2026-09-20): carries the site+folder identity so a load NEVER serves a
 // listing that belongs to another key. v1 files (case-folded-hash era) are
@@ -1065,6 +1068,7 @@ inline void FtpCacheClear()
 // re-enumeration hits a ready cache and always shows the new state.
 // Runs entirely off the caller's thread (cache clear + network fetch + notify).
 inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out, bool waitForWarm = false);   // fwd (defined below)
+inline BOOL FtpListForceRefresh(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out);   // fwd (defined below)
 struct FtpRefreshCtx
 {
     WCHAR site[64];
@@ -1230,9 +1234,10 @@ inline BOOL FtpCacheFindOne(PCWSTR site, PCWSTR folder, PCWSTR name, FTPENTRY *o
 // exactly what Explorer's delete pre-count and a large-dir navigation hit).
 // Callers that get FALSE should enumerate EMPTY and let FtpPrefetchQuiet fill
 // the cache asynchronously + SHChangeNotify refresh the view.
-inline BOOL FtpCachePeekAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out)
+inline BOOL FtpCachePeekAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out, ULONGLONG *ageMsOut = NULL)
 {
     out.clear();
+    if (ageMsOut) *ageMsOut = 0;
     if (!site || !site[0]) return FALSE;
     PCWSTR key = (path && path[0]) ? path : L"/";
     ULONGLONG now = GetTickCount64();
@@ -1242,6 +1247,7 @@ inline BOOL FtpCachePeekAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out
         if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FTP_CACHE_TTL_MS))
         {
             out = entry.items;
+            if (ageMsOut) *ageMsOut = (now >= entry.tick) ? (now - entry.tick) : 0;
             ReleaseSRWLockShared(&FtpCacheLock());
             return TRUE;
         }
@@ -1427,13 +1433,15 @@ static DWORD WINAPI FtpPrefetchThreadProc(LPVOID p)
     try
     {
         std::vector<FTPENTRY> warm;
-        if (!FtpListCachedAll(c->site, c->folder, warm) || warm.empty())
+        // 2026-09-21: 必须走强制刷新。之前调 FtpListCachedAll，磁盘快照命中
+        // （24h 内）就直接返回、根本不碰网络——"静默预取修正元数据"的注释是假的。
+        if (!FtpListForceRefresh(c->site, c->folder, warm))
         {
             // Transient bridge/network hiccup: the optimistic patch entries would
             // otherwise linger with guessed metadata. Retry once after a beat.
             Sleep(300);
             warm.clear();
-            FtpListCachedAll(c->site, c->folder, warm);
+            FtpListForceRefresh(c->site, c->folder, warm);
         }
         ProbeLog(L"[MUT] quiet prefetch site='%s' path='%s' n=%u", c->site, c->folder, (UINT)warm.size());
     }
@@ -1588,39 +1596,11 @@ inline void FtpCachePromote(PCWSTR site, PCWSTR path, const std::vector<FTPENTRY
     ReleaseSRWLockExclusive(&FtpCacheLock());
 }
 
-// Spawn the CLI bridge once per site+path per TTL, parse tab-separated items,
-// cache the result. Returns item count (0 on failure).
-inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
+// 解析桥接/CLI 的 "ITEM\t..." 文本（FtpListCached 与 FtpListForceRefresh 共用，
+// 保证"缓存读"和"强制刷新"看到完全一致的数据；与旧 FtpListCached 内联解析逐行一致）。
+inline BOOL FtpParseBridgeItems(PCWSTR site, PCWSTR path, const std::string &text, std::vector<FTPENTRY> &listed)
 {
-    int cached = FtpCacheLookup(site, path, out, maxItems);
-    if (cached > 0) return cached;
-
-    PCWSTR pszPath = (path && path[0]) ? path : L"/";
-    std::string text;
-    if (!FtpBridgeList(site, pszPath, text))
-    {
-        WCHAR cmd[1200];
-        StringCchPrintf(cmd, ARRAYSIZE(cmd),
-            L"\"%s\" pipe \"%s\" \"%s\"",
-            GetCliPath(), site, pszPath);
-        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-        HANDLE rd = NULL, wr = NULL;
-        if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
-        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-        STARTUPINFOW si = { sizeof(si) };
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-        PROCESS_INFORMATION pi = {};
-        BOOL spawned = CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-        CloseHandle(wr);
-        if (!spawned) { CloseHandle(rd); return 0; }
-        char buf[4096]; DWORD got = 0;
-        while (ReadFile(rd, buf, sizeof(buf), &got, NULL) && got) text.append(buf, got);
-        CloseHandle(rd);
-        WaitForSingleObject(pi.hProcess, 8000);
-        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    }
-    std::vector<FTPENTRY> listed;
+    listed.clear();
     size_t pos = 0;
     while (pos < text.size())
     {
@@ -1658,31 +1638,89 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
         item.dwGid = (nf > 11 && fields[11] && fields[11][0]) ? (DWORD)_wtoi64(fields[11]) : 0xFFFFFFFF;
         StringCchCopy(item.szName, ARRAYSIZE(item.szName), fields[9]);
     }
+    if (text.rfind("FAIL:", 0) == 0) return FALSE;
+    // Health probe (2026-09-06): a listing where nearly every item has
+    // mtime==0 AND size==0 AND no owner is almost certainly a corrupt
+    // response/parse — it would blank all columns and scramble sorting
+    // (folders no longer first) until the 3s TTL expires. Log any such
+    // batch so the intermittent blank-columns report can be pinned.
+    if (!listed.empty())
+    {
+        int zeroed = 0;
+        for (auto const &it : listed)
+            if (it.dwMtime == 0 && it.dwSize == 0 && !it.fIsFolder && !it.szOwner[0]) zeroed++;
+        if (zeroed * 2 >= (int)listed.size())
+            ProbeLog(L"[HEALTH] suspicious listing site='%s' path='%s' n=%u zeroed=%u",
+                     site, path, (UINT)listed.size(), (UINT)zeroed);
+    }
+    return TRUE;
+}
+
+// 真正走一次网络：先常驻桥接，失败再起一次 CLI 子进程（与旧 FtpListCached 一致）。
+inline BOOL FtpFetchLiveListing(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &listed)
+{
+    listed.clear();
+    PCWSTR pszPath = (path && path[0]) ? path : L"/";
+    std::string text;
+    if (!FtpBridgeList(site, pszPath, text))
+    {
+        WCHAR cmd[1200];
+        StringCchPrintf(cmd, ARRAYSIZE(cmd),
+            L"\"%s\" pipe \"%s\" \"%s\"",
+            GetCliPath(), site, pszPath);
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        HANDLE rd = NULL, wr = NULL;
+        if (!CreatePipe(&rd, &wr, &sa, 0)) return FALSE;
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        PROCESS_INFORMATION pi = {};
+        BOOL spawned = CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+        CloseHandle(wr);
+        if (!spawned) { CloseHandle(rd); return FALSE; }
+        char buf[4096]; DWORD got = 0;
+        while (ReadFile(rd, buf, sizeof(buf), &got, NULL) && got) text.append(buf, got);
+        CloseHandle(rd);
+        WaitForSingleObject(pi.hProcess, 8000);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    return FtpParseBridgeItems(site, pszPath, text, listed);
+}
+
+// 强制刷新（2026-09-21）：绕过内存+磁盘快照，直接拉一次服务器 LIST 并替换缓存键。
+// 给"后台预取 / 解析未命中重试 / 超龄重验"用。之前 FtpPrefetchQuiet 调的是
+// FtpListCachedAll——内存 5 分钟、磁盘 24 小时内命中就直接返回、根本不碰网络，
+// 所谓"刷新"等于只刷了 UI，这正是"远程目录不是实时 + F5 无效"的根因。
+inline BOOL FtpListForceRefresh(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out)
+{
+    out.clear();
+    PCWSTR key = (path && path[0]) ? path : L"/";
+    std::vector<FTPENTRY> listed;
+    if (!FtpFetchLiveListing(site, key, listed)) return FALSE;
+    FtpCacheStore(site, key, listed.data(), (int)listed.size());
+    out = listed;
+    ProbeLog(L"[REFRESH] forced live site='%s' path='%s' n=%u", site, key, (UINT)out.size());
+    return TRUE;
+}
+
+// Spawn the CLI bridge once per site+path per TTL, parse tab-separated items,
+// cache the result. Returns item count (0 on failure).
+inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
+{
+    int cached = FtpCacheLookup(site, path, out, maxItems);
+    if (cached > 0) return cached;
+
+    PCWSTR pszPath = (path && path[0]) ? path : L"/";
+    std::vector<FTPENTRY> listed;
+    if (!FtpFetchLiveListing(site, pszPath, listed)) return 0;
     // Cache the complete remote listing. The caller may ask for only a slice,
     // but a later Explorer enumeration must not inherit that artificial cap.
-    if (text.rfind("FAIL:", 0) == std::string::npos)
-    {
-        // Health probe (2026-09-06): a listing where nearly every item has
-        // mtime==0 AND size==0 AND no owner is almost certainly a corrupt
-        // response/parse — it would blank all columns and scramble sorting
-        // (folders no longer first) until the 3s TTL expires. Log any such
-        // batch so the intermittent blank-columns report can be pinned.
-        if (!listed.empty())
-        {
-            int zeroed = 0;
-            for (auto const &it : listed)
-                if (it.dwMtime == 0 && it.dwSize == 0 && !it.fIsFolder && !it.szOwner[0]) zeroed++;
-            if (zeroed * 2 >= (int)listed.size())
-                ProbeLog(L"[HEALTH] suspicious listing site='%s' path='%s' n=%u zeroed=%u",
-                         site, pszPath, (UINT)listed.size(), (UINT)zeroed);
-        }
-        FtpCacheStore(site, pszPath, listed.data(), (int)listed.size());
-        int n = (int)listed.size();
-        if (n > maxItems) n = maxItems;
-        for (int i = 0; i < n; i++) out[i] = listed[i];
-        return n;
-    }
-    return 0;
+    FtpCacheStore(site, pszPath, listed.data(), (int)listed.size());
+    int n = (int)listed.size();
+    if (n > maxItems) n = maxItems;
+    for (int i = 0; i < n; i++) out[i] = listed[i];
+    return n;
 }
 
 // Returns the complete cached listing. On a miss, populate the cache once via
@@ -1776,9 +1814,9 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
 //
 // 保护：磁盘快照超过 8 MB（≈1.1 万项）就不在 UI 线程上搬，仍然交给后台预取 ——
 // 本地文件读虽然快，也不能让一个超大目录把资源管理器的 UI 线程占住。
-inline BOOL FtpCachePeekAllOrDisk(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out)
+inline BOOL FtpCachePeekAllOrDisk(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out, ULONGLONG *ageMsOut = NULL)
 {
-    if (FtpCachePeekAll(site, path, out)) return TRUE;
+    if (FtpCachePeekAll(site, path, out, ageMsOut)) return TRUE;
 
     WCHAR file[MAX_PATH] = {};
     if (FtpMetadataCacheFile(site, path, file, ARRAYSIZE(file)))
@@ -1791,8 +1829,10 @@ inline BOOL FtpCachePeekAllOrDisk(PCWSTR site, PCWSTR path, std::vector<FTPENTRY
         }
     }
 
-    if (!FtpDiskCacheLoad(site, path, out, FTP_DISK_CACHE_MAX_AGE_MS) || out.empty()) return FALSE;
+    ULONGLONG age = 0;
+    if (!FtpDiskCacheLoad(site, path, out, FTP_DISK_CACHE_MAX_AGE_MS, &age) || out.empty()) return FALSE;
+    if (ageMsOut) *ageMsOut = age;
     FtpCachePromote(site, path, out);   // 回填内存，后续查询直接命中
-    ProbeLog(L"[CACHE] disk snapshot hit site='%s' path='%s' n=%u", site, path, (UINT)out.size());
+    ProbeLog(L"[CACHE] disk snapshot hit site='%s' path='%s' n=%u ageMs=%llu", site, path, (UINT)out.size(), age);
     return TRUE;
 }

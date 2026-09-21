@@ -117,7 +117,7 @@ HRESULT DisplayItem(IShellItemArray *psia, HWND hwnd)
         hr = psi->GetDisplayName(SIGDN_NORMALDISPLAY, &pszDisplayName);
         if (SUCCEEDED(hr))
         {
-            MessageBox(hwnd, pszDisplayName, pszDisplayName, MB_OK);
+            ErfMessageBoxW(hwnd, pszDisplayName, pszDisplayName, MB_OK);
             CoTaskMemFree(pszDisplayName);
         }
         psi->Release();
