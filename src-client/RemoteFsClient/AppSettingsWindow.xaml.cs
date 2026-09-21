@@ -25,6 +25,12 @@ public partial class AppSettingsWindow : Window
         EditorPathBox.Text = Settings.EditorPath;
         DownloadDirBox.Text = Settings.DownloadDir;
         TicketModeCheck.IsChecked = Settings.UseTransferTicket;
+        DirCacheTtlBox.Text = Settings.DirCacheTtlMinutes.ToString();
+        DirCacheDiskBox.Text = Settings.DirCacheDiskMaxAgeHours.ToString();
+        DirCacheRevalidateBox.Text = Settings.DirCacheRevalidateSeconds.ToString();
+        MruCheck.IsChecked = Settings.MruRevalidate;
+        MruIntervalBox.Text = Settings.MruIntervalSeconds.ToString();
+        MruMaxBox.Text = Settings.MruMaxDirs.ToString();
         ExplorerLanguageBox.SelectedValue = Settings.ExplorerLanguage;
         ServiceLanguageBox.SelectedValue = Settings.ServiceLanguage;
         DefaultViewBox.SelectedValue = Settings.DefaultViewMode;
@@ -72,7 +78,18 @@ public partial class AppSettingsWindow : Window
         MetadataCachePathLabel.Text = Ui.T("MetadataCachePath"); FileCachePathLabel.Text = Ui.T("FileCachePath");
         BrowseMetadataCacheButton.Content = Ui.T("Browse"); BrowseFileCacheButton.Content = Ui.T("Browse");
         DefaultEditorLabel.Text = Ui.T("DefaultEditor"); BrowseEditorButton.Content = Ui.T("Browse");
-        CachesHintText.Text = Ui.T("CacheDirectoryHint");
+        DirCacheTtlLabel.Text = Ui.IsEnglish ? "Listing cache TTL (minutes)" : "目录快照新鲜期（分钟）";
+        DirCacheDiskLabel.Text = Ui.IsEnglish ? "Disk snapshot max age (hours)" : "磁盘快照上限（小时）";
+        DirCacheRevalidateLabel.Text = Ui.IsEnglish ? "Background revalidate after (seconds, 0=off)" : "超龄后台重验（秒，0=关闭）";
+        MruCheck.Content = Ui.IsEnglish
+            ? "Silently revalidate recently opened folders (extend expiry if unchanged)"
+            : "后台静默重验最近打开的目录（无变化只续期）";
+        MruIntervalLabel.Text = Ui.IsEnglish ? "Revalidate interval (seconds)" : "重验间隔（秒）";
+        MruMaxLabel.Text = Ui.IsEnglish ? "Max tracked folders" : "最多跟踪目录数";
+        CachesHintText.Text = Ui.T("CacheDirectoryHint")
+            + (Ui.IsEnglish
+                ? "\n\nCache durations take effect within ~30 seconds; reopening Explorer is not required."
+                : "\n\n缓存时长改完约 30 秒内生效，不用重启资源管理器。");
 
         DownloadDirLabel.Text = Ui.IsEnglish ? "Default download directory" : "默认下载目录";
         BrowseDownloadDirButton.Content = Ui.T("Browse");
@@ -193,14 +210,22 @@ public partial class AppSettingsWindow : Window
     [DllImport("shell32.dll")]
     private static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
 
+    private static int ParseInt(string text, int fallback) =>
+        int.TryParse(text.Trim(), out int v) ? v : fallback;
+
     private void OnSave(object sender, RoutedEventArgs e)
-    {
-        Settings.WinScpPath = WinScpPathBox.Text.Trim();
+    {        Settings.WinScpPath = WinScpPathBox.Text.Trim();
         Settings.MetadataCachePath = MetadataCachePathBox.Text.Trim();
         Settings.FileCachePath = FileCachePathBox.Text.Trim();
         Settings.EditorPath = EditorPathBox.Text.Trim();
         Settings.DownloadDir = DownloadDirBox.Text.Trim();
         Settings.UseTransferTicket = TicketModeCheck.IsChecked == true;
+        Settings.DirCacheTtlMinutes = ParseInt(DirCacheTtlBox.Text, Settings.DirCacheTtlMinutes);
+        Settings.DirCacheDiskMaxAgeHours = ParseInt(DirCacheDiskBox.Text, Settings.DirCacheDiskMaxAgeHours);
+        Settings.DirCacheRevalidateSeconds = ParseInt(DirCacheRevalidateBox.Text, Settings.DirCacheRevalidateSeconds);
+        Settings.MruRevalidate = MruCheck.IsChecked == true;
+        Settings.MruIntervalSeconds = ParseInt(MruIntervalBox.Text, Settings.MruIntervalSeconds);
+        Settings.MruMaxDirs = ParseInt(MruMaxBox.Text, Settings.MruMaxDirs);
         Settings.ExplorerLanguage = (ExplorerLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.ServiceLanguage = (ServiceLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.DefaultViewMode = (DefaultViewBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "details";

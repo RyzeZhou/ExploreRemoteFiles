@@ -62,6 +62,8 @@
                 <Grid.ColumnDefinitions><ColumnDefinition Width="176"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
                 <TextBlock x:Name="WinScpPathLabel" VerticalAlignment="Center"/>
@@ -76,7 +78,18 @@
                 <TextBlock x:Name="DefaultEditorLabel" Grid.Row="3" VerticalAlignment="Center" Margin="0,10,0,0"/>
                 <TextBox x:Name="EditorPathBox" Grid.Row="3" Grid.Column="1" Margin="0,14,8,0"/>
                 <Button x:Name="BrowseEditorButton" Grid.Row="3" Grid.Column="2" Click="OnBrowseEditor" Padding="12,4" Margin="0,14,0,0"/>
-                <TextBlock x:Name="CachesHintText" Grid.Row="4" Grid.ColumnSpan="3" TextWrapping="Wrap"
+                <TextBlock x:Name="DirCacheTtlLabel" Grid.Row="4" VerticalAlignment="Center" Margin="0,10,0,0"/>
+                <TextBox x:Name="DirCacheTtlBox" Grid.Row="4" Grid.Column="1" Margin="0,14,8,0"/>
+                <TextBlock x:Name="DirCacheDiskLabel" Grid.Row="5" VerticalAlignment="Center" Margin="0,10,0,0"/>
+                <TextBox x:Name="DirCacheDiskBox" Grid.Row="5" Grid.Column="1" Margin="0,14,8,0"/>
+                <TextBlock x:Name="DirCacheRevalidateLabel" Grid.Row="6" VerticalAlignment="Center" Margin="0,10,0,0"/>
+                <TextBox x:Name="DirCacheRevalidateBox" Grid.Row="6" Grid.Column="1" Margin="0,14,8,0"/>
+                <CheckBox x:Name="MruCheck" Grid.Row="7" Grid.ColumnSpan="3" Margin="0,14,0,0"/>
+                <TextBlock x:Name="MruIntervalLabel" Grid.Row="8" VerticalAlignment="Center" Margin="0,10,0,0"/>
+                <TextBox x:Name="MruIntervalBox" Grid.Row="8" Grid.Column="1" Margin="0,14,8,0"/>
+                <TextBlock x:Name="MruMaxLabel" Grid.Row="9" VerticalAlignment="Center" Margin="0,10,0,0"/>
+                <TextBox x:Name="MruMaxBox" Grid.Row="9" Grid.Column="1" Margin="0,14,8,0"/>
+                <TextBlock x:Name="CachesHintText" Grid.Row="10" Grid.ColumnSpan="3" TextWrapping="Wrap"
                            Foreground="#666" Margin="0,18,0,0" VerticalAlignment="Top"/>
             </Grid>
 

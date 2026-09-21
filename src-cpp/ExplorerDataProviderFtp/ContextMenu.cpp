@@ -1940,6 +1940,47 @@ static void RunCustomCommand(HWND hwnd, PCWSTR site, PCWSTR folder, PCWSTR name,
 
 // ---- background (folder empty area) menu helpers ----------------------------
 
+// 手动刷新（2026-09-21）：右键背景菜单 k=0「刷新」。与 WinSCP 的 Ctrl+R 对应——
+// 必走一次服务器 LIST（FtpListForceRefresh），成功只通知视图（静默），
+// 失败才弹窗（用户是显式点的，有权知道）。全程后台，UI 线程只投递参数。
+struct RefreshJob
+{
+    WCHAR site[64];
+    WCHAR folder[600];
+    PIDLIST_ABSOLUTE pidl;
+};
+static DWORD WINAPI RefreshJobProc(LPVOID p)
+{
+    RefreshJob *j = static_cast<RefreshJob *>(p);
+    std::vector<FTPENTRY> fresh;
+    BOOL ok = FtpListForceRefresh(j->site, j->folder, fresh);
+    ProbeLog(L"[REFRESH] manual site='%s' path='%s' ok=%d n=%u",
+             j->site, j->folder, (int)ok, (UINT)fresh.size());
+    if (j->pidl)
+    {
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)j->pidl, NULL);
+        ILFree(j->pidl);
+    }
+    if (!ok)
+        ErfMessageBoxW(NULL,
+            ExplorerText(L"error.refresh_failed", L"刷新失败：没能从服务器取到最新目录。", L"Refresh failed: could not list the server directory."),
+            ExplorerText(L"dialog.remote", L"远程操作", L"Remote"), MB_OK | MB_ICONERROR);
+    delete j;
+    DllRelease();
+    return 0;
+}
+static void RefreshFolderRemote(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
+{
+    RefreshJob *j = new (std::nothrow) RefreshJob();
+    if (!j) return;
+    StringCchCopy(j->site, ARRAYSIZE(j->site), site ? site : L"");
+    StringCchCopy(j->folder, ARRAYSIZE(j->folder), (folder && folder[0]) ? folder : L"/");
+    j->pidl = notifyPidl ? ILCloneFull(notifyPidl) : NULL;
+    DllAddRef();   // 线程自己 pin 模块（2026-09-20 规范）
+    HANDLE h = CreateThread(NULL, 0, RefreshJobProc, j, 0, NULL);
+    if (h) CloseHandle(h);
+    else { DllRelease(); if (j->pidl) ILFree(j->pidl); delete j; }
+}
 static void NewFolderRemote(HWND hwnd, PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE notifyPidl)
 {
     WCHAR name[256]; StringCchCopy(name, ARRAYSIZE(name), ExplorerText(L"dialog.new_folder_default", L"新建文件夹", L"New folder"));
@@ -3783,6 +3824,10 @@ public:
         }
         else
         {
+            // k=0 刷新：必走一次服务器 LIST（FtpListForceRefresh），与 WinSCP 的
+            // Ctrl+R 对应。注意下面 switch/自定义命令偏移/ GetCommandString 的
+            // 位置全部随之 +1（终端项判据 m_hasTerminalItem 不变）。
+            BG_INSERT(ExplorerText(L"menu.refresh", L"刷新(&R)", L"Refresh(&R)"));
             BG_INSERT(ExplorerText(L"menu.copy_current_path", L"复制当前路径", L"Copy current path"));
             BG_INSERT(ExplorerText(L"menu.new_folder", L"新建文件夹...", L"New folder..."));
             BG_INSERT(ExplorerText(L"menu.new_file", L"新建文件...", L"New file..."));
@@ -3915,12 +3960,13 @@ public:
         }
         switch (k)
         {
-        case 0: { std::wstring t = L"erf:"; t += site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
-        case 1: NewFolderRemote(ci->hwnd, site, folder, m_pidl); break;
-        case 2: NewFileRemote(ci->hwnd, site, folder, m_pidl); break;
-        case 3: ShowCurrentFolderProperties(ci->hwnd, site, folder); break;
-        case 4: ShowCurrentSiteInfo(ci->hwnd, site); break;
-        case 5:
+        case 0: RefreshFolderRemote(site, folder, m_pidl); break;
+        case 1: { std::wstring t = L"erf:"; t += site; t += L":"; t += folder; CopyTextToClipboard(ci->hwnd, t.c_str()); break; }
+        case 2: NewFolderRemote(ci->hwnd, site, folder, m_pidl); break;
+        case 3: NewFileRemote(ci->hwnd, site, folder, m_pidl); break;
+        case 4: ShowCurrentFolderProperties(ci->hwnd, site, folder); break;
+        case 5: ShowCurrentSiteInfo(ci->hwnd, site); break;
+        case 6:
             // Open the resident client focused on the Transfers tab.
             if (GetClientPath()[0])
                 ShellExecuteW(ci->hwnd, NULL, GetClientPath(), L"--transfers", NULL, SW_SHOWNORMAL);
@@ -3928,14 +3974,14 @@ public:
         default:
             // 「在此打开终端」只在 SSH 站点插入（m_hasTerminalItem 与 QueryContextMenu 同判据），
             // 因此自定义命令的偏移要随之移动一位。
-            if (m_hasTerminalItem && k == 6)
+            if (m_hasTerminalItem && k == 7)
             {
                 FTPSITE ts = {};
                 if (FindSiteByName(site, &ts))
                     LaunchTerminalForSite(ci->hwnd, ts, folder, ReadTerminalForSite(ts));
                 break;
             }
-            BgCustomCommand(ci->hwnd, site, folder, (int)k - (m_hasTerminalItem ? 7 : 6));
+            BgCustomCommand(ci->hwnd, site, folder, (int)k - (m_hasTerminalItem ? 8 : 7));
             break;
         }
         return S_OK;
@@ -3950,27 +3996,27 @@ public:
             return m_pDefault->GetCommandString(off, type, r, s, c);
         // Canonical verb names let HOST commands reach our items. Explorer's
         // native commands resolve the target folder's background menu through
-        // canonical verbs. Item layout (level >= 1): k=0 copy path, k=1 new
-        // folder.  k=2 is visually "New file", but continues to publish the
+        // canonical verbs. Item layout (level >= 1): k=0 refresh, k=1 copy path,
+        // k=2 new folder. k=3 is visually "New file", but continues to publish the
         // canonical paste verb: Explorer has no separate hidden-command API
         // for a virtual namespace background menu.  Native Ctrl+V invokes it
         // by verb, whereas a user click invokes the numeric menu id and opens
         // NewFileRemote above.
-        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 0)
+        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 1)
         {
             ProbeLog(L"[BG] GetCommandString copyaspath requested type=%u", type);
             if (type == GCS_VERBW) return StringCchCopyW((PWSTR)s, c, L"copyaspath");
             if (type == GCS_VERBA) return StringCchCopyA(s, c, "copyaspath");
         }
-        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 2)
+        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 3)
         {
             ProbeLog(L"[BG] GetCommandString paste-verb requested type=%u", type);
             if (type == GCS_VERBW) return StringCchCopyW((PWSTR)s, c, L"paste");
             if (type == GCS_VERBA) return StringCchCopyA(s, c, "paste");
         }
-        // k=1 is "New folder" — expose it as the canonical "new" verb so the
+        // k=2 is "New folder" — expose it as the canonical "new" verb so the
         // shell's New command can reach us on the background.
-        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 1)
+        if (m_nLevel >= 1 && m_pDefault && off == m_defaultCount + 2)
         {
             ProbeLog(L"[BG] GetCommandString new-verb requested type=%u", type);
             if (type == GCS_VERBW) return StringCchCopyW((PWSTR)s, c, L"new");

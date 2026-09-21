@@ -34,6 +34,19 @@ public sealed class AppSettings
     /// 票据所在目录。与扩展 DLL 读的是同一个注册表值：UseTransferTicket（DWORD）。</summary>
     public bool UseTransferTicket { get; set; }
 
+    /// <summary>目录快照内存新鲜期（分钟）。与扩展 DLL 读的是同一个注册表值：DirCacheTtlMinutes（DWORD）。</summary>
+    public int DirCacheTtlMinutes { get; set; } = 5;
+    /// <summary>磁盘快照可用于首屏的上限（小时）。注册表值：DirCacheDiskMaxAgeHours（DWORD）。</summary>
+    public int DirCacheDiskMaxAgeHours { get; set; } = 24;
+    /// <summary>首屏快照超龄多少秒就后台强制重验；0 = 关闭自动重验。注册表值：DirCacheRevalidateSeconds（DWORD）。</summary>
+    public int DirCacheRevalidateSeconds { get; set; } = 60;
+    /// <summary>MRU 静默重验总开关。注册表值：MruRevalidate（DWORD）。</summary>
+    public bool MruRevalidate { get; set; } = true;
+    /// <summary>MRU 重验间隔（秒）。注册表值：MruIntervalSeconds（DWORD）。</summary>
+    public int MruIntervalSeconds { get; set; } = 120;
+    /// <summary>MRU 最多跟踪几个目录。注册表值：MruMaxDirs（DWORD）。</summary>
+    public int MruMaxDirs { get; set; } = 8;
+
     public static string DefaultMetadataCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "MetadataCache");
     public static string DefaultFileCachePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ExplorerRemoteFs", "FileCache");
     public static string DefaultDownloadDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
@@ -56,6 +69,12 @@ public sealed class AppSettings
                 Terminal = NormalizeTerminal(key?.GetValue("Terminal") as string),
                 DownloadDir = NormalizeDirectory(key?.GetValue("DownloadDir") as string, DefaultDownloadDir),
                 UseTransferTicket = Convert.ToInt32(key?.GetValue("UseTransferTicket") ?? 0) != 0,
+                DirCacheTtlMinutes = ClampInt(key?.GetValue("DirCacheTtlMinutes"), 5, 1, 1440),
+                DirCacheDiskMaxAgeHours = ClampInt(key?.GetValue("DirCacheDiskMaxAgeHours"), 24, 1, 720),
+                DirCacheRevalidateSeconds = ClampInt(key?.GetValue("DirCacheRevalidateSeconds"), 60, 0, 3600),
+                MruRevalidate = Convert.ToInt32(key?.GetValue("MruRevalidate") ?? 1) != 0,
+                MruIntervalSeconds = ClampInt(key?.GetValue("MruIntervalSeconds"), 120, 30, 3600),
+                MruMaxDirs = ClampInt(key?.GetValue("MruMaxDirs"), 8, 1, 32),
             };
         }
         catch { return new AppSettings(); }
@@ -80,6 +99,21 @@ public sealed class AppSettings
         DownloadDir = NormalizeDirectory(DownloadDir, DefaultDownloadDir); Directory.CreateDirectory(DownloadDir);
         key.SetValue("DownloadDir", DownloadDir, RegistryValueKind.String);
         key.SetValue("UseTransferTicket", UseTransferTicket ? 1 : 0, RegistryValueKind.DWord);
+        key.SetValue("DirCacheTtlMinutes", ClampInt(DirCacheTtlMinutes, 5, 1, 1440), RegistryValueKind.DWord);
+        key.SetValue("DirCacheDiskMaxAgeHours", ClampInt(DirCacheDiskMaxAgeHours, 24, 1, 720), RegistryValueKind.DWord);
+        key.SetValue("DirCacheRevalidateSeconds", ClampInt(DirCacheRevalidateSeconds, 60, 0, 3600), RegistryValueKind.DWord);
+        key.SetValue("MruRevalidate", MruRevalidate ? 1 : 0, RegistryValueKind.DWord);
+        key.SetValue("MruIntervalSeconds", ClampInt(MruIntervalSeconds, 120, 30, 3600), RegistryValueKind.DWord);
+        key.SetValue("MruMaxDirs", ClampInt(MruMaxDirs, 8, 1, 32), RegistryValueKind.DWord);
+    }
+
+    private static int ClampInt(object? value, int fallback, int min, int max)
+    {
+        int v;
+        try { v = Convert.ToInt32(value ?? fallback); } catch { v = fallback; }
+        if (v < min) v = min;
+        if (v > max) v = max;
+        return v;
     }
 
     public static string NormalizeDirectory(string? path, string fallback)

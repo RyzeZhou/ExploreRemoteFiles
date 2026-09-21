@@ -14,6 +14,7 @@
 #include <vector>
 #include <algorithm>
 #include "ProbeLog.h"
+#include "Utils.h"   // ErfHostIsExplorer：MRU 后台活只在资源管理器宿主里跑
 
 // ---------------------------------------------------------------------------
 // 「传输票据」(.erfdl) 开关：打开后 Ctrl+C 产出的"虚拟文件"是**票据**（几百字节），
@@ -827,13 +828,57 @@ inline SRWLOCK &FtpCacheLock()
 // 磁盘 TTL 原来也是 30 秒，而且过期直接 DeleteFileW —— 这是"缓存不持久化"的根因：
 // 磁盘条目与内存条目是**同一时刻**写入的（FtpCacheStore 一次写两边），
 // 所以磁盘条目年龄恒 ≥ 内存条目年龄，磁盘层永远不可能比内存层活得更久，落盘等于白做。
-// 现在磁盘快照不再因为"老"被删，只在超过 FTP_DISK_CACHE_MAX_AGE_MS 后不再用于首屏。
-#define FTP_CACHE_TTL_MS            300000ULL              // 内存新鲜期：5 分钟
-#define FTP_DISK_CACHE_MAX_AGE_MS   (24ULL * 3600 * 1000)  // 磁盘快照可用于首屏的上限：24 小时
+// 现在磁盘快照不再因为"老"被删，只在超过 FtpCacheDiskMaxAgeMs() 后不再用于首屏。
 #define FTP_CACHE_MAX_DIRS          128                    // 内存里最多保留多少个目录快照
-#define FTP_CACHE_REVALIDATE_MS     60000ULL               // 重验阈值（2026-09-21）：首屏
-                                                           // 快照超过 60 秒就后台强制拉一次服务器并通知视图，
-                                                           // 显示不卡、数据不旧——之前 F5 只重画了旧快照。
+
+// ── 缓存时长全部可设置（2026-09-21）──────────────────────────────────────
+// HKCU\Software\ExplorerRemoteFs 下：
+//   DirCacheTtlMinutes      内存新鲜期（分钟，默认 5，范围 1~1440）
+//   DirCacheDiskMaxAgeHours 磁盘快照可用于首屏的上限（小时，默认 24，范围 1~720）
+//   DirCacheRevalidateSeconds 首屏快照超龄多少秒就后台强制重验（默认 60，范围 0~3600；
+//                           0 = 关闭自动重验：导航永不 LIST，只靠手动刷新/MRU）
+// 设置页写这三个值；30 秒重读一次，改完最多 30 秒生效，不用重启 Explorer。
+inline DWORD ErfRegDword(PCWSTR name, DWORD def)
+{
+    HKEY k = NULL;
+    DWORD v = def, cb = sizeof(v), type = 0;
+    if (ERROR_SUCCESS == RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerRemoteFs", 0, KEY_READ, &k))
+    {
+        if (ERROR_SUCCESS != RegQueryValueExW(k, name, NULL, &type, (LPBYTE)&v, &cb) || type != REG_DWORD)
+            v = def;
+        RegCloseKey(k);
+    }
+    return v;
+}
+inline ULONGLONG ErfRegDwordClamped(PCWSTR name, DWORD def, DWORD lo, DWORD hi)
+{
+    DWORD v = ErfRegDword(name, def);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
+inline ULONGLONG FtpCacheTtlMs()
+{
+    static ULONGLONG s_v = 0, s_t = 0;
+    ULONGLONG now = GetTickCount64();
+    if (!s_v || now - s_t > 30000) { s_v = ErfRegDwordClamped(L"DirCacheTtlMinutes", 5, 1, 1440) * 60000ULL; s_t = now; }
+    return s_v;
+}
+inline ULONGLONG FtpCacheDiskMaxAgeMs()
+{
+    static ULONGLONG s_v = 0, s_t = 0;
+    ULONGLONG now = GetTickCount64();
+    if (!s_v || now - s_t > 30000) { s_v = ErfRegDwordClamped(L"DirCacheDiskMaxAgeHours", 24, 1, 720) * 3600000ULL; s_t = now; }
+    return s_v;
+}
+inline ULONGLONG FtpCacheRevalidateMs()
+{
+    static ULONGLONG s_v = 0, s_t = 0;
+    static bool s_init = false;
+    ULONGLONG now = GetTickCount64();
+    if (!s_init || now - s_t > 30000) { s_v = ErfRegDwordClamped(L"DirCacheRevalidateSeconds", 60, 0, 3600) * 1000ULL; s_t = now; s_init = true; }
+    return s_v;
+}
 
 // v2 (2026-09-20): carries the site+folder identity so a load NEVER serves a
 // listing that belongs to another key. v1 files (case-folded-hash era) are
@@ -961,7 +1006,7 @@ inline sqlite3 *FtpDb()
 }
 
 // maxAgeMs = 0 表示不限年龄；>0 且超龄时返回 FALSE，但**绝不删行**（见上面
-// FTP_CACHE_TTL_MS 的说明：过期即删会让磁盘层永远追不上内存层）。ageMsOut 回传年龄。
+// FtpCacheTtlMs() 的说明：过期即删会让磁盘层永远追不上内存层）。ageMsOut 回传年龄。
 inline BOOL FtpDiskCacheLoad(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &items,
                              ULONGLONG maxAgeMs = 0, ULONGLONG *ageMsOut = NULL)
 {
@@ -1211,7 +1256,7 @@ inline BOOL FtpCacheFindOne(PCWSTR site, PCWSTR folder, PCWSTR name, FTPENTRY *o
     for (auto const &e : FtpCacheEntries())
         if (0 == StrCmp(e.site, site) && 0 == StrCmp(e.path, key))
         {
-            if (FtpCacheFresh(now, e.tick, FTP_CACHE_TTL_MS))
+            if (FtpCacheFresh(now, e.tick, FtpCacheTtlMs()))
                 for (auto const &it : e.items)
                     if (0 == StrCmp(it.szName, name))
                     {
@@ -1244,7 +1289,7 @@ inline BOOL FtpCachePeekAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out
     AcquireSRWLockShared(&FtpCacheLock());
     for (auto const &entry : FtpCacheEntries())
     {
-        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FTP_CACHE_TTL_MS))
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FtpCacheTtlMs()))
         {
             out = entry.items;
             if (ageMsOut) *ageMsOut = (now >= entry.tick) ? (now - entry.tick) : 0;
@@ -1565,9 +1610,9 @@ inline int FtpCacheLookup(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxOut)
 {
     if (maxOut <= 0) return 0; PCWSTR key = (path && path[0]) ? path : L"/"; ULONGLONG now = GetTickCount64(); int got = 0;
     AcquireSRWLockShared(&FtpCacheLock());
-    for (auto &e : FtpCacheEntries()) if (0 == StrCmp(e.path, key) && 0 == StrCmp(e.site, site)) { if (FtpCacheFresh(now, e.tick, FTP_CACHE_TTL_MS)) { got = (int)e.items.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = e.items[i]; } break; }
+    for (auto &e : FtpCacheEntries()) if (0 == StrCmp(e.path, key) && 0 == StrCmp(e.site, site)) { if (FtpCacheFresh(now, e.tick, FtpCacheTtlMs())) { got = (int)e.items.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = e.items[i]; } break; }
     ReleaseSRWLockShared(&FtpCacheLock()); if (got) return got;
-    std::vector<FTPENTRY> disk; if (!FtpDiskCacheLoad(site, key, disk, FTP_DISK_CACHE_MAX_AGE_MS)) return 0; got = (int)disk.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = disk[i]; return got;
+    std::vector<FTPENTRY> disk; if (!FtpDiskCacheLoad(site, key, disk, FtpCacheDiskMaxAgeMs())) return 0; got = (int)disk.size(); if (got > maxOut) got = maxOut; for (int i = 0; i < got; ++i) out[i] = disk[i]; return got;
 }
 
 inline void FtpCacheStore(PCWSTR site, PCWSTR path, const FTPENTRY *items, int count)
@@ -1576,7 +1621,7 @@ inline void FtpCacheStore(PCWSTR site, PCWSTR path, const FTPENTRY *items, int c
     AcquireSRWLockExclusive(&FtpCacheLock()); auto &v = FtpCacheEntries();
     for (auto it = v.begin(); it != v.end();) { if (0 == StrCmp(it->path, key) && 0 == StrCmp(it->site, site)) it = v.erase(it); else ++it; }
     FtpCacheEntry e = {}; StringCchCopy(e.site, ARRAYSIZE(e.site), site); StringCchCopy(e.path, ARRAYSIZE(e.path), key); e.tick = now; for (int i = 0; i < count; ++i) e.items.push_back(items[i]); v.push_back(std::move(e));
-    for (auto it = v.begin(); it != v.end();) { if (!FtpCacheFresh(now, it->tick, FTP_CACHE_TTL_MS)) it = v.erase(it); else ++it; } while (v.size() > FTP_CACHE_MAX_DIRS) v.erase(v.begin()); ReleaseSRWLockExclusive(&FtpCacheLock());
+    for (auto it = v.begin(); it != v.end();) { if (!FtpCacheFresh(now, it->tick, FtpCacheTtlMs())) it = v.erase(it); else ++it; } while (v.size() > FTP_CACHE_MAX_DIRS) v.erase(v.begin()); ReleaseSRWLockExclusive(&FtpCacheLock());
     FtpDiskCacheStore(site, key, items, count);
 }
 
@@ -1592,7 +1637,7 @@ inline void FtpCachePromote(PCWSTR site, PCWSTR path, const std::vector<FTPENTRY
     AcquireSRWLockExclusive(&FtpCacheLock()); auto &v = FtpCacheEntries();
     for (auto it = v.begin(); it != v.end();) { if (0 == StrCmp(it->path, key) && 0 == StrCmp(it->site, site)) it = v.erase(it); else ++it; }
     FtpCacheEntry e = {}; StringCchCopy(e.site, ARRAYSIZE(e.site), site); StringCchCopy(e.path, ARRAYSIZE(e.path), key); e.tick = now; e.items = items; v.push_back(std::move(e));
-    for (auto it = v.begin(); it != v.end();) { if (!FtpCacheFresh(now, it->tick, FTP_CACHE_TTL_MS)) it = v.erase(it); else ++it; } while (v.size() > FTP_CACHE_MAX_DIRS) v.erase(v.begin());
+    for (auto it = v.begin(); it != v.end();) { if (!FtpCacheFresh(now, it->tick, FtpCacheTtlMs())) it = v.erase(it); else ++it; } while (v.size() > FTP_CACHE_MAX_DIRS) v.erase(v.begin());
     ReleaseSRWLockExclusive(&FtpCacheLock());
 }
 
@@ -1723,6 +1768,237 @@ inline int FtpListCached(PCWSTR site, PCWSTR path, FTPENTRY *out, int maxItems)
     return n;
 }
 
+// ── 最近目录（MRU）并行静默重验（2026-09-21）──────────────────────────────
+// 记录最近打开的目录；后台定期（默认 120 秒）并行拉取新状态：
+//   * 没变 → 只把内存/磁盘 tick 拨到现在（续期），不碰 UI；
+//   * 变了 → 替换缓存并通知视图重枚举。
+// 开关与参数全部可设置（MruRevalidate / MruIntervalSeconds / MruMaxDirs）。
+struct FtpMruEntry
+{
+    std::wstring site;
+    std::wstring folder;
+    PIDLIST_ABSOLUTE pidl;      // 上次看到该目录的视图（clone，淘汰时释放）
+    ULONGLONG lastCheck;        // 上次重验（tick ms）
+};
+inline std::vector<FtpMruEntry> &FtpMruList()
+{
+    static std::vector<FtpMruEntry> v;
+    return v;
+}
+inline SRWLOCK &FtpMruLock()
+{
+    static SRWLOCK l = SRWLOCK_INIT;
+    return l;
+}
+inline ULONGLONG FtpMruIntervalMs()
+{
+    static ULONGLONG s_v = 0, s_t = 0;
+    ULONGLONG now = GetTickCount64();
+    if (!s_v || now - s_t > 30000) { s_v = ErfRegDwordClamped(L"MruIntervalSeconds", 120, 30, 3600) * 1000ULL; s_t = now; }
+    return s_v;
+}
+inline int FtpMruMaxDirs()
+{
+    static int s_v = 0; static ULONGLONG s_t = 0;
+    ULONGLONG now = GetTickCount64();
+    if (!s_v || now - s_t > 30000) { s_v = (int)ErfRegDwordClamped(L"MruMaxDirs", 8, 1, 32); s_t = now; }
+    return s_v;
+}
+inline BOOL FtpMruEnabled()
+{
+    static LONG s_v = -1; static ULONGLONG s_t = 0;
+    ULONGLONG now = GetTickCount64();
+    if (s_v < 0 || now - s_t > 30000) { s_v = (LONG)ErfRegDword(L"MruRevalidate", 1); s_t = now; }
+    return s_v != 0;
+}
+inline BOOL ErfMruHostAllowed()
+{
+    return ErfHostIsExplorer() || ErfHostIsOwnTool();
+}
+inline void FtpMruTouch(PCWSTR site, PCWSTR folder, PIDLIST_ABSOLUTE pidl)
+{
+    if (!FtpMruEnabled() || !ErfMruHostAllowed() || !site || !site[0]) return;
+    std::wstring f = (folder && folder[0]) ? folder : L"/";
+    AcquireSRWLockExclusive(&FtpMruLock());
+    auto &v = FtpMruList();
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].site == site && v[i].folder == f)
+        {
+            FtpMruEntry e = std::move(v[i]);
+            v.erase(v.begin() + i);
+            if (e.pidl) ILFree(e.pidl);
+            e.pidl = pidl ? ILCloneFull(pidl) : NULL;
+            v.insert(v.begin(), std::move(e));
+            ReleaseSRWLockExclusive(&FtpMruLock());
+            return;
+        }
+    FtpMruEntry e;
+    e.site = site; e.folder = f;
+    e.pidl = pidl ? ILCloneFull(pidl) : NULL;
+    e.lastCheck = GetTickCount64();   // 刚看过：下一轮到点再查，不重复拉
+    v.insert(v.begin(), std::move(e));
+    int maxDirs = FtpMruMaxDirs();
+    while ((int)v.size() > maxDirs) { if (v.back().pidl) ILFree(v.back().pidl); v.pop_back(); }
+    ReleaseSRWLockExclusive(&FtpMruLock());
+}
+// 顺序无关的比较：两次服务器 LIST 的顺序可能不一样。
+inline BOOL FtpCachePeekAllOrDisk(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out, ULONGLONG *ageMsOut);   // fwd (defined below)
+inline BOOL FtpListingsEqual(const std::vector<FTPENTRY> &a, const std::vector<FTPENTRY> &b)
+{
+    if (a.size() != b.size()) return FALSE;
+    std::vector<FTPENTRY> sa = a, sb = b;
+    auto byName = [](const FTPENTRY &x, const FTPENTRY &y) { return StrCmp(x.szName, y.szName) < 0; };
+    std::sort(sa.begin(), sa.end(), byName);
+    std::sort(sb.begin(), sb.end(), byName);
+    for (size_t i = 0; i < sa.size(); ++i)
+    {
+        const FTPENTRY &x = sa[i], &y = sb[i];
+        if (StrCmp(x.szName, y.szName) != 0 || x.fIsFolder != y.fIsFolder ||
+            x.dwSize != y.dwSize || x.dwMtime != y.dwMtime || x.dwMode != y.dwMode)
+            return FALSE;
+    }
+    return TRUE;
+}
+// 只续期：内容没变时把内存 tick 与磁盘 tick 都拨到现在，不通知视图。
+inline void FtpCacheTouch(PCWSTR site, PCWSTR path)
+{
+    PCWSTR key = (path && path[0]) ? path : L"/";
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&FtpCacheLock());
+    for (auto &e : FtpCacheEntries())
+        if (0 == StrCmp(e.path, key) && 0 == StrCmp(e.site, site)) { e.tick = now; break; }
+    ReleaseSRWLockExclusive(&FtpCacheLock());
+    sqlite3 *db = FtpDb();
+    if (db)
+    {
+        FILETIME ft = {}; GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER ftnow = {}; ftnow.LowPart = ft.dwLowDateTime; ftnow.HighPart = ft.dwHighDateTime;
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE dir_cache SET tick=?1 WHERE site=?2 AND path=?3", -1, &st, NULL) == SQLITE_OK)
+        {
+            std::string sSite = FtpUtf8(site ? site : L"");
+            std::string sPath = FtpUtf8(key);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)ftnow.QuadPart);
+            sqlite3_bind_text(st, 2, sSite.c_str(), (int)sSite.size(), SQLITE_STATIC);
+            sqlite3_bind_text(st, 3, sPath.c_str(), (int)sPath.size(), SQLITE_STATIC);
+            sqlite3_step(st);
+            sqlite3_finalize(st);
+        }
+    }
+}
+struct FtpMruJob
+{
+    std::wstring site;
+    std::wstring folder;
+    PIDLIST_ABSOLUTE pidl;
+};
+struct FtpMruPass
+{
+    std::vector<FtpMruJob> jobs;   // 本线程分到的
+    volatile LONG *running;        // 全部线程共享：整个 pass 的锁
+    volatile LONG *left;           // 剩余线程数；归零的线程负责解锁
+};
+static DWORD WINAPI FtpMruWorkerProc(LPVOID p)
+{
+    FtpMruPass *pass = static_cast<FtpMruPass *>(p);
+    // 先把共享计数器取出来：delete pass 之后绝不能再碰它（use-after-free 会崩）。
+    volatile LONG *running = pass->running;
+    volatile LONG *left = pass->left;
+    ULONGLONG now = GetTickCount64();
+    for (auto &j : pass->jobs)
+    {
+        std::vector<FTPENTRY> live;
+        if (!FtpFetchLiveListing(j.site.c_str(), j.folder.c_str(), live))
+        {
+            ProbeLog(L"[MRU] fetch failed site='%s' path='%s'", j.site.c_str(), j.folder.c_str());
+        }
+        else
+        {
+            std::vector<FTPENTRY> cur;
+            if (!FtpCachePeekAllOrDisk(j.site.c_str(), j.folder.c_str(), cur, NULL) || cur.empty())
+            {
+                FtpCacheStore(j.site.c_str(), j.folder.c_str(), live.data(), (int)live.size());
+                ProbeLog(L"[MRU] no cache, stored site='%s' path='%s' n=%u", j.site.c_str(), j.folder.c_str(), (UINT)live.size());
+            }
+            else if (FtpListingsEqual(cur, live))
+            {
+                FtpCacheTouch(j.site.c_str(), j.folder.c_str());
+                ProbeLog(L"[MRU] unchanged site='%s' path='%s' n=%u (expiry extended)", j.site.c_str(), j.folder.c_str(), (UINT)live.size());
+            }
+            else
+            {
+                FtpCacheStore(j.site.c_str(), j.folder.c_str(), live.data(), (int)live.size());
+                ProbeLog(L"[MRU] changed site='%s' path='%s' %u -> %u, notifying", j.site.c_str(), j.folder.c_str(), (UINT)cur.size(), (UINT)live.size());
+                if (j.pidl) SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST, (PCIDLIST_ABSOLUTE)j.pidl, NULL);
+            }
+        }
+        if (j.pidl) ILFree(j.pidl);
+        AcquireSRWLockExclusive(&FtpMruLock());
+        for (auto &e : FtpMruList())
+            if (e.site == j.site && e.folder == j.folder) { e.lastCheck = now; break; }
+        ReleaseSRWLockExclusive(&FtpMruLock());
+    }
+    delete pass;
+    DllRelease();
+    if (InterlockedDecrement(left) == 0)
+        InterlockedExchange(running, 0);
+    return 0;
+}
+// 到点就扫一轮 MRU（最多 3 路并行）。调一次只做两次静态判断，开销可忽略，
+// 所以 EnumObjects 里每次枚举都可以调。
+inline void FtpMruPassIfDue()
+{
+    if (!FtpMruEnabled() || !ErfMruHostAllowed()) return;
+    static ULONGLONG s_lastPass = 0;
+    static volatile LONG s_running = 0;
+    static volatile LONG s_left = 0;
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG interval = FtpMruIntervalMs();
+    if (now - s_lastPass < interval) return;
+    if (InterlockedCompareExchange(const_cast<LONG *>(&s_running), 1, 0) != 0) return;
+    s_lastPass = now;
+    std::vector<FtpMruJob> due;
+    int maxDirs = 0;
+    AcquireSRWLockShared(&FtpMruLock());
+    maxDirs = FtpMruMaxDirs();
+    for (auto &e : FtpMruList())
+    {
+        if ((int)due.size() >= maxDirs) break;
+        if (now - e.lastCheck < interval) continue;
+        FtpMruJob j; j.site = e.site; j.folder = e.folder;
+        j.pidl = e.pidl ? ILCloneFull(e.pidl) : NULL;
+        due.push_back(std::move(j));
+    }
+    ReleaseSRWLockShared(&FtpMruLock());
+    if (due.empty()) { InterlockedExchange(const_cast<LONG *>(&s_running), 0); return; }
+    const int lanes = (int)due.size() < 3 ? (int)due.size() : 3;
+    s_left = lanes;
+    size_t at = 0;
+    for (int k = 0; k < lanes; ++k)
+    {
+        FtpMruPass *pass = new (std::nothrow) FtpMruPass{};
+        if (!pass) continue;
+        pass->running = &s_running;
+        pass->left = &s_left;
+        size_t n = (due.size() - at) / (size_t)(lanes - k);
+        for (size_t i = 0; i < n && at < due.size(); ++i, ++at)
+            pass->jobs.push_back(std::move(due[at]));
+        DllAddRef();
+        HANDLE h = CreateThread(NULL, 0, FtpMruWorkerProc, pass, 0, NULL);
+        if (h) CloseHandle(h);
+        else
+        {
+            // 起线程失败是极小概率事件，但不能让 s_running 卡死（否则 MRU 永久停摆），
+            // 也不能漏掉已 clone 的 pidl。
+            DllRelease();
+            for (auto &j : pass->jobs) if (j.pidl) ILFree(j.pidl);
+            delete pass;
+            if (InterlockedDecrement(const_cast<LONG *>(&s_left)) == 0)
+                InterlockedExchange(const_cast<LONG *>(&s_running), 0);
+        }
+    }
+}
+
 // Returns the complete cached listing. On a miss, populate the cache once via
 // FtpListCached, which now parses the full CLI output before copying a slice.
 inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &out, bool waitForWarm)
@@ -1733,7 +2009,7 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     AcquireSRWLockShared(&FtpCacheLock());
     for (auto const &entry : FtpCacheEntries())
     {
-        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FTP_CACHE_TTL_MS))
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FtpCacheTtlMs()))
         {
             out = entry.items;
             ReleaseSRWLockShared(&FtpCacheLock());
@@ -1744,7 +2020,7 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
 
     // 磁盘快照命中：立刻用它（"关掉资源管理器窗口再打开还是热目录"就是从这儿来的），
     // 并提升进内存，让紧接着的 EnumObjects（只读内存）也能命中。
-    if (FtpDiskCacheLoad(site, key, out, FTP_DISK_CACHE_MAX_AGE_MS))
+    if (FtpDiskCacheLoad(site, key, out, FtpCacheDiskMaxAgeMs()))
     {
         FtpCachePromote(site, key, out);
         return TRUE;
@@ -1770,7 +2046,7 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
                 AcquireSRWLockShared(&FtpCacheLock());
                 for (auto const &entry : FtpCacheEntries())
                 {
-                    if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(t, entry.tick, FTP_CACHE_TTL_MS))
+                    if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(t, entry.tick, FtpCacheTtlMs()))
                     {
                         out = entry.items;
                         hit = TRUE;
@@ -1794,7 +2070,7 @@ inline BOOL FtpListCachedAll(PCWSTR site, PCWSTR path, std::vector<FTPENTRY> &ou
     AcquireSRWLockShared(&FtpCacheLock());
     for (auto const &entry : FtpCacheEntries())
     {
-        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FTP_CACHE_TTL_MS))
+        if (0 == StrCmp(entry.path, key) && 0 == StrCmp(entry.site, site) && FtpCacheFresh(now, entry.tick, FtpCacheTtlMs()))
         {
             out = entry.items;
             ReleaseSRWLockShared(&FtpCacheLock());
@@ -1830,7 +2106,7 @@ inline BOOL FtpCachePeekAllOrDisk(PCWSTR site, PCWSTR path, std::vector<FTPENTRY
     }
 
     ULONGLONG age = 0;
-    if (!FtpDiskCacheLoad(site, path, out, FTP_DISK_CACHE_MAX_AGE_MS, &age) || out.empty()) return FALSE;
+    if (!FtpDiskCacheLoad(site, path, out, FtpCacheDiskMaxAgeMs(), &age) || out.empty()) return FALSE;
     if (ageMsOut) *ageMsOut = age;
     FtpCachePromote(site, path, out);   // 回填内存，后续查询直接命中
     ProbeLog(L"[CACHE] disk snapshot hit site='%s' path='%s' n=%u ageMs=%llu", site, path, (UINT)out.size(), age);

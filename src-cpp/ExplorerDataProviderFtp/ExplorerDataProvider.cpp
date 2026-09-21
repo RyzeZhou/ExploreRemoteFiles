@@ -865,6 +865,9 @@ try
         BOOL haveSnap;
         ULONGLONG snapAgeMs = 0;
         haveSnap = FtpCachePeekAllOrDisk(m_szSiteName, m_szRemotePath, snapshot, &snapAgeMs);
+        // MRU 记录 + 到点触发静默重验（无变化只续期、有变化才刷视图）。
+        FtpMruTouch(m_szSiteName, m_szRemotePath, m_pidl);
+        FtpMruPassIfDue();
         if (!haveSnap)
         {
             // Cold: never touch the network on the shell UI thread.
@@ -889,10 +892,12 @@ try
         }
         if (haveSnap)
         {
-            // 2026-09-21: 暖快照也可能很旧（磁盘快照最长 24h）。先显示旧数据保证
-            // 不卡，同时后台强制拉一次服务器、到了就通知视图重枚举——F5/重开目录
-            // 不再是"只刷 UI"。重枚举后快照是新的，不会循环触发。
-            if (snapAgeMs > FTP_CACHE_REVALIDATE_MS)
+            // 2026-09-21: 暖快照也可能很旧（磁盘快照上限可在设置里改，默认 24h）。
+            // 先显示旧数据保证不卡，同时后台强制拉一次服务器、到了就通知视图重枚举——
+            // F5/重开目录不再是"只刷 UI"。重枚举后快照是新的，不会循环触发。
+            // 重验秒数可在设置里改，0 = 关闭自动重验（严格 WinSCP 模式，只靠手动刷新/MRU）。
+            ULONGLONG rvMs = FtpCacheRevalidateMs();
+            if (rvMs && snapAgeMs > rvMs)
             {
                 ProbeLog(L"[ENUM] warm-but-stale site='%s' path='%s' n=%u ageMs=%llu -> background revalidate",
                          m_szSiteName, m_szRemotePath, (UINT)snapshot.size(), snapAgeMs);
