@@ -108,6 +108,15 @@ static LONG WINAPI RfsVectoredHandler(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Vectored handler handle: MUST be removed on DETACH (2026-09-21).
+// Not removing it was the svchost_cbdhsvc / Widgets.exe crash:
+// fault module ExplorerDataProviderFtp.dll_unloaded, 0xc0000005, same offset
+// 0x3c290 in both processes. A vectored handler is process-wide; after COM
+// unloads our DLL the entry still points at our (now unmapped) handler, so the
+// host's next first-chance exception jumps into unloaded memory. Same build =>
+// same offset in every host process. This also explains the historic Office crash.
+static PVOID g_vehHandle = NULL;
+
 // Standard DLL functions
 STDAPI_(BOOL) DllMain(HINSTANCE hInstance, DWORD dwReason, void *)
 {
@@ -115,7 +124,11 @@ STDAPI_(BOOL) DllMain(HINSTANCE hInstance, DWORD dwReason, void *)
     {
         g_hInst = hInstance;
         DisableThreadLibraryCalls(hInstance);
-        AddVectoredExceptionHandler(1 /*call first*/, RfsVectoredHandler);
+        g_vehHandle = AddVectoredExceptionHandler(1 /*call first*/, RfsVectoredHandler);
+    }
+    else if (dwReason == DLL_PROCESS_DETACH)
+    {
+        if (g_vehHandle) { RemoveVectoredExceptionHandler(g_vehHandle); g_vehHandle = NULL; }
     }
     return TRUE;
 }
