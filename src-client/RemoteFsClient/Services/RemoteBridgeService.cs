@@ -3,6 +3,8 @@ using System.IO.Pipes;
 using System.Text;
 using ExplorerRemoteFs.Config;
 using ExplorerRemoteFs.Providers;
+using Microsoft.Data.Sqlite;
+using Microsoft.Win32;
 
 namespace RemoteFsClient.Services;
 
@@ -23,6 +25,39 @@ public sealed class RemoteBridgeService : IDisposable
     private readonly TransferTaskService? _transfers;   // 传输队列（上传/下载），与操作队列分开
     private Task? _listener;
     private static readonly TimeSpan CompletedListingCacheLifetime = TimeSpan.FromSeconds(3);
+
+    // ── 站点名大小写语义（2026-09-24）──────────────────────────────────────
+    // WSL 与 wsl 是**两个不同的站点**。此前 FindConnection 用 OrdinalIgnoreCase、
+    // 列表缓存键用 ToUpperInvariant —— 大小写同名并存时输入哪个都会串到另一个站点，
+    // 且两站点的列表共享同一个缓存键（互相污染）。现在：
+    //   1) 精确匹配优先；
+    //   2) 无精确命中且大小写不敏感命中**恰好一个**时才回退（打 wsl 找到唯一的 WSL 仍可用）；
+    //   3) ≥2 个不敏感命中 = 有歧义，按"找不到"处理，绝不猜。
+    private static ConnectionConfig? FindConnection(string name, out string canonicalName)
+    {
+        canonicalName = name;
+        var connections = ConnectionStore.Load();
+        var exact = connections.FirstOrDefault(c => c.Name.Equals(name, StringComparison.Ordinal));
+        if (exact is not null)
+        {
+            canonicalName = exact.Name;
+            return WithCredentials(exact);
+        }
+        var insensitive = connections.Where(c => c.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (insensitive.Count == 1)
+        {
+            canonicalName = insensitive[0].Name;
+            return WithCredentials(insensitive[0]);
+        }
+        return null;
+    }
+
+    private static ConnectionConfig WithCredentials(ConnectionConfig connection)
+    {
+        if (string.IsNullOrEmpty(connection.Password) && CredentialManager.TryRead(connection.Name, out _, out var secret))
+            connection.Password = secret;
+        return connection;
+    }
 
     public RemoteBridgeService(Func<ErfNavigationRequest, Task>? navigationHandler = null,
                                RemoteOperationQueueService? operationQueue = null,
@@ -425,7 +460,15 @@ public sealed class RemoteBridgeService : IDisposable
                 _listingCache.Clear();
                 return;
             }
-            var prefix = siteName.ToUpperInvariant() + "\0";
+            // 键不再折叠大小写：清除也按"已解析的规范站点名"算前缀。
+            string canonical = siteName;
+            try
+            {
+                if (FindConnection(siteName, out var resolved) is not null || !string.IsNullOrEmpty(resolved))
+                    canonical = resolved;
+            }
+            catch { /* 解析失败就用原样前缀，清不到也不致命 */ }
+            var prefix = canonical + "\0";
             foreach (var key in _listingCache.Keys.Where(k => k.StartsWith(prefix, StringComparison.Ordinal)).ToArray())
                 _listingCache.Remove(key);
         }
@@ -438,7 +481,15 @@ public sealed class RemoteBridgeService : IDisposable
     // write never leaves this cache authoritative.
     private Task<string> GetListingAsync(string siteName, string remotePath)
     {
-        var key = siteName.ToUpperInvariant() + "\0" + remotePath;
+        // 键用**规范站点名**（配置里的拼写）：大小写同名站点绝不共享缓存条目。
+        // 解析不到（不存在/歧义）时退回原名 —— 后续 BuildListingAsync 会产出 FAIL，
+        // 失败从不缓存，所以这个键只是占位。
+        string key;
+        try
+        {
+            key = (FindConnection(siteName, out var canonical) is not null ? canonical : siteName) + "\0" + remotePath;
+        }
+        catch { key = siteName + "\0" + remotePath; }
         lock (_listingCacheGate)
         {
             var now = DateTimeOffset.UtcNow;
@@ -1039,34 +1090,177 @@ public sealed class RemoteBridgeService : IDisposable
 
     private sealed record DeletePlanItem(string Path, bool IsDirectory);
 
+    // ── 导航加速：本地持久缓存先行（2026-09-24）──────────────────────────────
+    // 之前 erf: 直达 = 服务端逐段真实 LIST（内存列表缓存只有 3 秒，等于每次重走网络），
+    // 深路径要串行等 N 次往返。现在同一条 erf-cache.db 里加一张服务侧的
+    // bridge_listings(site, path, tick, text)：text 就是 ITEM 行文本（无二进制耦合），
+    // 并顺带查 DLL 写的 dir_cache —— 两边任一命中该段就不再打网络。
+    // 结果：走过的路径再直达 = 0 次网络往返，和本地目录一样秒开；
+    // 没走过的路径行为不变（逐段 LIST，且这次会把每段记进 bridge_listings）。
+    private string? _cacheDbPath;
+    private static int _bridgeListingWrites;
+
+    private static string? ResolveCacheDbPath()
+    {
+        try
+        {
+            var dir = AppSettings.Load().MetadataCachePath;
+            if (string.IsNullOrWhiteSpace(dir)) dir = AppSettings.DefaultMetadataCachePath;
+            return Path.Combine(dir, "erf-cache.db");
+        }
+        catch { return null; }
+    }
+
+    private SqliteConnection? OpenCacheDb()
+    {
+        try
+        {
+            _cacheDbPath ??= ResolveCacheDbPath();
+            if (_cacheDbPath is null) return null;
+            var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = _cacheDbPath,
+                Mode = SqliteOpenMode.ReadWriteCreate,
+                DefaultTimeout = 4,
+            }.ToString());
+            connection.Open();
+            using var pragma = connection.CreateCommand();
+            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=4000;";
+            pragma.ExecuteNonQuery();
+            using var create = connection.CreateCommand();
+            create.CommandText =
+                "CREATE TABLE IF NOT EXISTS bridge_listings(" +
+                "  site TEXT NOT NULL, path TEXT NOT NULL, tick INTEGER NOT NULL," +
+                "  text TEXT NOT NULL, PRIMARY KEY(site, path));";
+            create.ExecuteNonQuery();
+            return connection;
+        }
+        catch { return null; }
+    }
+
+    private static TimeSpan BridgeListingMaxAge()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\ExplorerRemoteFs");
+            var hours = Convert.ToInt32(key?.GetValue("DirCacheDiskMaxAgeHours") ?? 24);
+            if (hours < 1) hours = 1;
+            if (hours > 720) hours = 720;
+            return TimeSpan.FromHours(hours);
+        }
+        catch { return TimeSpan.FromHours(24); }
+    }
+
+    // DLL 写的 dir_cache 里有没有这个 (site, path) 的新鲜行 —— 行存在 = 之前真实列过该目录。
+    private static bool HasFreshDirCacheRow(SqliteConnection db, string site, string path, TimeSpan maxAge)
+    {
+        try
+        {
+            using var cmd = db.CreateCommand();
+            cmd.CommandText = "SELECT tick FROM dir_cache WHERE site=$s AND path=$p";
+            cmd.Parameters.AddWithValue("$s", site);
+            cmd.Parameters.AddWithValue("$p", path);
+            var value = cmd.ExecuteScalar();
+            if (value is null || value is DBNull) return false;
+            var ageMs = (DateTime.UtcNow.Ticks - Convert.ToInt64(value)) / TimeSpan.TicksPerMillisecond;
+            return ageMs >= 0 && ageMs <= maxAge.TotalMilliseconds;
+        }
+        catch { return false; }
+    }
+
+    private static string? TryGetBridgeListing(SqliteConnection db, string site, string path, TimeSpan maxAge)
+    {
+        try
+        {
+            using var cmd = db.CreateCommand();
+            cmd.CommandText = "SELECT tick, text FROM bridge_listings WHERE site=$s AND path=$p";
+            cmd.Parameters.AddWithValue("$s", site);
+            cmd.Parameters.AddWithValue("$p", path);
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read()) return null;
+            var ageMs = (DateTime.UtcNow.Ticks - reader.GetInt64(0)) / TimeSpan.TicksPerMillisecond;
+            if (ageMs < 0 || ageMs > maxAge.TotalMilliseconds) return null;
+            return reader.GetString(1);
+        }
+        catch { return null; }
+    }
+
+    private void StoreBridgeListing(SqliteConnection? db, string site, string path, string text)
+    {
+        if (db is null) return;
+        try
+        {
+            using var cmd = db.CreateCommand();
+            cmd.CommandText =
+                "INSERT INTO bridge_listings(site, path, tick, text) VALUES($s, $p, $t, $x) " +
+                "ON CONFLICT(site, path) DO UPDATE SET tick=excluded.tick, text=excluded.text";
+            cmd.Parameters.AddWithValue("$s", site);
+            cmd.Parameters.AddWithValue("$p", path);
+            cmd.Parameters.AddWithValue("$t", DateTime.UtcNow.Ticks);
+            cmd.Parameters.AddWithValue("$x", text);
+            cmd.ExecuteNonQuery();
+            // 轻量清理：每 64 次写入删一次 7 天前的旧行，免得无限长。
+            if (System.Threading.Interlocked.Increment(ref _bridgeListingWrites) % 64 == 0)
+            {
+                using var prune = db.CreateCommand();
+                prune.CommandText = "DELETE FROM bridge_listings WHERE tick < $cutoff";
+                prune.Parameters.AddWithValue("$cutoff", DateTime.UtcNow.AddDays(-7).Ticks);
+                prune.ExecuteNonQuery();
+            }
+        }
+        catch { /* 缓存写失败绝不影响导航 */ }
+    }
+
     private async Task WarmErfNavigationAsync(string address)
     {
         if (!TryParseErfAddress(address, out var siteName, out var requestedPath))
             throw new InvalidOperationException("Invalid ERF address. Expected erf:<site>:/absolute/unix/path.");
 
         var connection = FindConnection(siteName);
+        var canonicalSite = connection.Name;
         var startPath = NormalizeRemotePath(connection.StartPath);
         var fullPath = NormalizeRemotePath(requestedPath);
         if (!IsAtOrBelow(fullPath, startPath))
             throw new InvalidOperationException($"The ERF path is outside the configured start path '{startPath}'.");
 
+        var maxAge = BridgeListingMaxAge();
+        using var db = OpenCacheDb();
+
         var currentPath = startPath;
         var remainder = fullPath.Length == startPath.Length ? string.Empty : fullPath[startPath.Length..].TrimStart('/');
         foreach (var segment in remainder.Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
-            var listing = await GetListingAsync(siteName, currentPath);
+            var childPath = currentPath == "/" ? "/" + segment : currentPath + "/" + segment;
+            // 该段已在本地缓存中（DLL 列过这个目录，或服务侧存过父目录的列表）→ 零网络。
+            if (db is not null && HasFreshDirCacheRow(db, canonicalSite, childPath, maxAge))
+            {
+                currentPath = childPath;
+                continue;
+            }
+            if (db is not null &&
+                TryGetBridgeListing(db, canonicalSite, currentPath, maxAge) is { } cachedText &&
+                ListingContainsDirectory(cachedText, segment))
+            {
+                currentPath = childPath;
+                continue;
+            }
+            var listing = await GetListingAsync(canonicalSite, currentPath);
             if (listing.StartsWith("FAIL:", StringComparison.Ordinal))
                 throw new InvalidOperationException(listing[5..].Trim());
             if (!ListingContainsDirectory(listing, segment))
                 throw new DirectoryNotFoundException($"Remote directory not found: {fullPath}");
-            currentPath = currentPath == "/" ? "/" + segment : currentPath + "/" + segment;
+            currentPath = childPath;
         }
 
         // Prewarm the target view as well; the first Explorer enumeration can
         // consume this completed cache entry without another remote round trip.
-        var targetListing = await GetListingAsync(siteName, currentPath);
-        if (targetListing.StartsWith("FAIL:", StringComparison.Ordinal))
-            throw new InvalidOperationException(targetListing[5..].Trim());
+        // DLL 自己已有该目录快照时连这次也省掉（它根本不会再问服务）。
+        if (db is null || !HasFreshDirCacheRow(db, canonicalSite, currentPath, maxAge))
+        {
+            var targetListing = await GetListingAsync(canonicalSite, currentPath);
+            if (targetListing.StartsWith("FAIL:", StringComparison.Ordinal))
+                throw new InvalidOperationException(targetListing[5..].Trim());
+        }
     }
 
     private static bool TryParseErfAddress(string address, out string siteName, out string remotePath)
@@ -1127,7 +1321,11 @@ public sealed class RemoteBridgeService : IDisposable
                         .Append(remotePath).Append('\t').Append(entry.Name).Append('\t').Append(entry.Uid).Append('\t').Append(entry.Gid).AppendLine();
                 }
                 text.AppendLine("BRIDGE-END");
-                return text.ToString();
+                var listingText = text.ToString();
+                // 每次真实 LIST 成功后记进持久缓存：同一条 erf: 地址下次直达就不用再走网络。
+                using (var db = OpenCacheDb())
+                    StoreBridgeListing(db, connection.Name, remotePath, listingText);
+                return listingText;
             }
             finally { _providerGate.Release(); }
         }
@@ -1140,9 +1338,11 @@ public sealed class RemoteBridgeService : IDisposable
 
     private static ConnectionConfig FindConnection(string name)
     {
-        var connection = ConnectionStore.Load().FirstOrDefault(c => c.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-        if (connection is null) throw new InvalidOperationException($"Connection '{name}' not found.");
-        if (string.IsNullOrEmpty(connection.Password) && CredentialManager.TryRead(connection.Name, out _, out var secret)) connection.Password = secret;
+        // 大小写语义见 FindConnection(string, out string) 的注释：
+        // 精确优先，唯一不敏感回退，歧义按找不到。
+        var connection = FindConnection(name, out _);
+        if (connection is null)
+            throw new InvalidOperationException($"Connection '{name}' not found.");
         return connection;
     }
 

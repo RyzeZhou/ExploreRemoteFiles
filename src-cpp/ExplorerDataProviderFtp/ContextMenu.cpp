@@ -2187,8 +2187,16 @@ static BOOL FindSiteByName(PCWSTR name, FTPSITE *out)
     if (!name || !name[0] || !out) return FALSE;
     FTPSITE sites[64] = {};
     int n = FtpSitesGet(sites, ARRAYSIZE(sites));
+    // 2026-09-24: 与 FtpSiteFind 同语义 —— 精确优先，唯一不敏感回退，
+    // 大小写同名并存（WSL/wsl）时绝不猜（原来 StrCmpIW 会拿第一个，串站点）。
+    const FTPSITE *ci = NULL;
+    int ciCount = 0;
     for (int k = 0; k < n; k++)
-        if (0 == StrCmpIW(sites[k].name, name)) { *out = sites[k]; return TRUE; }
+    {
+        if (0 == wcscmp(sites[k].name, name)) { *out = sites[k]; return TRUE; }
+        if (0 == _wcsicmp(sites[k].name, name)) { ci = &sites[k]; ++ciCount; }
+    }
+    if (ci && ciCount == 1) { *out = *ci; return TRUE; }
     return FALSE;
 }
 

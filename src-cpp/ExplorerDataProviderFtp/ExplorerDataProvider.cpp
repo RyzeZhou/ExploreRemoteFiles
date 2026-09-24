@@ -710,7 +710,9 @@ try
         const FTPSITE *site = FtpSiteFind(component);
         if (!site) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
         PIDLIST_RELATIVE current = NULL;
-        hr = CreateChildID(component, 1, 1, 3, TRUE, &current);
+        // 2026-09-24: 子 ID 用规范站点名（site->name）——地址栏输入的大小写不再
+        // 生成第二套站点身份，大小写同名站点不会串。
+        hr = CreateChildID(site->name, 1, 1, 3, TRUE, &current);
         if (FAILED(hr)) return hr;
         if (next && *next)
         {
@@ -1006,9 +1008,12 @@ try
             if (m_nLevel == 0)
             {
                 // Site picker: bind to the site root (path = site StartPath).
+                // 2026-09-24: 用**配置里的规范站点名**（site->name）而不是用户输入的拼写建
+                // 子文件夹 —— 否则打 wsl（配置是 WSL）时，PIDL/缓存键/显示名都挂在"wsl"上，
+                // 与规范站点两套身份并存，大小写同名站点会互相串。
                 const FTPSITE *site = FtpSiteFind(name);
                 if (!site) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-                child = new (std::nothrow) CFolderViewImplFolder(1, name, site->startPath);
+                child = new (std::nothrow) CFolderViewImplFolder(1, site->name, site->startPath);
                 hr = child ? S_OK : E_OUTOFMEMORY;
             }
             else

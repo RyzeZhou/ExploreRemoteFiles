@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <shlwapi.h>
 #include <strsafe.h>
+#include <wchar.h>
 #include <string>
 #include <vector>
 
@@ -167,6 +168,26 @@ inline int FtpSitesGet(FTPSITE *out, int maxOut)
     return n;
 }
 
+// 站点查找（2026-09-24：大小写语义）。WSL 与 wsl 是两个站点：
+//   1) 精确匹配优先；
+//   2) 无精确命中且大小写不敏感命中**恰好一个**时才回退（打 wsl 找唯一的 WSL 仍可用）；
+//   3) ≥2 个不敏感命中 = 有歧义（WSL/wsl 并存）→ 返回 NULL，绝不猜错站点。
+// 调用方持共享锁；返回指向静态 vector 的指针，不得跨 reload 持有。
+inline const FTPSITE *FtpSiteFindLocked(PCWSTR name)
+{
+    const FTPSITE *exact = NULL;
+    const FTPSITE *ci = NULL;
+    int ciCount = 0;
+    for (auto &s : FtpSitesVec())
+    {
+        if (0 == wcscmp(s.name, name)) { exact = &s; break; }
+        if (0 == _wcsicmp(s.name, name)) { ci = &s; ++ciCount; }
+    }
+    if (exact) return exact;
+    if (ci && ciCount == 1) return ci;
+    return NULL;
+}
+
 inline const FTPSITE *FtpSiteFind(PCWSTR name)
 {
     ULONGLONG now = GetTickCount64();
@@ -175,18 +196,13 @@ inline const FTPSITE *FtpSiteFind(PCWSTR name)
         bool fresh = (FtpSitesTick() != 0 && now - FtpSitesTick() <= 2000);
         const FTPSITE *hit = NULL;
         if (fresh)
-        {
-            for (auto &s : FtpSitesVec())
-                if (0 == StrCmpW(s.name, name)) { hit = &s; break; }
-        }
+            hit = FtpSiteFindLocked(name);
         ReleaseSRWLockShared(&FtpSitesLock());
         if (fresh) return hit;
     }
     FtpSitesReload();
     AcquireSRWLockShared(&FtpSitesLock());
-    const FTPSITE *hit = NULL;
-    for (auto &s : FtpSitesVec())
-        if (0 == StrCmpW(s.name, name)) { hit = &s; break; }
+    const FTPSITE *hit = FtpSiteFindLocked(name);
     ReleaseSRWLockShared(&FtpSitesLock());
     // NOTE: pointer into the static vector; caller must not hold it across reloads.
     return hit;
