@@ -97,13 +97,85 @@ public sealed class TransferTicketService
                 cmd.ExecuteNonQuery();
                 using var stats = connection.CreateCommand();
                 stats.CommandText = "SELECT (SELECT COUNT(*) FROM dir_cache), (SELECT COUNT(*) FROM tickets)";
-                using var reader = stats.ExecuteReader();
-                if (reader.Read())
-                    Log($"tickets db ready '{_dbPath}' dir_cache={reader.GetInt64(0)} tickets={reader.GetInt64(1)}");
+                {
+                    using var statsReader = stats.ExecuteReader();
+                    if (statsReader.Read())
+                        Log($"tickets db ready '{_dbPath}' dir_cache={statsReader.GetInt64(0)} tickets={statsReader.GetInt64(1)}");
+                }   // reader 必须先关：VACUUM 不允许有进行中的语句（实测报 cannot VACUUM）
+                PruneCaches(connection);
             }
             MigrateLegacyJson();
+            _ = Task.Run(PruneLoopAsync);
         }
         catch (Exception ex) { Log($"tickets db init failed: {ex.Message}"); }
+    }
+
+    /// <summary>每 24 小时重复清理一次（服务常驻不重启也在收敛，不只靠开机那一次）。</summary>
+    private async Task PruneLoopAsync()
+    {
+        while (true)
+        {
+            try { await Task.Delay(TimeSpan.FromHours(24)); }
+            catch { return; }
+            try
+            {
+                lock (_gate)
+                using (var connection = Open())
+                    PruneCaches(connection);
+            }
+            catch { /* 清理失败不影响任何功能，下一轮再试 */ }
+        }
+    }
+
+    /// <summary>
+    /// 自动清理（2026-09-25，对齐 WinSCP 的"持久缓存有寿命、过期自动清除"）。
+    /// 此前三张表只进不出：dir_cache 超龄行永不删（体积大头）、tickets/ticket_items 永不删。
+    /// 现在：目录快照超 DirCacheDiskMaxAgeHours（默认 24h，设置页可改）删除；
+    /// 票据保留 30 天；有删除就 VACUUM 把文件真实收缩。跑在服务进程里，绝不占 Explorer 的 UI 线程。
+    /// </summary>
+    private void PruneCaches(SqliteConnection connection)
+    {
+        try
+        {
+            var settings = AppSettings.Load();
+            int hours = Math.Clamp(settings.DirCacheDiskMaxAgeHours, 1, 720);
+            long dirCutoff = DateTime.UtcNow.Ticks - hours * 3600L * 10_000_000L;
+            long ticketCutoff = DateTimeOffset.UtcNow.AddDays(-30).ToUnixTimeSeconds();
+
+            int dirs, items, orphans, tickets;
+            using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM dir_cache WHERE tick < $c";
+                cmd.Parameters.AddWithValue("$c", dirCutoff);
+                dirs = cmd.ExecuteNonQuery();
+            }
+            using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM ticket_items WHERE job_id IN (SELECT job_id FROM tickets WHERE created < $c)";
+                cmd.Parameters.AddWithValue("$c", ticketCutoff);
+                items = cmd.ExecuteNonQuery();
+            }
+            using (var cmd = connection.CreateCommand())
+            {
+                // 顺带清孤儿：票据行已不存在的 items（历史版本可能留下）。
+                cmd.CommandText = "DELETE FROM ticket_items WHERE job_id NOT IN (SELECT job_id FROM tickets)";
+                orphans = cmd.ExecuteNonQuery();
+            }
+            using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM tickets WHERE created < $c";
+                cmd.Parameters.AddWithValue("$c", ticketCutoff);
+                tickets = cmd.ExecuteNonQuery();
+            }
+            if (dirs + items + orphans + tickets > 0)
+            {
+                using var vac = connection.CreateCommand();
+                vac.CommandText = "VACUUM";
+                vac.ExecuteNonQuery();
+                Log($"[cache] pruned: dir_cache={dirs} tickets={tickets} ticket_items={items + orphans}; vacuum ok");
+            }
+        }
+        catch (Exception ex) { Log($"[cache] prune failed: {ex.Message}"); }
     }
 
     /// <summary>把旧版 tickets.json 一次性搬进数据库（搬完改名，不再看它）。</summary>
