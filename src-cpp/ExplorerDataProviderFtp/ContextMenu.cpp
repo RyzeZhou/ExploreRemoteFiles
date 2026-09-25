@@ -2074,10 +2074,16 @@ static DWORD WINAPI PasteJobProc(LPVOID p)
         else
         {
             ULONGLONG sz = 0;
+            BOOL isFolder = FALSE;
             WIN32_FILE_ATTRIBUTE_DATA fa = {};
             if (GetFileAttributesExW(local.c_str(), GetFileExInfoStandard, &fa))
-                sz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-            FtpCachePatchAdd(j->site, j->folder, name, FALSE, sz);   // optimistic
+            {
+                isFolder = (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? TRUE : FALSE;
+                if (!isFolder) sz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            }
+            // 文件夹也必须进缓存（isFolder=TRUE）：服务侧现在会递归上传整个目录，
+            // 视图里得显示成文件夹 —— 旧代码一律 FALSE，上传完会看到"文件"。
+            FtpCachePatchAdd(j->site, j->folder, name, isFolder, sz);   // optimistic
         }
     }
     RefreshLocalFast(j->site, j->folder, j->pidl);

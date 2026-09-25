@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 using System.IO.Pipes;
 using System.Text;
 using ExplorerRemoteFs.Config;
@@ -806,8 +806,15 @@ public sealed class RemoteBridgeService : IDisposable
             cancellation.Token.ThrowIfCancellationRequested();
             var connection = FindConnection(siteName);
             var remote = NormalizeRemotePath(remotePath);
-            if (string.IsNullOrWhiteSpace(localPath) || !File.Exists(localPath))
-                return new(FetchJobState.Failed, "missing local file");
+            if (string.IsNullOrWhiteSpace(localPath))
+                return new(FetchJobState.Failed, "missing local path");
+            // 2026-09-25：拖放 / Ctrl+V 进来的**文件夹**此前被原样当文件上传，服务侧
+            // File.Exists(目录) 恒为 false → 一律 "missing local file"，用户只看到
+            // 「部分文件上传失败」，真因被盖住（中文路径是误会）。目录现在走递归上传。
+            if (Directory.Exists(localPath))
+                return await PutDirAsync(job);
+            if (!File.Exists(localPath))
+                return new(FetchJobState.Failed, $"local path not found: {localPath}");
             var fileName = System.IO.Path.GetFileName(localPath);
             task = _transfers?.BeginManagedTask("upload", siteName, fileName, remote,
                 () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }), batchId);
@@ -843,6 +850,113 @@ public sealed class RemoteBridgeService : IDisposable
             if (task is not null) _transfers?.CompleteManagedTask(task, false, message);
             Log($"put failed id='{job.Id}' site='{siteName}' remote='{remotePath}' src='{localPath}' bytes={job.Done}/{job.Total} exception='{SanitizeBridgeError(ex.ToString())}'");
             return new(FetchJobState.Failed, message);
+        }
+    }
+
+    /// <summary>递归上传一个本地目录到远程（拖放 / Ctrl+V 里"文件夹"的那一项）。
+    /// 与 FetchDirAsync 完全同构：先扫本地树拿文件总数，再建远程目录、逐个上传，
+    /// 进度按**文件数**聚合到一个队列任务上，暂停/取消语义一致。
+    /// 远程根 = remote（顶层文件夹名由扩展侧拼好，与下载侧的本地根对称）。</summary>
+    private async Task<FetchResult> PutDirAsync(FetchJob job)
+    {
+        var siteName = job.Site; var remoteDir = job.Remote; var localRoot = job.Local; var batchId = job.BatchId;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, job.Cts.Token);
+        TransferTask? task = null;
+        int uploaded = 0, failed = 0;
+        try
+        {
+            cancellation.Token.ThrowIfCancellationRequested();
+            var connection = FindConnection(siteName);
+            var remote = NormalizeRemotePath(remoteDir);
+            var folderName = System.IO.Path.GetFileName(localRoot.TrimEnd('\\', '/'));
+            if (string.IsNullOrEmpty(folderName)) folderName = remote;
+            task = _transfers?.BeginManagedTask("upload", siteName, folderName, remote,
+                () => System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { cancellation.Cancel(); } catch { } }), batchId);
+            _transfers?.UpdateManagedTask(task!, 0, 0, Ui.IsEnglish ? "Scanning local folder" : "正在扫描本地目录");
+            using var fs = ProviderFactory.Create(connection);
+            await Task.Run(() =>
+            {
+                cancellation.Token.ThrowIfCancellationRequested();
+                fs.EnsureConnected();
+                cancellation.Token.ThrowIfCancellationRequested();
+                var dirs = new List<string>();
+                var files = new List<(string Local, string Remote)>();
+                CollectLocalFiles(localRoot, remote, dirs, files, cancellation.Token);
+                int total = files.Count;
+                job.Done = 0; job.Total = total;
+                if (task is not null)
+                    _transfers?.UpdateManagedTask(task, 0, total, Ui.IsEnglish ? $"0 / {total} files" : $"0 / {total} 个文件");
+                // 目录先建（浅→深）。CreateDirectory 对**已存在**的目标会报错（SFTP mkdir），
+                // 这里刻意吞掉：目标目录本来就可能已经存在，真问题留给随后的上传去暴露。
+                foreach (var dir in dirs)
+                {
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    try { fs.CreateDirectory(dir); } catch { }
+                }
+                foreach (var file in files)
+                {
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    _transfers?.WaitWhilePaused(task, cancellation.Token);
+                    try
+                    {
+                        fs.Upload(file.Local, file.Remote, null, false, cancellation.Token,
+                            task is null ? null : () => _transfers?.WaitWhilePaused(task, cancellation.Token));
+                        uploaded++;
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        failed++;
+                        Log($"putdir item failed id='{job.Id}' remote='{file.Remote}' src='{file.Local}' exception='{SanitizeBridgeError(ex.ToString())}'");
+                    }
+                    job.Done = uploaded + failed;
+                    if (task is not null)
+                        _transfers?.UpdateManagedTask(task, uploaded + failed, total,
+                            Ui.IsEnglish ? $"{uploaded} / {total} files" : $"{uploaded} / {total} 个文件");
+                }
+            }, cancellation.Token);
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (task is not null) _transfers?.CompleteManagedTask(task, failed == 0, failed == 0 ? null : $"{failed} file(s) failed");
+            string message = failed == 0 ? "" : $"{failed} file(s) failed";
+            Log($"putdir done id='{job.Id}' site='{siteName}' remote='{remote}' src='{localRoot}' files={uploaded} failed={failed} batch='{batchId}'");
+            return new(failed == 0 ? FetchJobState.Done : FetchJobState.Failed, message);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, null, cancelled: true);
+            Log($"putdir cancelled id='{job.Id}' site='{siteName}' remote='{remoteDir}' src='{localRoot}' files={uploaded}/{job.Total} batch='{batchId}'");
+            return new(FetchJobState.Cancelled, "");
+        }
+        catch (Exception ex)
+        {
+            string message = SanitizeBridgeError(ex.Message);
+            if (task is not null) _transfers?.CompleteManagedTask(task, false, message);
+            Log($"putdir failed id='{job.Id}' site='{siteName}' remote='{remoteDir}' src='{localRoot}' files={uploaded}/{job.Total} batch='{batchId}' exception='{SanitizeBridgeError(ex.ToString())}'");
+            return new(FetchJobState.Failed, message);
+        }
+    }
+
+    /// <summary>把本地目录树摊平成 (本地, 远程) 文件列表，并收集需要创建的远程目录（浅→深）。
+    /// 符号链接目录当**空目录**占位、不跟随目标 —— 与下载侧 CollectRemoteFiles 同一规则，
+    /// 免得往服务器上灌一份链接目标的副本。</summary>
+    private static void CollectLocalFiles(string localDir, string remoteDir,
+                                          List<string> outDirs, List<(string Local, string Remote)> outFiles,
+                                          CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        outDirs.Add(remoteDir);
+        foreach (var entry in System.IO.Directory.EnumerateFileSystemEntries(localDir))
+        {
+            var name = System.IO.Path.GetFileName(entry);
+            if (string.IsNullOrEmpty(name)) continue;
+            var childRemote = remoteDir.TrimEnd('/') + "/" + name;
+            var attrs = System.IO.File.GetAttributes(entry);
+            if ((attrs & FileAttributes.Directory) != 0)
+            {
+                if ((attrs & FileAttributes.ReparsePoint) != 0) outDirs.Add(childRemote);
+                else CollectLocalFiles(entry, childRemote, outDirs, outFiles, token);
+            }
+            else outFiles.Add((entry, childRemote));
         }
     }
 
