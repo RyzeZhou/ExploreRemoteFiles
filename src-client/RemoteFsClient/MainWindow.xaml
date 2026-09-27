@@ -71,11 +71,13 @@
                         <TextBlock x:Name="SiteSettingsHelpText" TextWrapping="Wrap" Margin="0,0,0,16"/>
                         <Grid>
                             <Grid.ColumnDefinitions><ColumnDefinition Width="160"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                             <TextBlock x:Name="FtpEncodingLabel" VerticalAlignment="Center"/>
                             <TextBlock Grid.Column="1" x:Name="DFtpEncoding" VerticalAlignment="Center"/>
                             <TextBlock x:Name="PrivateKeyLabel" Grid.Row="1" VerticalAlignment="Center" Margin="0,10,0,0"/>
                             <TextBlock Grid.Row="1" Grid.Column="1" x:Name="DPrivateKey" VerticalAlignment="Center" Margin="0,10,0,0" TextWrapping="Wrap"/>
+                            <TextBlock x:Name="ServerOffsetLabel" Grid.Row="2" VerticalAlignment="Center" Margin="0,10,0,0"/>
+                            <TextBlock Grid.Row="2" Grid.Column="1" x:Name="DServerOffset" VerticalAlignment="Center" Margin="0,10,0,0"/>
                         </Grid>
                         <Button x:Name="EditSiteSettingsButton" Click="OnEdit" Padding="12,4" HorizontalAlignment="Left" Margin="0,20,0,0"/>
                     </StackPanel>

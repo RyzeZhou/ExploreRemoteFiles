@@ -1,4 +1,4 @@
-﻿namespace ExplorerRemoteFs.Providers;
+namespace ExplorerRemoteFs.Providers;
 
 /// <summary>
 /// 递归权限修改的结果。<b>Failed &gt; 0 即"部分完成"，调用方不得报成功</b>
@@ -21,6 +21,13 @@ public interface IRemoteFileSystem : IDisposable
 
     /// <summary>列出目录内容（不含 . 和 ..）。</summary>
     IReadOnlyList<RemoteEntry> List(string path);
+
+    /// <summary>
+    /// 探测服务器时区偏移（分钟）；探测不到返回 null。
+    /// 两个协议都不传时区，所以「按服务器时区显示」只能靠它：FTP 用 MDTM(UTC) 与
+    /// LIST(服务器本地) 之差反推，SFTP 读 /etc/timezone。站点里手工填的值优先。
+    /// </summary>
+    int? ProbeServerUtcOffset();
 
     /// <summary>删除文件或空目录（远程）。</summary>
     void Delete(string path);

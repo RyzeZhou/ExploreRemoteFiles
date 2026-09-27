@@ -1,4 +1,4 @@
-﻿# ExplorerRemoteFs 安装脚本（当前用户，无需管理员）
+# ExplorerRemoteFs 安装脚本（当前用户，无需管理员）
 # 正式发布走 Inno Setup 安装包（src-setup/erf.iss -> dist/Erf-*-Setup.exe）；本脚本保留给
 # "不装安装包、直接脚本注册"的开发/排障场景，注册语义两边要保持一致，改动时都看一眼。
 # 用法：右键"使用 PowerShell 运行"，或
@@ -153,7 +153,10 @@ Set-ItemProperty "$hk\RemoteFsMicrosoftCoreType\shellex\PropertySheetHandlers\$p
 # Start the per-user resident control center and its reusable Provider connection pool.
 Start-Process -FilePath "$InstallDir\client\RemoteFsClient.exe" -ArgumentList '--background' -WindowStyle Hidden
 
-Write-Host "==> Registration done. Restarting Explorer..."
+# 注意：本脚本**不会**重启资源管理器（2026-09-18 起改用"改名成 .old"绕开 DLL 占用）。
+# 被 explorer 映射着的旧 DLL 会一直用到 explorer 下次启动为止，所以这里必须明确提示，
+# 不能再写 "Restarting Explorer..." 那种与行为不符的话 —— 2026-09-27 实测被它误导过。
+Write-Host "==> Registration done. 扩展 DLL 已更新；资源管理器仍加载着旧版本，重启 explorer 后生效。"
 
 Write-Host ""
 Write-Host "DONE. 易远传 should appear as a top-level entry in the navigation pane."

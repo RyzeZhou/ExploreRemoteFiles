@@ -28,7 +28,15 @@ public sealed class RemoteEntry
 
     public long Size { get; init; }
 
+    /// <summary>修改时间，**统一为 UTC 时刻（Kind=Utc）**：由各 Provider 规范化
+    /// （SFTP 从本地字面值换算，FTP 按站点偏移从无时区字面值换算）。
+    /// 显示口径由 <see cref="Utils.TimeDisplay"/> 决定，别在这里直接 ToString ——
+    /// 之前就是在这里直出字面值，导致同一条链路里 CLI 与资源管理器显示的时区不一致。</summary>
     public DateTime? LastWriteTime { get; init; }
+
+    /// <summary>服务器时区偏移（分钟，东八区 = 480）；null = 未探测到。
+    /// FTP 的 LIST 需要它才能换算绝对时刻；SFTP 的 Unix 秒不需要，但「服务器时区」口径要用。</summary>
+    public int? ServerUtcOffsetMinutes { get; init; }
 
     public string? SymlinkTarget { get; init; }
 
@@ -42,7 +50,9 @@ public sealed class RemoteEntry
 
     public string SizeDisplay => IsDirectory ? "" : FormatSize(Size);
 
-    public string ModifiedDisplay => LastWriteTime?.ToString("yyyy-MM-dd HH:mm") ?? "";
+    public string ModifiedDisplay => LastWriteTime is { } t
+        ? Utils.TimeDisplay.Format(t, Utils.TimeDisplay.CurrentMode, ServerUtcOffsetMinutes)
+        : "";
 
     /// 大小显示口径（1024/1000、KB/kB/KiB）在 Utils.SizeFormat 里统一实现，
     /// 与扩展 DLL 的 SizeFormat.h 用同一个注册表设置，避免两边各写一套。

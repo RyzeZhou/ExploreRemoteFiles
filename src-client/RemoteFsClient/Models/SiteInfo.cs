@@ -17,6 +17,11 @@ public sealed class SiteInfo
     public string StartPath { get; set; } = "/";
     public bool FtpUseUtf8 { get; set; } = true;
 
+    /// <summary>服务器时区偏移（分钟，东八区 = 480）；null = 未探测/未指定。
+    /// 与 ExplorerRemoteFs.Config.ConnectionConfig.ServerUtcOffsetMinutes 是同一个 JSON 字段，
+    /// 两边必须同时声明 —— CLI 的 Load→Save 会整体回写，缺一处就会被静默丢掉。</summary>
+    public int? ServerUtcOffsetMinutes { get; set; }
+
     /// <summary>站点级默认终端程序：null/空 = 跟随全局；wt / powershell / vscode。</summary>
     public string? Terminal { get; set; }
 

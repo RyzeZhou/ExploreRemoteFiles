@@ -1,4 +1,4 @@
-﻿using ExplorerRemoteFs.Config;
+using ExplorerRemoteFs.Config;
 using FluentFTP;
 
 namespace ExplorerRemoteFs.Providers;
@@ -72,10 +72,11 @@ public sealed class FtpFileSystem : IRemoteFileSystem
             return result;
         }
 
+        EnsureServerOffset(items);
+
         foreach (var item in items)
         {
             if (item.Name is "." or "..") continue;
-
             var isDir = item.Type == FtpObjectType.Directory;
             result.Add(new RemoteEntry
             {
@@ -87,12 +88,85 @@ public sealed class FtpFileSystem : IRemoteFileSystem
                 Owner = string.IsNullOrEmpty(item.RawOwner) ? null : item.RawOwner,
                 Group = string.IsNullOrEmpty(item.RawGroup) ? null : item.RawGroup,
                 Size = item.Size,
-                LastWriteTime = item.Modified == DateTime.MinValue ? (DateTime?)null : item.Modified,
+                LastWriteTime = item.Modified == DateTime.MinValue ? null : ToUtc(item.Modified, ServerOffsetMinutes),
+                ServerUtcOffsetMinutes = ServerOffsetMinutes,
                 SymlinkTarget = string.IsNullOrEmpty(item.LinkTarget) ? null : item.LinkTarget
             });
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// FTP 的 LIST 只给"服务器本地时间"的字面值，**协议不带时区**（RFC 3659 只规定 MDTM 用 UTC），
+    /// 所以必须用站点偏移把它解释成绝对时刻。偏移未探测到时按"服务器时区 = 本地时区"处理
+    /// （与改造前的行为一致，不引入新的错误），探测到之后就是精确值。
+    /// </summary>
+    private static DateTime ToUtc(DateTime value, int? serverOffsetMinutes)
+    {
+        if (value.Kind == DateTimeKind.Utc) return value;
+        var offset = serverOffsetMinutes ?? (int)TimeZoneInfo.Local.GetUtcOffset(value).TotalMinutes;
+        return DateTime.SpecifyKind(value.AddMinutes(-offset), DateTimeKind.Utc);
+    }
+
+    // ── 服务器时区偏移：站点里手工填的优先，其次进程内探测到的 ────────────────
+    private int? _serverOffset;
+    private bool _offsetProbed;
+
+    private int? ServerOffsetMinutes => _config.ServerUtcOffsetMinutes ?? _serverOffset;
+
+    /// <inheritdoc />
+    public int? ProbeServerUtcOffset()
+    {
+        if (_config.ServerUtcOffsetMinutes.HasValue) return _config.ServerUtcOffsetMinutes;
+        if (_offsetProbed) return _serverOffset;
+        EnsureConnected();
+        if (_client is null) return null;
+        _offsetProbed = true;
+        try
+        {
+            var items = _client.GetListing(
+                string.IsNullOrWhiteSpace(_config.StartPath) ? "/" : _config.StartPath,
+                FtpListOption.ForceList | FtpListOption.AllFiles);
+            _serverOffset = ProbeFromListing(items);
+        }
+        catch { _serverOffset = null; }
+        if (_serverOffset.HasValue) ServerOffsetStore.Persist(_config, _serverOffset.Value);
+        return _serverOffset;
+    }
+
+    /// <summary>首次 List 时顺手探测 —— 复用已有的 LIST 结果，只多一次 MDTM。</summary>
+    private void EnsureServerOffset(FtpListItem[] items)
+    {
+        if (_config.ServerUtcOffsetMinutes.HasValue || _offsetProbed) return;
+        _offsetProbed = true;
+        _serverOffset = ProbeFromListing(items);
+        if (_serverOffset.HasValue) ServerOffsetStore.Persist(_config, _serverOffset.Value);
+    }
+
+    /// <summary>
+    /// MDTM 按 RFC 3659 返回 UTC，LIST 给的是服务器本地时间字面值 —— 两者之差就是服务器时区偏移。
+    /// 只用文件样本（目录的 MDTM 支持度不一），结果抹到最近的 15 分钟
+    /// （现实中的时区偏移都是 15 分钟的整数倍），超出 ±14 小时的样本判为异常丢弃。
+    /// </summary>
+    private int? ProbeFromListing(FtpListItem[] items)
+    {
+        foreach (var item in items)
+        {
+            if (item.Type != FtpObjectType.File) continue;
+            if (item.Modified == DateTime.MinValue) continue;
+            try
+            {
+                var mdtm = _client?.GetModifiedTime(item.FullName) ?? DateTime.MinValue;
+                if (mdtm == DateTime.MinValue) continue;
+                var utc = DateTime.SpecifyKind(mdtm, DateTimeKind.Unspecified);
+                var serverLocal = DateTime.SpecifyKind(item.Modified, DateTimeKind.Unspecified);
+                var minutes = (int)(Math.Round((serverLocal - utc).TotalMinutes / 15.0) * 15);
+                if (Math.Abs(minutes) <= 14 * 60) return minutes;
+            }
+            catch { /* 单个样本失败就试下一个 */ }
+        }
+        return null;
     }
 
     /// <summary>Owner/Group/Others 三组 FtpPermission → "drwxr-xr-x"（Unix 服务器解析才有值，否则返回 null）。</summary>

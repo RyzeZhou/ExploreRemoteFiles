@@ -1334,14 +1334,16 @@ public sealed class RemoteBridgeService : IDisposable
         var canonicalSite = connection.Name;
         var startPath = NormalizeRemotePath(connection.StartPath);
         var fullPath = NormalizeRemotePath(requestedPath);
-        if (!IsAtOrBelow(fullPath, startPath))
-            throw new InvalidOperationException($"The ERF path is outside the configured start path '{startPath}'.");
+        // 导航**不再限制在起始路径之内**（对齐 WinSCP：起始路径只是默认落点，不是围栏）。
+        // 删除 / chmod 那两处仍用 IsAtOrBelow 拦住越界写操作 —— 那里防的是改坏别的目录。
 
         var maxAge = BridgeListingMaxAge();
         using var db = OpenCacheDb();
 
-        var currentPath = startPath;
-        var remainder = fullPath.Length == startPath.Length ? string.Empty : fullPath[startPath.Length..].TrimStart('/');
+        // 逐段预热从 startPath 与目标的**公共前缀**开始：前缀之上的目录本来就已列过，
+        // 不必从起始路径绕一圈（目标在起始路径之外时，公共前缀就是 "/"）。
+        var currentPath = CommonPrefix(startPath, fullPath);
+        var remainder = fullPath.Length == currentPath.Length ? string.Empty : fullPath[currentPath.Length..].TrimStart('/');
         foreach (var segment in remainder.Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
             var childPath = currentPath == "/" ? "/" + segment : currentPath + "/" + segment;
@@ -1402,6 +1404,19 @@ public sealed class RemoteBridgeService : IDisposable
         root == "/" || path.Equals(root, StringComparison.Ordinal) ||
         (path.StartsWith(root, StringComparison.Ordinal) && path.Length > root.Length && path[root.Length] == '/');
 
+    /// <summary>两个绝对路径的公共目录前缀（按 '/' 分段比较，避免 /home/zh 误配 /home/zhou）。
+    /// 没有任何公共段时返回 "/"。</summary>
+    private static string CommonPrefix(string a, string b)
+    {
+        if (a.Equals(b, StringComparison.Ordinal)) return a;
+        var left = a.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var right = b.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var common = 0;
+        while (common < left.Length && common < right.Length &&
+               left[common].Equals(right[common], StringComparison.Ordinal)) common++;
+        return common == 0 ? "/" : "/" + string.Join('/', left.Take(common));
+    }
+
     private static bool ListingContainsDirectory(string listing, string name)
     {
         foreach (var line in listing.Split('\n', StringSplitOptions.RemoveEmptyEntries))
@@ -1432,7 +1447,10 @@ public sealed class RemoteBridgeService : IDisposable
                     text.Append("ITEM\t").Append(mode).Append('\t').Append(mtime).Append('\t').Append(entry.Size).Append('\t')
                         .Append(entry.OwnerDisplay).Append('\t').Append(entry.GroupDisplay).Append('\t')
                         .Append(entry.IsDirectory ? 1 : 0).Append('\t').Append(entry.IsSymlink ? 1 : 0).Append('\t')
-                        .Append(remotePath).Append('\t').Append(entry.Name).Append('\t').Append(entry.Uid).Append('\t').Append(entry.Gid).AppendLine();
+                        .Append(remotePath).Append('\t').Append(entry.Name).Append('\t').Append(entry.Uid).Append('\t').Append(entry.Gid)
+                        // 第 13 列：服务器时区偏移（分钟），-1 = 未探测。DLL 要靠它渲染
+                        // 「服务器时区」口径；老解析方只读前 12 列，多这一列不影响它们。
+                        .Append('\t').Append(entry.ServerUtcOffsetMinutes?.ToString() ?? "-1").AppendLine();
                 }
                 text.AppendLine("BRIDGE-END");
                 var listingText = text.ToString();

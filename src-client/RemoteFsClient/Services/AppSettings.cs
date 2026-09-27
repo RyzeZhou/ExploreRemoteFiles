@@ -1,4 +1,4 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using System.IO;
 
 namespace RemoteFsClient.Services;
@@ -18,6 +18,10 @@ public sealed class AppSettings
     public string DefaultViewMode { get; set; } = "details";
     /// <summary>File-size column format: "auto" (Linux -h style) or "kb" (Windows style).</summary>
     public string SizeFormat { get; set; } = "auto";
+
+    /// <summary>修改时间的显示口径：local（默认）/ server / utc。
+    /// 与扩展 DLL 读的是**同一个注册表值**：HKCU\Software\ExplorerRemoteFs\TimeDisplayMode。</summary>
+    public string TimeDisplayMode { get; set; } = "local";
 
     /// <summary>
     /// Default terminal program for the Explorer "Open terminal here" command:
@@ -66,6 +70,7 @@ public sealed class AppSettings
                 EditorPath = NormalizeEditorPath(key?.GetValue("EditorPath") as string),
                 DefaultViewMode = NormalizeViewMode(key?.GetValue("DefaultViewMode") as string),
                 SizeFormat = NormalizeSizeFormat(key?.GetValue("SizeFormat") as string),
+                TimeDisplayMode = NormalizeTimeDisplayMode(key?.GetValue("TimeDisplayMode") as string),
                 Terminal = NormalizeTerminal(key?.GetValue("Terminal") as string),
                 DownloadDir = NormalizeDirectory(key?.GetValue("DownloadDir") as string, DefaultDownloadDir),
                 UseTransferTicket = Convert.ToInt32(key?.GetValue("UseTransferTicket") ?? 0) != 0,
@@ -95,6 +100,7 @@ public sealed class AppSettings
         key.SetValue("EditorPath", EditorPath, RegistryValueKind.String);
         key.SetValue("DefaultViewMode", NormalizeViewMode(DefaultViewMode), RegistryValueKind.String);
         key.SetValue("SizeFormat", NormalizeSizeFormat(SizeFormat), RegistryValueKind.String);
+        key.SetValue("TimeDisplayMode", NormalizeTimeDisplayMode(TimeDisplayMode), RegistryValueKind.String);
         key.SetValue("Terminal", NormalizeTerminal(Terminal), RegistryValueKind.String);
         DownloadDir = NormalizeDirectory(DownloadDir, DefaultDownloadDir); Directory.CreateDirectory(DownloadDir);
         key.SetValue("DownloadDir", DownloadDir, RegistryValueKind.String);
@@ -124,9 +130,18 @@ public sealed class AppSettings
     public static string NormalizeEditorPath(string? path) =>
         string.IsNullOrWhiteSpace(path) ? "notepad.exe" : path.Trim();
 
-    /// <summary>icons | list | details | tiles | content; anything else falls back to details.</summary>
-    public static string NormalizeViewMode(string? mode) => (mode ?? "").Trim().ToLowerInvariant() switch
+    /// <summary>时间显示口径：local = 本地时区（默认）；server = 服务器时区
+    /// （站点未探测到偏移时退回本地）；utc = UTC+0。
+    /// 规则与扩展 DLL 的 <c>TimeDisplay.h</c> 一致 —— 两边共用同一个注册表值。</summary>
+    public static string NormalizeTimeDisplayMode(string? mode) => (mode ?? "").Trim().ToLowerInvariant() switch
     {
+        "utc" => "utc",
+        "server" => "server",
+        _ => "local",
+    };
+
+    /// <summary>icons | list | details | tiles | content; anything else falls back to details.</summary>
+    public static string NormalizeViewMode(string? mode) => (mode ?? "").Trim().ToLowerInvariant() switch    {
         "icons" => "icons",
         "list" => "list",
         "tiles" => "tiles",
@@ -181,6 +196,9 @@ public static class Ui
             ["FtpEncoding"] = ("FTP 文件名编码", "FTP file-name encoding"), ["ForceUtf8"] = ("强制 UTF-8（推荐）", "Force UTF-8 (recommended)"),
             ["EditSiteSettings"] = ("编辑站点设置", "Edit site settings"),
             ["ApplicationSettings"] = ("应用设置", "Application settings"), ["WinScpBackend"] = ("WinSCP 后端", "WinSCP backend"),
+            ["TimeDisplay"] = ("修改时间显示", "Modified time display"),
+            ["ServerTimeZone"] = ("服务器时区", "Server time zone"),
+            ["ProbeTimeZone"] = ("自动探测", "Auto detect"),
             ["WinScpPath"] = ("WinSCP.com 路径", "WinSCP.com path"), ["Browse"] = ("浏览...", "Browse..."),
             ["MetadataCachePath"] = ("元数据缓存目录", "Metadata cache directory"), ["FileCachePath"] = ("文件缓存目录", "File cache directory"),
             ["DefaultEditor"] = ("默认编辑器", "Default editor"),

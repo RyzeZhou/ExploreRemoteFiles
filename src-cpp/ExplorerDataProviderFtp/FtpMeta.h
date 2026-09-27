@@ -795,6 +795,10 @@ typedef struct
     DWORD   dwGid;
     BOOL    fIsFolder;
     BOOL    fIsSymlink;
+    // 服务器时区偏移（分钟），-1 = 未探测；「服务器时区」显示口径要用（见 TimeDisplay.h）。
+    // 放在末尾：这个结构体会按 sizeof 直接当 blob 存进磁盘缓存，
+    // 加字段后大小变化会让旧 blob 被判为格式不符而丢弃重建（FtpDiskCacheLoad 里有校验）。
+    int     serverOffsetMinutes;
     WCHAR   szOwner[40];
     WCHAR   szGroup[40];
     WCHAR   szName[MAX_PATH];
@@ -1658,9 +1662,9 @@ inline BOOL FtpParseBridgeItems(PCWSTR site, PCWSTR path, const std::string &tex
         // Manual split that KEEPS empty fields. wcstok_s would skip consecutive
         // tabs (e.g. SFTP rows have empty owner/group => "\t\t"), shifting every
         // field index and corrupting the name/uid/gid columns.
-        WCHAR *fields[12] = {}; int nf = 0;
+        WCHAR *fields[13] = {}; int nf = 0;
         WCHAR *p = wide;
-        while (nf < 12)
+        while (nf < 13)
         {
             WCHAR *tab = wcschr(p, L'\t');
             if (tab) *tab = 0;
@@ -1681,6 +1685,8 @@ inline BOOL FtpParseBridgeItems(PCWSTR site, PCWSTR path, const std::string &tex
         item.fIsSymlink = _wtoi(fields[7]) != 0;
         item.dwUid = (nf > 10 && fields[10] && fields[10][0]) ? (DWORD)_wtoi64(fields[10]) : 0xFFFFFFFF;
         item.dwGid = (nf > 11 && fields[11] && fields[11][0]) ? (DWORD)_wtoi64(fields[11]) : 0xFFFFFFFF;
+        // 第 13 列（可缺）：服务器时区偏移，-1 = 未探测。老服务只给 12 列，按未探测处理。
+        item.serverOffsetMinutes = (nf > 12 && fields[12] && fields[12][0]) ? _wtoi(fields[12]) : -1;
         StringCchCopy(item.szName, ARRAYSIZE(item.szName), fields[9]);
     }
     if (text.rfind("FAIL:", 0) == 0) return FALSE;

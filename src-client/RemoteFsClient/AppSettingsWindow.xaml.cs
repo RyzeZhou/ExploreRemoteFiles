@@ -36,6 +36,7 @@ public partial class AppSettingsWindow : Window
         DefaultViewBox.SelectedValue = Settings.DefaultViewMode;
         SizeFormatBox.SelectedValue = Settings.SizeFormat;
         TerminalBox.SelectedValue = AppSettings.NormalizeTerminal(Settings.Terminal);
+        TimeDisplayBox.SelectedValue = AppSettings.NormalizeTimeDisplayMode(Settings.TimeDisplayMode);
         ApplyLanguage();
         RefreshAssocStatus();
         NavList.SelectedIndex = 0;   // 触发 OnNavChanged
@@ -56,6 +57,16 @@ public partial class AppSettingsWindow : Window
             : new[] { "图标", "列表", "详细信息", "平铺", "内容" };
         for (int i = 0; i < DefaultViewBox.Items.Count && i < viewNames.Length; i++)
             ((ComboBoxItem)DefaultViewBox.Items[i]).Content = viewNames[i];
+        TimeDisplayLabel.Text = Ui.IsEnglish ? "Modified time display" : "修改时间显示";
+        var timeNames = Ui.IsEnglish
+            ? new[] { "Local time zone (matches local files in the same window)",
+                      "Server time zone (falls back to local while the site's offset is unknown)",
+                      "UTC+0" }
+            : new[] { "本地时区（与同一窗口的本地文件一致）",
+                      "服务器时区（站点未探测到偏移时退回本地）",
+                      "UTC+0（世界时）" };
+        for (int i = 0; i < TimeDisplayBox.Items.Count && i < timeNames.Length; i++)
+            ((ComboBoxItem)TimeDisplayBox.Items[i]).Content = timeNames[i];
         SizeFormatLabel.Text = Ui.IsEnglish ? "File size format" : "文件大小格式";
         var sizeNames = Ui.IsEnglish
             ? new[] { "Auto — same as Explorer (Windows formats it: 1.00 KB / 976 KB / 1.39 GB)",
@@ -230,6 +241,7 @@ public partial class AppSettingsWindow : Window
         Settings.ServiceLanguage = (ServiceLanguageBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "zh-CN";
         Settings.DefaultViewMode = (DefaultViewBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "details";
         Settings.SizeFormat = (SizeFormatBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "auto";
+        Settings.TimeDisplayMode = (TimeDisplayBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "local";
         Settings.Terminal = AppSettings.NormalizeTerminal((TerminalBox.SelectedItem as ComboBoxItem)?.Tag as string);
         try
         {

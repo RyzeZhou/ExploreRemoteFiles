@@ -15,6 +15,7 @@
 #include "FtpSites.h"
 #include "VscodeBridge.h"
 #include "SizeFormat.h"
+#include "TimeDisplay.h"
 #include "Utils.h"
 #include "resource.h"
 #include "ProbeLog.h"
@@ -84,6 +85,13 @@ static void ApplySiteStartPath(PCWSTR site, PWSTR path, UINT cch)
     if (!site || !site[0] || !path || !path[0]) return;
     const FTPSITE *s = FtpSiteFind(site);
     if (!s || !s->startPath[0] || StrCmp(s->startPath, L"/") == 0) return;
+
+    // 路径已经带着起始路径了（fAbsRoot 的项：GetPidlPath 直接给出服务器绝对路径，
+    // 例如地址栏进 /etc 之后的项）→ 不能再补一次，否则会拼成
+    // /home/zhou/AI_work/etc 这种不存在的路径。
+    size_t sl = lstrlen(s->startPath);
+    if (0 == StrCmpNW(path, s->startPath, (int)sl) &&
+        (path[sl] == L'/' || path[sl] == 0)) return;
 
     if (StrCmp(path, L"/") == 0)
     {
@@ -562,12 +570,9 @@ static void FormatSizeString(ULONGLONG size, BOOL folder, PWSTR out, UINT cch)
 {
     ErfFormatSizeWithExact(size, folder, out, cch);
 }
-static void FormatMtimeString(DWORD mtime, PWSTR out, UINT cch)
+static void FormatMtimeString(DWORD mtime, int serverOffsetMinutes, PWSTR out, UINT cch)
 {
-    __time64_t t = (__time64_t)mtime; struct tm tmLocal;
-    if (_localtime64_s(&tmLocal,&t)==0) StringCchPrintf(out,cch,L"%04d-%02d-%02d %02d:%02d",
-        tmLocal.tm_year+1900, tmLocal.tm_mon+1, tmLocal.tm_mday, tmLocal.tm_hour, tmLocal.tm_min);
-    else StringCchCopy(out,cch,L"-");
+    ErfFormatMtime(mtime, serverOffsetMinutes, out, cch);
 }
 
 // 从"已经拿到的列表"里填元数据 —— 走网络和走缓存两条路共用这一段。
@@ -593,7 +598,7 @@ static BOOL ReadRemoteMetaFromList(const std::vector<FTPENTRY> &entries, PCWSTR 
         StringCchCopy(meta->type, ARRAYSIZE(meta->type),
             item.fIsSymlink ? ExplorerText(L"type.symbolic_link", L"符号链接", L"Symbolic Link") : (item.fIsFolder ? ExplorerText(L"type.folder", L"文件夹", L"Folder") : ExplorerText(L"type.file", L"文件", L"File")));
         FormatSizeString(item.dwSize, item.fIsFolder, meta->size, ARRAYSIZE(meta->size));
-        FormatMtimeString(item.dwMtime, meta->mtime, ARRAYSIZE(meta->mtime));
+        FormatMtimeString(item.dwMtime, item.serverOffsetMinutes, meta->mtime, ARRAYSIZE(meta->mtime));
         return TRUE;
     }
     return FALSE;

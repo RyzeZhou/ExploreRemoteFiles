@@ -41,6 +41,7 @@ public partial class SiteEditWindow : Window
         TbUser.Text = draft.Username;
         TbPath.Text = draft.StartPath;
         CbFtpUtf8.IsChecked = draft.FtpUseUtf8;
+        TbServerOffset.Text = FormatOffset(draft.ServerUtcOffsetMinutes);
 
         BuildTerminalChoices(draft.Terminal);
         ReloadSshEntries(selectAlias: draft.SshHostAlias);
@@ -61,6 +62,7 @@ public partial class SiteEditWindow : Window
         PortLabel.Text = Ui.IsEnglish ? "Port (optional)" : "端口（可空）"; UserLabel.Text = Ui.T("Username");
         PathLabel.Text = Ui.T("StartPath"); LblFtpUtf8.Text = Ui.T("FtpEncoding"); CbFtpUtf8.Content = Ui.T("ForceUtf8");
         PasswordLabel.Text = Ui.T("Password"); SaveButton.Content = Ui.T("Save"); CancelButton.Content = Ui.T("Cancel");
+        ServerOffsetLabel.Text = Ui.T("ServerTimeZone"); ProbeOffsetButton.Content = Ui.T("ProbeTimeZone");
 
         TerminalProgramLabel.Text = Ui.T("TerminalProgram");
         SshBindingLabel.Text = Ui.T("SshBinding");
@@ -73,6 +75,68 @@ public partial class SiteEditWindow : Window
         ColDownButton.Content = Ui.T("ColumnMoveDown");
         ColResetButton.Content = Ui.T("ColumnReset");
         RefreshColumnList();
+    }
+
+    // ── 服务器时区（分钟偏移）────────────────────────────────────────────────
+    // 为什么需要手工项：SFTP 只给 Unix 秒、FTP 的 LIST 只有无时区字面值 —— **两个协议都不传时区**。
+    // 能自动探测就自动填，探测不到就靠用户填（如 +08:00），填了之后「服务器时区」显示口径才准确。
+    private static string FormatOffset(int? minutes) =>
+        minutes.HasValue ? ExplorerRemoteFs.Utils.TimeDisplay.DescribeOffset(minutes) : "";
+
+    /// <summary>解析 "UTC+08:00" / "+08:00" / "-05:30" 形式的偏移；空或非法返回 null（= 未设置）。</summary>
+    private static int? ParseOffset(string? text)
+    {
+        var t = (text ?? "").Trim();
+        if (t.Length == 0) return null;
+        if (t.StartsWith("UTC", StringComparison.OrdinalIgnoreCase)) t = t[3..].Trim();
+        bool negative = t.StartsWith('-');
+        t = t.TrimStart('+', '-');
+        var parts = t.Split(':');
+        if (parts.Length == 0 || !int.TryParse(parts[0], out var hours)) return null;
+        int minutes = parts.Length > 1 && int.TryParse(parts[1], out var m) ? m : 0;
+        var total = hours * 60 + minutes;
+        return negative ? -total : total;
+    }
+
+    private void OnProbeOffset(object sender, RoutedEventArgs e)
+    {
+        var config = new ExplorerRemoteFs.Config.ConnectionConfig
+        {
+            Name = TbName.Text.Trim(),
+            Type = (CbType.SelectedItem as ComboBoxItem)?.Content as string ?? "sftp",
+            Host = TbHost.Text.Trim(),
+            Username = TbUser.Text,
+            StartPath = string.IsNullOrWhiteSpace(TbPath.Text) ? "/" : TbPath.Text.Trim(),
+            FtpUseUtf8 = CbFtpUtf8.IsChecked != false,
+        };
+        if (int.TryParse(TbPort.Text.Trim(), out var port) && port > 0) config.Port = port;
+        if (CredentialStore.TryRead(config.Name, out _, out var secret)) config.Password = secret;
+
+        try
+        {
+            var fs = ExplorerRemoteFs.Providers.ProviderFactory.Create(config);
+            try
+            {
+                var minutes = fs.ProbeServerUtcOffset();
+                if (minutes.HasValue)
+                {
+                    TbServerOffset.Text = FormatOffset(minutes);
+                }
+                else
+                {
+                    MessageBox.Show(
+                        Ui.IsEnglish
+                            ? "The server did not reveal its time zone. Enter the offset manually (e.g. +08:00)."
+                            : "服务器没有提供时区信息，请手工填写偏移（如 +08:00）。",
+                        Ui.T("ServerTimeZone"), MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+            }
+            finally { fs.Dispose(); }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, Ui.T("ServerTimeZone"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     // ── 列顺序 ──────────────────────────────────────────────────────────────
@@ -281,6 +345,7 @@ public partial class SiteEditWindow : Window
         _draft.Username = TbUser.Text;
         _draft.StartPath = string.IsNullOrWhiteSpace(TbPath.Text) ? "/" : TbPath.Text.Trim();
         _draft.FtpUseUtf8 = CbFtpUtf8.IsChecked != false;
+        _draft.ServerUtcOffsetMinutes = ParseOffset(TbServerOffset.Text);
 
         // 终端配置（只有 SSH 类型才有意义；FTP 站点清空，避免留下误导性配置）
         bool ssh = IsSftp();

@@ -54,5 +54,13 @@ public sealed class ConnectionConfig
     /// </summary>
     public string? ColumnOrder { get; set; }
 
+    /// <summary>
+    /// 服务器时区偏移（分钟，东八区 = 480）；null = 未探测/未指定。
+    /// FTP 的 LIST 只给"服务器本地时间"的字面值，协议不带时区，必须靠它换算成绝对时刻；
+    /// SFTP 的 Unix 秒本身是绝对时刻，此值只影响「按服务器时区显示」这一口径。
+    /// 探测结果由站点编辑窗口 / CLI 写回这里。
+    /// </summary>
+    public int? ServerUtcOffsetMinutes { get; set; }
+
     public int EffectivePort => Port ?? (Type.StartsWith("sftp", StringComparison.OrdinalIgnoreCase) ? 22 : 21);
 }

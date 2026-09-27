@@ -30,7 +30,8 @@
                 <Grid.ColumnDefinitions><ColumnDefinition Width="176"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
                 <TextBlock x:Name="ExplorerLanguageLabel" VerticalAlignment="Center"/>
                 <ComboBox x:Name="ExplorerLanguageBox" Grid.Column="1" Margin="0,4" SelectedValuePath="Tag">
@@ -53,7 +54,11 @@
                 <ComboBox x:Name="TerminalBox" Grid.Row="4" Grid.Column="1" Margin="0,12,0,4" SelectedValuePath="Tag">
                     <ComboBoxItem Tag="wt"/><ComboBoxItem Tag="powershell"/><ComboBoxItem Tag="vscode"/>
                 </ComboBox>
-                <TextBlock x:Name="GeneralHintText" Grid.Row="5" Grid.ColumnSpan="2" TextWrapping="Wrap"
+                <TextBlock x:Name="TimeDisplayLabel" Grid.Row="5" VerticalAlignment="Center" Margin="0,8,0,0"/>
+                <ComboBox x:Name="TimeDisplayBox" Grid.Row="5" Grid.Column="1" Margin="0,12,0,4" SelectedValuePath="Tag">
+                    <ComboBoxItem Tag="local"/><ComboBoxItem Tag="server"/><ComboBoxItem Tag="utc"/>
+                </ComboBox>
+                <TextBlock x:Name="GeneralHintText" Grid.Row="6" Grid.ColumnSpan="2" TextWrapping="Wrap"
                            Foreground="#666" Margin="0,18,0,0" VerticalAlignment="Top"/>
             </Grid>
 

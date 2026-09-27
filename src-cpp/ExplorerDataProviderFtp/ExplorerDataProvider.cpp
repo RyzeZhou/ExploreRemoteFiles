@@ -22,6 +22,7 @@
 #include "FtpSites.h"
 #include "ColumnModel.h"
 #include "SizeFormat.h"
+#include "TimeDisplay.h"
 
 #include "resource.h"
 #include "Utils.h"
@@ -65,6 +66,10 @@ typedef struct tagObject
     BYTE    nSides;
     BYTE    cchName;
     BOOL    fIsFolder;
+    // 本段的路径基准：FALSE = 站点配置的 StartPath（默认，站点根语义）；
+    // TRUE = 服务器绝对根 "/" —— 地址栏输入"起始路径之外"的路径时用（见 ParseDisplayName）。
+    // 只有 level 1 的站点段会带它；后续段照常相对拼接，GetPidlPath 据此决定要不要补 StartPath。
+    BOOL    fAbsRoot;
     WCHAR   szName[1];
 } FVITEMID;
 #pragma pack()
@@ -163,6 +168,7 @@ typedef struct
     DWORD   dwMode;       // unix permission bits
     ULONGLONG dwSize;    // bytes
     DWORD   dwMtime;      // unix epoch seconds
+    int     serverOffsetMinutes;   // 服务器时区偏移（分钟），-1 = 未探测（见 TimeDisplay.h）
     DWORD   dwUid;        // 0 = unknown (FTP)
     DWORD   dwGid;
     BOOL    fIsFolder;
@@ -263,6 +269,7 @@ static BOOL GetItemMeta(PCWSTR site, PCWSTR path, PCWSTR name, ITEMDATA *out)
         return FALSE;
     }
     out->dwMode = found.dwMode; out->dwMtime = found.dwMtime; out->dwSize = found.dwSize;
+    out->serverOffsetMinutes = found.serverOffsetMinutes;   // 「服务器时区」口径要用
     out->dwUid = found.dwUid; out->dwGid = found.dwGid;
     out->fIsFolder = found.fIsFolder; out->fIsSymlink = found.fIsSymlink;
     StringCchCopy(out->szOwner, ARRAYSIZE(out->szOwner), found.szOwner);
@@ -299,6 +306,7 @@ static void GetPidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
     out[0] = 0;
     PCUIDLIST_RELATIVE p = (PCUIDLIST_RELATIVE)abs;
     BOOL first = TRUE;
+    BOOL absRoot = FALSE;
     while (p && p->mkid.cb)
     {
         PCFVITEMID it = IsOursItem(p);
@@ -306,6 +314,7 @@ static void GetPidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
         {
             WCHAR name[256];
             StringCchCopyN(name, ARRAYSIZE(name), it->szName, it->cchName);
+            if (it->fAbsRoot) absRoot = TRUE;
             if (name[0] && !first) { StringCchCat(out, cch, L"/"); StringCchCat(out, cch, name); }
             first = FALSE;
         }
@@ -315,8 +324,10 @@ static void GetPidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
 
     // PIDLs store path components relative to the configured site root.
     // Shell extensions must pass the actual remote path to the CLI.
+    // fAbsRoot 的项（地址栏输入的、起始路径之外的路径）已经是服务器绝对路径，
+    // 不能再补一次站点起始路径 —— 那个前缀是给"相对站点根"的普通项准备的。
     WCHAR site[64] = {};
-    if (GetPidlSite(abs, site, ARRAYSIZE(site)))
+    if (!absRoot && GetPidlSite(abs, site, ARRAYSIZE(site)))
     {
         const FTPSITE *s = FtpSiteFind(site);
         if (s && s->startPath[0] && StrCmp(s->startPath, L"/") != 0)
@@ -476,15 +487,9 @@ static void FormatSize(ULONGLONG size, BOOL folder, PWSTR out, UINT cch)
 {
     ErfFormatSize(size, folder, out, cch);
 }
-static void FormatMtime(DWORD mtime, PWSTR out, UINT cch)
+static void FormatMtime(DWORD mtime, int serverOffsetMinutes, PWSTR out, UINT cch)
 {
-    __time64_t t = (__time64_t)mtime;
-    struct tm tmLocal;
-    if (_localtime64_s(&tmLocal, &t) == 0)
-        StringCchPrintf(out, cch, L"%04d-%02d-%02d %02d:%02d",
-            tmLocal.tm_year + 1900, tmLocal.tm_mon + 1, tmLocal.tm_mday,
-            tmLocal.tm_hour, tmLocal.tm_min);
-    else StringCchCopy(out, cch, L"-");
+    ErfFormatMtime(mtime, serverOffsetMinutes, out, cch);
 }
 
 class CFolderViewImplEnumIDList : public IEnumIDList
@@ -652,6 +657,11 @@ try
             while (startLength > 1 && startPath[startLength - 1] == L'/')
                 startPath[--startLength] = 0;
 
+            // 起始路径之外的路径**不再拒绝**（对齐 WinSCP：起始路径只是默认落点，不是围栏）：
+            // 改用"服务器绝对根"作为该 PIDL 段的路径基准（fAbsRoot），于是
+            // "WSL:/etc" 会绑成 站点段(fAbsRoot) → etc，路径重建为 /etc。
+            // 删除/chmod 的越界保护在服务侧（RemoteBridgeService.IsAtOrBelow），不在这里。
+            BOOL absRoot = FALSE;
             if (StrCmpW(startPath, L"/") == 0)
             {
                 while (*pathToBind == L'/') ++pathToBind;
@@ -661,13 +671,17 @@ try
                 if (0 != StrCmpNW(pathToBind, startPath, (int)startLength) ||
                     (pathToBind[startLength] && pathToBind[startLength] != L'/'))
                 {
-                    ProbeLog(L"[PARSE] path outside site root; site='%s' start='%s' requested='%s'", site, startPath, pathToBind);
-                    ILFree(result);
-                    return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+                    ProbeLog(L"[PARSE] path outside site root -> binding from server root; site='%s' start='%s' requested='%s'", site, startPath, pathToBind);
+                    absRoot = TRUE;
+                    while (*pathToBind == L'/') ++pathToBind;
                 }
-                pathToBind += startLength;
-                while (*pathToBind == L'/') ++pathToBind;
+                else
+                {
+                    pathToBind += startLength;
+                    while (*pathToBind == L'/') ++pathToBind;
+                }
             }
+            ((PFVITEMID)result)->fAbsRoot = absRoot;
 
             // Split the path RELATIVE TO THE SITE ROOT into segments and bind
             // them step by step.
@@ -926,6 +940,7 @@ try
                 item.nLevel = m_nLevel + 1;
                 item.dwMode = it.dwMode;
                 item.dwMtime = it.dwMtime;
+                item.serverOffsetMinutes = it.serverOffsetMinutes;
                 item.dwSize = it.dwSize;
                 item.dwUid = it.dwUid;
                 item.dwGid = it.dwGid;
@@ -1013,7 +1028,13 @@ try
                 // 与规范站点两套身份并存，大小写同名站点会互相串。
                 const FTPSITE *site = FtpSiteFind(name);
                 if (!site) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-                child = new (std::nothrow) CFolderViewImplFolder(1, site->name, site->startPath);
+                // fAbsRoot 的站点段 = "服务器绝对根"（地址栏输入了起始路径之外的路径，
+                // 见 ParseDisplayName）：这一层的路径基准是 "/"，不是站点配置的 StartPath。
+                PCFVITEMID absItem = IsOursItem(pidl);
+                ProbeLog(L"[PARSE] site root bind: site='%s' fromServerRoot=%d", name,
+                         absItem ? (int)absItem->fAbsRoot : 0);
+                PCWSTR rootPath = (absItem && absItem->fAbsRoot) ? L"/" : site->startPath;
+                child = new (std::nothrow) CFolderViewImplFolder(1, site->name, rootPath);
                 hr = child ? S_OK : E_OUTOFMEMORY;
             }
             else
@@ -2295,7 +2316,7 @@ HRESULT CFolderViewImplFolder::_GetColumnDisplayName(PCUITEMID_CHILD pidl,
     }
     else if (IsEqualPropertyKey(*pkey, PKEY_Remote_Modified))
     {
-        FormatMtime(meta.dwMtime, szVal, ARRAYSIZE(szVal));
+        FormatMtime(meta.dwMtime, meta.serverOffsetMinutes, szVal, ARRAYSIZE(szVal));
     }
     else
     {
@@ -2809,6 +2830,7 @@ HRESULT CFolderViewImplEnumIDList::Initialize()
             item.nLevel = m_nLevel;
             item.dwMode = entry.dwMode;
             item.dwMtime = entry.dwMtime;
+            item.serverOffsetMinutes = entry.serverOffsetMinutes;
             item.dwSize = entry.dwSize;
             item.dwUid = entry.dwUid;
             item.dwGid = entry.dwGid;

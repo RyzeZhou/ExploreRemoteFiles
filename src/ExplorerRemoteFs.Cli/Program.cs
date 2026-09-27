@@ -202,7 +202,7 @@ static void CmdPipe(string[] args)
             var mtime = e.LastWriteTime.HasValue
                 ? new DateTimeOffset(e.LastWriteTime.Value.ToUniversalTime()).ToUnixTimeSeconds().ToString()
                 : "0";
-            Console.WriteLine($"ITEM\t{mode}\t{mtime}\t{e.Size}\t{e.OwnerDisplay}\t{e.GroupDisplay}\t{(e.IsDirectory ? 1 : 0)}\t{(e.IsSymlink ? 1 : 0)}\t{path}\t{e.Name}\t{e.Uid}\t{e.Gid}");
+            Console.WriteLine($"ITEM\t{mode}\t{mtime}\t{e.Size}\t{e.OwnerDisplay}\t{e.GroupDisplay}\t{(e.IsDirectory ? 1 : 0)}\t{(e.IsSymlink ? 1 : 0)}\t{path}\t{e.Name}\t{e.Uid}\t{e.Gid}\t{e.ServerUtcOffsetMinutes?.ToString() ?? "-1"}");
         }
     }
     catch (Exception ex)

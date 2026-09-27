@@ -52,6 +52,7 @@ public partial class MainWindow : Window
         UsernameLabel.Text = Ui.T("Username"); StartPathLabel.Text = Ui.T("StartPath"); PasswordLabel.Text = Ui.T("Password");
         WinScpSiteLabel.Text = Ui.T("WinScpSite"); TestResultGroup.Header = Ui.T("TestResult");
         SiteSettingsHelpText.Text = Ui.T("SiteSettingsHelp"); FtpEncodingLabel.Text = Ui.T("FtpEncoding");
+        ServerOffsetLabel.Text = Ui.T("ServerTimeZone");
         PrivateKeyLabel.Text = Ui.IsEnglish ? "Private key" : "私钥文件";
         EditSiteSettingsButton.Content = Ui.T("EditSiteSettings");
         ShowDetails();
@@ -129,6 +130,7 @@ public partial class MainWindow : Window
         {
             DName.Text = DType.Text = DHost.Text = DUser.Text = DPath.Text = "";
             DPwd.Text = DShared.Text = DFtpEncoding.Text = DPrivateKey.Text = "";
+            DServerOffset.Text = "";
             return;
         }
         DName.Text = s.Name;
@@ -140,6 +142,9 @@ public partial class MainWindow : Window
         DShared.Text = RegistryShared(s.Name) ? Ui.T("SharedYes") : Ui.T("SharedNo");
         DFtpEncoding.Text = s.Type is "ftp" or "ftps" ? (s.FtpUseUtf8 ? Ui.T("ForceUtf8") : (Ui.IsEnglish ? "Server default" : "服务器默认编码")) : "—";
         DPrivateKey.Text = string.IsNullOrWhiteSpace(s.PrivateKeyPath) ? "—" : s.PrivateKeyPath;
+        // 服务器时区：两个协议都不传时区（SFTP 只给 Unix 秒、FTP 的 LIST 只有无时区字面值），
+        // 所以这里是"探测到的值或用户手填的值"，没探测到就如实写"未探测"。
+        DServerOffset.Text = ExplorerRemoteFs.Utils.TimeDisplay.DescribeOffset(s.ServerUtcOffsetMinutes);
     }
 
     private static bool RegistryShared(string name)

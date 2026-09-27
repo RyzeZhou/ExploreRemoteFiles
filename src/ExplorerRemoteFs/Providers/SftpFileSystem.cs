@@ -1,4 +1,4 @@
-﻿using ExplorerRemoteFs.Config;
+using ExplorerRemoteFs.Config;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
@@ -50,6 +50,8 @@ public sealed class SftpFileSystem : IRemoteFileSystem
         EnsureConnected();
         if (_client is null) return Array.Empty<RemoteEntry>();
 
+        EnsureServerOffset();
+
         var result = new List<RemoteEntry>();
         IEnumerable<ISftpFile> files;
         try
@@ -81,12 +83,64 @@ public sealed class SftpFileSystem : IRemoteFileSystem
                 Uid = f.UserId >= 0 ? f.UserId : -1,
                 Gid = f.GroupId >= 0 ? f.GroupId : -1,
                 Size = f.Length,
-                LastWriteTime = f.LastWriteTime,
+                LastWriteTime = ToUtc(f.LastWriteTime),
+                ServerUtcOffsetMinutes = ServerOffsetMinutes,
                 SymlinkTarget = f.IsSymbolicLink ? f.FullName : null
             });
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// SSH.NET 的 <c>SftpFileAttributes.LastWriteTime</c> 实测是**本地时间的字面值**
+    /// （Kind=Local/Unspecified，值已经由 SSH.NET 从协议里的 Unix 秒本地化过），
+    /// 这里统一成 UTC 时刻：否则下游 <c>ToUniversalTime()</c> 会按 Kind 各自解释，
+    /// 同一条链路（CLI 直出 vs 桥接转 epoch 再由 DLL 本地化）会得出两种结果。
+    /// </summary>
+    private static DateTime ToUtc(DateTime value) =>
+        value.Kind == DateTimeKind.Utc
+            ? value
+            : DateTime.SpecifyKind(value, DateTimeKind.Local).ToUniversalTime();
+
+    // ── 服务器时区偏移（站点里手工填的优先，其次进程内探测到的）────────────────
+    private int? _serverOffset;
+    private bool _offsetProbed;
+
+    private int? ServerOffsetMinutes => _config.ServerUtcOffsetMinutes ?? _serverOffset;
+
+    /// <inheritdoc />
+    public int? ProbeServerUtcOffset()
+    {
+        if (_config.ServerUtcOffsetMinutes.HasValue) return _config.ServerUtcOffsetMinutes;
+        if (_offsetProbed) return _serverOffset;
+        _offsetProbed = true;
+        _serverOffset = ProbeTimeZoneFile();
+        if (_serverOffset.HasValue) ServerOffsetStore.Persist(_config, _serverOffset.Value);
+        return _serverOffset;
+    }
+
+    private void EnsureServerOffset() => ProbeServerUtcOffset();
+
+    /// <summary>
+    /// SFTP 协议本身不传服务器时区。Debian/Ubuntu（含 WSL）的 /etc/timezone 是纯文本 IANA 名，
+    /// .NET 6+ 在 Windows 上也能直接解析 IANA id。取不到就返回 null —— 由用户在站点里手工填。
+    /// 注意：SFTP 的时间正确性**不依赖**这个值（协议给的是 Unix 秒，绝对时刻），
+    /// 它只影响「按服务器时区显示」这一口径。
+    /// </summary>
+    private int? ProbeTimeZoneFile()
+    {
+        EnsureConnected();
+        if (_client is null) return null;
+        try
+        {
+            using var buffer = new MemoryStream();
+            _client.DownloadFile("/etc/timezone", buffer);
+            var name = System.Text.Encoding.UTF8.GetString(buffer.ToArray()).Trim();
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            return (int)TimeZoneInfo.FindSystemTimeZoneById(name).GetUtcOffset(DateTime.UtcNow).TotalMinutes;
+        }
+        catch { return null; }
     }
 
     // ── uid/gid → 账户名映射 ────────────────────────────────────────────────
