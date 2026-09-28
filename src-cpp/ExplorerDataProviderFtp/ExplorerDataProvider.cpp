@@ -23,6 +23,7 @@
 #include "ColumnModel.h"
 #include "SizeFormat.h"
 #include "TimeDisplay.h"
+#include "PidlItem.h"   // FVITEMID / MYOBJID 的唯一权威定义（右键菜单读同一份布局）
 
 #include "resource.h"
 #include "Utils.h"
@@ -52,30 +53,8 @@ HRESULT DeleteRemoteShellItem(IShellItem *psiSource, PIDLIST_ABSOLUTE notifyPidl
 HRESULT CFolderViewCB_CreateInstance(REFIID riid, void **ppv);
 
 
-#define MYOBJID 0x1234
-
-// FVITEMID is allocated with a variable size, szName is the beginning
-// of a NULL-terminated string buffer.
-#pragma pack(1)
-typedef struct tagObject
-{
-    USHORT  cb;
-    WORD    MyObjID;
-    BYTE    nLevel;
-    BYTE    nSize;
-    BYTE    nSides;
-    BYTE    cchName;
-    BOOL    fIsFolder;
-    // 本段的路径基准：FALSE = 站点配置的 StartPath（默认，站点根语义）；
-    // TRUE = 服务器绝对根 "/" —— 地址栏输入"起始路径之外"的路径时用（见 ParseDisplayName）。
-    // 只有 level 1 的站点段会带它；后续段照常相对拼接，GetPidlPath 据此决定要不要补 StartPath。
-    BOOL    fAbsRoot;
-    WCHAR   szName[1];
-} FVITEMID;
-#pragma pack()
-
-typedef UNALIGNED FVITEMID *PFVITEMID;
-typedef const UNALIGNED FVITEMID *PCFVITEMID;
+// MYOBJID / FVITEMID 见 PidlItem.h —— 那份布局由本文件与 ContextMenu.cpp 共用，
+// 定义只能有一处（2026-09-27：两处各写一份，插字段时漏改一处，右键菜单读错名字）。
 
 class CFolderViewImplFolder : public IShellFolder2,
                               public IPersistFolder2,

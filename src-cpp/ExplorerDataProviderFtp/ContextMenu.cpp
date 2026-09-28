@@ -16,6 +16,7 @@
 #include "VscodeBridge.h"
 #include "SizeFormat.h"
 #include "TimeDisplay.h"
+#include "PidlItem.h"   // FVITEMID / MYOBJID 的唯一权威定义（与 ExplorerDataProvider.cpp 同一份布局）
 #include "Utils.h"
 #include "resource.h"
 #include "ProbeLog.h"
@@ -40,55 +41,59 @@
 #define MENU_TERM_VSCODE 15
 #define MENU_CUSTOM_BASE 100
 
-#define MYOBJID 0x1234
 #define MAX_SEL 64
 #define MAX_CUSTOM 16
-#pragma pack(1)
-typedef struct tagCompactItem {
-    USHORT cb; WORD MyObjID; BYTE nLevel; BYTE nSize; BYTE nSides; BYTE cchName;
-    BOOL fIsFolder; WCHAR szName[1];
-} COMPACTITEM;
-#pragma pack()
 
-static void CopyName(const COMPACTITEM *item, PWSTR out, UINT cch)
+// PIDL 项布局见 PidlItem.h：本文件与 ExplorerDataProvider.cpp 读的是**同一份**结构。
+// 这里以前另写了一个 FVITEMID（只到 fIsFolder 为止）。2026-09-27 那边给结构插了
+// fAbsRoot 之后，szName 的偏移从 12 变成 16，而这里仍按 12 读 —— 读到的"文件名"
+// 其实是 fAbsRoot 的 4 个字节（普通项恒为 0 → 名字全空）。菜单项还能构建，
+// 但属性 / 新建文件 / 新建文件夹 / 刷新等一切依赖名字与路径的操作全部报错。
+static void CopyName(const FVITEMID *item, PWSTR out, UINT cch)
 {
     UINT i=0; while(i+1<cch && i<item->cchName && item->szName[i]) { out[i]=item->szName[i]; i++; } out[i]=0;
 }
-static BOOL IsOurs(PCUIDLIST_RELATIVE p)
-{
-    return p && p->mkid.cb >= FIELD_OFFSET(COMPACTITEM, szName)+sizeof(WCHAR) && ((const COMPACTITEM*)p)->MyObjID==MYOBJID;
-}
-static void PidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
+static BOOL IsOurs(PCUIDLIST_RELATIVE p) { return ErfPidlIsOurs(p); }
+// 返回该 PIDL 是否带「服务器绝对根」标记（站点段上的 fAbsRoot）。
+// TRUE 时 out 已经是服务器绝对路径，调用方**不能**再补站点起始路径。
+static BOOL PidlPath(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
 {
     // First IsOurs segment is the site name (level 1); skip it, join the rest.
-    out[0]=0; PCUIDLIST_RELATIVE p=(PCUIDLIST_RELATIVE)abs; BOOL first=TRUE;
+    out[0]=0; PCUIDLIST_RELATIVE p=(PCUIDLIST_RELATIVE)abs; BOOL first=TRUE; BOOL absRoot=FALSE;
     while(p && p->mkid.cb) {
-        if(IsOurs(p)) { WCHAR name[256]; CopyName((const COMPACTITEM*)p,name,ARRAYSIZE(name));
+        if(IsOurs(p)) { const FVITEMID *it=(const FVITEMID*)p; WCHAR name[256]; CopyName(it,name,ARRAYSIZE(name));
+            if(it->fAbsRoot) absRoot=TRUE;
             if(name[0] && !first) { StringCchCat(out,cch,L"/"); StringCchCat(out,cch,name); }
             first=FALSE;
         }
         p=ILNext(p);
     }
     if(!out[0]) StringCchCopy(out,cch,L"/");
+    return absRoot;
 }
 static BOOL PidlSite(PCIDLIST_ABSOLUTE abs, PWSTR out, UINT cch)
 {
     out[0]=0; PCUIDLIST_RELATIVE p=(PCUIDLIST_RELATIVE)abs;
     while(p && p->mkid.cb) {
-        if(IsOurs(p)) { CopyName((const COMPACTITEM*)p,out,cch); return out[0]!=0; }
+        if(IsOurs(p)) { CopyName((const FVITEMID*)p,out,cch); return out[0]!=0; }
         p=ILNext(p);
     }
     return FALSE;
 }
-static void ApplySiteStartPath(PCWSTR site, PWSTR path, UINT cch)
+static void ApplySiteStartPath(PCWSTR site, PWSTR path, UINT cch, BOOL alreadyAbsolute)
 {
     if (!site || !site[0] || !path || !path[0]) return;
+
+    // 已经是服务器绝对路径（PIDL 带 fAbsRoot：地址栏进到了起始路径之外，例如 /etc）——
+    // 一个字都不能再补，否则会拼成 /home/zhou/AI_work/etc 这种不存在的路径，
+    // 属性 / 新建 / 刷新就会全部报错。判断依据来自 PIDL 的 fAbsRoot 标记，
+    // 不能靠字符串猜（"/etc" 与起始路径毫无公共前缀）。
+    if (alreadyAbsolute) return;
+
     const FTPSITE *s = FtpSiteFind(site);
     if (!s || !s->startPath[0] || StrCmp(s->startPath, L"/") == 0) return;
 
-    // 路径已经带着起始路径了（fAbsRoot 的项：GetPidlPath 直接给出服务器绝对路径，
-    // 例如地址栏进 /etc 之后的项）→ 不能再补一次，否则会拼成
-    // /home/zhou/AI_work/etc 这种不存在的路径。
+    // 双保险：路径已经带着起始路径了（重复调用）→ 也不再补。
     size_t sl = lstrlen(s->startPath);
     if (0 == StrCmpNW(path, s->startPath, (int)sl) &&
         (path[sl] == L'/' || path[sl] == 0)) return;
@@ -405,13 +410,13 @@ HRESULT DeleteRemoteShellItem(IShellItem *psiSource, PIDLIST_ABSOLUTE notifyPidl
     WCHAR site[64] = {}, full[600] = {}, parent[600] = {}, name[MAX_PATH] = {};
     BOOL isFolder = FALSE;
     BOOL valid = PidlSite(source, site, ARRAYSIZE(site));
-    PidlPath(source, full, ARRAYSIZE(full));
-    ApplySiteStartPath(site, full, ARRAYSIZE(full));
+    BOOL fullAbsRoot = PidlPath(source, full, ARRAYSIZE(full));
+    ApplySiteStartPath(site, full, ARRAYSIZE(full), fullAbsRoot);
     PCUIDLIST_RELATIVE last = ILFindLastID(source);
     if (valid && IsOurs(last))
     {
-        CopyName((const COMPACTITEM *)last, name, ARRAYSIZE(name));
-        isFolder = ((const COMPACTITEM *)last)->fIsFolder;
+        CopyName((const FVITEMID *)last, name, ARRAYSIZE(name));
+        isFolder = ((const FVITEMID *)last)->fIsFolder;
     }
     ILFree(source);
 
@@ -1241,12 +1246,12 @@ static BOOL CollectSelection(IDataObject *data, SELDATA *out)
     if(cida && cida->cidl>0){
         PCIDLIST_ABSOLUTE parent=(PCIDLIST_ABSOLUTE)((BYTE*)cida+cida->aoffset[0]);
         PidlSite(parent,out->site,ARRAYSIZE(out->site));
-        PidlPath(parent,out->folder,ARRAYSIZE(out->folder));
-        ApplySiteStartPath(out->site, out->folder, ARRAYSIZE(out->folder));
+        BOOL folderAbsRoot = PidlPath(parent,out->folder,ARRAYSIZE(out->folder));
+        ApplySiteStartPath(out->site, out->folder, ARRAYSIZE(out->folder), folderAbsRoot);
         out->notify=ILCloneFull(parent);
         for(UINT i=1;i<=cida->cidl && out->count<MAX_SEL;i++){
             PCUIDLIST_RELATIVE child=(PCUIDLIST_RELATIVE)((BYTE*)cida+cida->aoffset[i]);
-            if(IsOurs(child)){ const COMPACTITEM *item=(const COMPACTITEM*)child; if(out->count==0) out->firstIsFolder=item->fIsFolder; CopyName(item,out->names[out->count],ARRAYSIZE(out->names[0])); out->count++; }
+            if(IsOurs(child)){ const FVITEMID *item=(const FVITEMID*)child; if(out->count==0) out->firstIsFolder=item->fIsFolder; CopyName(item,out->names[out->count],ARRAYSIZE(out->names[0])); out->count++; }
         }
         // Site-picker items (level 0) have no site segment in the folder PIDL;
         // accept a non-empty selection regardless so their property sheet works.
@@ -3922,8 +3927,8 @@ public:
             WCHAR nsite[64] = {}, nfolder[512] = {};
             if (m_pidl) {
                 PidlSite(m_pidl, nsite, ARRAYSIZE(nsite));
-                PidlPath(m_pidl, nfolder, ARRAYSIZE(nfolder));
-                ApplySiteStartPath(nsite, nfolder, ARRAYSIZE(nfolder));
+                BOOL absRoot = PidlPath(m_pidl, nfolder, ARRAYSIZE(nfolder));
+                ApplySiteStartPath(nsite, nfolder, ARRAYSIZE(nfolder), absRoot);
             }
             ProbeLog(L"[BG] canonical verb new site='%s' folder='%s'", nsite, nfolder);
             NewFolderRemote(ci->hwnd, nsite, nfolder, m_pidl);
@@ -3934,8 +3939,8 @@ public:
             WCHAR csite[64] = {}, cfolder[512] = {};
             if (m_pidl) {
                 PidlSite(m_pidl, csite, ARRAYSIZE(csite));
-                PidlPath(m_pidl, cfolder, ARRAYSIZE(cfolder));
-                ApplySiteStartPath(csite, cfolder, ARRAYSIZE(cfolder));
+                BOOL absRoot = PidlPath(m_pidl, cfolder, ARRAYSIZE(cfolder));
+                ApplySiteStartPath(csite, cfolder, ARRAYSIZE(cfolder), absRoot);
             }
             std::wstring text = L"erf:"; text += csite; text += L":"; text += cfolder;
             ProbeLog(L"[BG] canonical verb copyaspath site='%s' folder='%s'", csite, cfolder);
@@ -3947,8 +3952,8 @@ public:
             WCHAR vsite[64] = {}, vfolder[512] = {};
             if (m_pidl) {
                 PidlSite(m_pidl, vsite, ARRAYSIZE(vsite));
-                PidlPath(m_pidl, vfolder, ARRAYSIZE(vfolder));
-                ApplySiteStartPath(vsite, vfolder, ARRAYSIZE(vfolder));
+                BOOL absRoot = PidlPath(m_pidl, vfolder, ARRAYSIZE(vfolder));
+                ApplySiteStartPath(vsite, vfolder, ARRAYSIZE(vfolder), absRoot);
             }
             ProbeLog(L"[BG] canonical verb paste site='%s' folder='%s'", vsite, vfolder);
             if (m_nLevel >= 1) PasteClipboardToFolder(ci->hwnd, vsite, vfolder, m_pidl);
@@ -3966,8 +3971,8 @@ public:
         WCHAR site[64] = {}, folder[512] = {};
         if (m_pidl) {
             PidlSite(m_pidl, site, ARRAYSIZE(site));
-            PidlPath(m_pidl, folder, ARRAYSIZE(folder));
-            ApplySiteStartPath(site, folder, ARRAYSIZE(folder));
+            BOOL absRoot = PidlPath(m_pidl, folder, ARRAYSIZE(folder));
+            ApplySiteStartPath(site, folder, ARRAYSIZE(folder), absRoot);
         }
         UINT k = rel - m_defaultCount;
         if (m_nLevel == 0)
